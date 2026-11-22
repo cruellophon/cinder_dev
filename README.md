@@ -44,23 +44,49 @@ Repository: <https://github.com/cruellophon/cinder_dev>
 
 ---
 
+## Downloads & Platform Support
+
+Prebuilt native releases are published automatically via GitHub Actions on the [Releases page](https://github.com/cruellophon/cinder_dev/releases):
+
+| Platform | Architecture | Package | Notes |
+| :--- | :--- | :--- | :--- |
+| **macOS (Intel)** | `x86_64` | `cinder-macos-intel.zip` | Native `Cinder.app` bundle for Intel Macs (macOS 12+) |
+| **macOS (Apple Silicon)** | `aarch64` (`M1`/`M2`/`M3`/`M4`) | `cinder-macos-apple-silicon.zip` | Native `Cinder.app` bundle (macOS 12+) |
+| **Linux** | `x86_64` | `cinder-linux-x86_64.tar.gz` | Standalone `cinder` binary + `.desktop` + `install.sh` |
+| **Windows** | `x86_64` | `cinder.exe` | Single self-contained executable |
+
+> **macOS First Launch (Gatekeeper Notice):** Community builds are ad-hoc signed rather than Apple-notarized. After moving `Cinder.app` into `/Applications`, clear the quarantine attribute once before opening:
+> ```bash
+> xattr -cr /Applications/Cinder.app
+> ```
+
+---
+
 ## Quick Start & Build from Source
 
 ### Prerequisites
 - [Rust & Cargo](https://rustup.rs/) (stable toolchain, 2021 edition)
+- **Linux (`apt`) system dependencies:**
+  ```bash
+  sudo apt-get update && sudo apt-get install -y \
+    pkg-config libssl-dev libxcb-render0-dev libxcb-shape0-dev \
+    libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev libxdo-dev
+  ```
+- **macOS:** Xcode Command Line Tools (`xcode-select --install`). To cross-compile for an Intel Mac on Apple Silicon: `rustup target add x86_64-apple-darwin`
 
 ### Build & Test
 
-```powershell
+```bash
 # Run the full workspace unit test suite
 cargo test --workspace
 
 # Build the standalone single-file release executable
 cargo build --release --bin cinder
-
-# Copy standalone executable to release/ (optional local release folder, gitignored)
-Copy-Item -Force target\release\cinder.exe release\cinder.exe
 ```
+
+- **Windows:** Copy standalone executable (`target\release\cinder.exe`) to `release\cinder.exe`.
+- **macOS `.app` bundle:** `bash scripts/bundle-macos-app.sh target/release/cinder dist native 0.5.5`
+- **Linux archive:** `bash scripts/package-linux.sh target/release/cinder dist 0.5.5`
 
 ### Runtime Flags & Environment Variables
 - `--headless` — start the embedded Axum web UI & API server (`http://127.0.0.1:17770`) instead of opening the native GUI
@@ -72,7 +98,7 @@ Copy-Item -Force target\release\cinder.exe release\cinder.exe
 
 ## Privacy & API Key Storage
 
-Cinder never stores API keys or runtime chat state inside source repositories. All provider keys (`gemini_api_key`, `anthropic_api_key`, `openrouter_api_key`, `openai_compat_api_key`, `huggingface_token`, `brave_search_api_key`), sessions, and preferences are stored strictly inside your local OS application data directory (`%APPDATA%\Cinder\state.json` on Windows, or `$CINDER_DATA_DIR`).
+Cinder never stores API keys or runtime chat state inside source repositories. All provider keys (`gemini_api_key`, `anthropic_api_key`, `openrouter_api_key`, `openai_compat_api_key`, `huggingface_token`, `brave_search_api_key`), sessions, and preferences are stored strictly inside your local OS application data directory (`%APPDATA%\Cinder\` / `%LOCALAPPDATA%\Project_Bumbo\state.json` on Windows, `~/Library/Application Support/Project_Bumbo/state.json` on macOS, `~/.local/share/Project_Bumbo/state.json` on Linux, or `$CINDER_DATA_DIR`).
 
 See [`SECURITY.md`](SECURITY.md) for details on sandboxing, network gating, and vulnerability reporting, and [`CHANGELOG.md`](CHANGELOG.md) for full release notes.
 
@@ -80,16 +106,16 @@ See [`SECURITY.md`](SECURITY.md) for details on sandboxing, network gating, and 
 
 ## Keyboard Shortcuts
 
-| Shortcut | Action |
-| :--- | :--- |
-| `Ctrl+B` | Toggle Left Sidebar |
-| `Ctrl+E` | Toggle Workbench Stage |
-| `Ctrl+Shift+E` | Toggle Workspace File Explorer |
-| `Ctrl+K` | Command Palette |
-| `Ctrl+,` | Settings Control Center |
-| `Ctrl+S` | Save Active Editor File |
-| `Ctrl+V` | Paste Screenshot / Clipboard Image or Files into Chat |
-| `` Ctrl+` `` | Toggle Integrated Workspace Terminal |
+| Windows / Linux | macOS | Action |
+| :--- | :--- | :--- |
+| `Ctrl+B` | `Cmd+B` | Toggle Left Sidebar |
+| `Ctrl+E` | `Cmd+E` | Toggle Workbench Stage |
+| `Ctrl+Shift+E` | `Cmd+Shift+E` | Toggle Workspace File Explorer |
+| `Ctrl+K` | `Cmd+K` | Command Palette |
+| `Ctrl+,` | `Cmd+,` | Settings Control Center |
+| `Ctrl+S` | `Cmd+S` | Save Active Editor File |
+| `Ctrl+V` | `Cmd+V` | Paste Screenshot / Clipboard Image or Files into Chat |
+| `` Ctrl+` `` | `` Cmd+` `` | Toggle Integrated Workspace Terminal |
 
 ---
 

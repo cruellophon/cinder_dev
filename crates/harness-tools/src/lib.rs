@@ -313,7 +313,11 @@ pub fn tool_specs(mode: AgentMode, allow_web: bool) -> Vec<ToolSpec> {
         });
         specs.push(ToolSpec {
             name: "run_command".into(),
-            description: "Run a shell command inside the active workspace directory (Windows already runs inside PowerShell — pass commands directly without wrapping in 'powershell -Command').".into(),
+            description: if cfg!(windows) {
+                "Run a shell command inside the active workspace directory (Windows already runs inside PowerShell — pass commands directly without wrapping in 'powershell -Command').".into()
+            } else {
+                "Run a shell command inside the active workspace directory (runs via `sh -c`).".into()
+            },
             parameters_schema: json!({
                 "type": "object",
                 "properties": {
@@ -324,7 +328,11 @@ pub fn tool_specs(mode: AgentMode, allow_web: bool) -> Vec<ToolSpec> {
         });
         specs.push(ToolSpec {
             name: "verify_workspace".into(),
-            description: "Run a verification command (e.g. cargo check, python -m py_compile, pytest) after edits inside the active workspace (Windows already runs inside PowerShell).".into(),
+            description: if cfg!(windows) {
+                "Run a verification command (e.g. cargo check, python -m py_compile, pytest) after edits inside the active workspace (Windows already runs inside PowerShell).".into()
+            } else {
+                "Run a verification command (e.g. cargo check, python3 -m py_compile, pytest) after edits inside the active workspace (runs via `sh -c`).".into()
+            },
             parameters_schema: json!({
                 "type": "object",
                 "properties": {

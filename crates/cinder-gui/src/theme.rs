@@ -287,6 +287,136 @@ pub fn install_system_fonts(ctx: &egui::Context) {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        let proportional_candidates = [
+            "/System/Library/Fonts/SFNS.ttf",
+            "/System/Library/Fonts/HelveticaNeue.ttc",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ];
+        for path in proportional_candidates {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts
+                    .font_data
+                    .insert("mac_ui".to_owned(), FontData::from_owned(bytes).into());
+                if let Some(fam) = fonts.families.get_mut(&FontFamily::Proportional) {
+                    fam.insert(0, "mac_ui".to_owned());
+                }
+                break;
+            }
+        }
+
+        for path in [
+            "/System/Library/Fonts/SFNSRounded.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ] {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts
+                    .font_data
+                    .insert("mac_ui_sb".to_owned(), FontData::from_owned(bytes).into());
+                let mut sb_fam = fonts
+                    .families
+                    .get(&FontFamily::Proportional)
+                    .cloned()
+                    .unwrap_or_default();
+                sb_fam.insert(0, "mac_ui_sb".to_owned());
+                fonts
+                    .families
+                    .insert(FontFamily::Name("semibold".into()), sb_fam);
+                break;
+            }
+        }
+
+        if let Ok(bytes) = std::fs::read("/System/Library/Fonts/Apple Symbols.ttf") {
+            fonts
+                .font_data
+                .insert("mac_sym".to_owned(), FontData::from_owned(bytes).into());
+            if let Some(fam) = fonts.families.get_mut(&FontFamily::Proportional) {
+                let idx = usize::min(1, fam.len());
+                fam.insert(idx, "mac_sym".to_owned());
+            }
+            if let Some(sb) = fonts.families.get_mut(&FontFamily::Name("semibold".into())) {
+                let idx = usize::min(2, sb.len());
+                sb.insert(idx, "mac_sym".to_owned());
+            }
+        }
+
+        let mono_candidates = [
+            "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/Monaco.ttf",
+            "/System/Library/Fonts/SFNSMono.ttf",
+        ];
+        for path in mono_candidates {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts
+                    .font_data
+                    .insert("mac_mono".to_owned(), FontData::from_owned(bytes).into());
+                if let Some(fam) = fonts.families.get_mut(&FontFamily::Monospace) {
+                    fam.insert(0, "mac_mono".to_owned());
+                }
+                break;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let proportional_candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ];
+        for path in proportional_candidates {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts
+                    .font_data
+                    .insert("linux_ui".to_owned(), FontData::from_owned(bytes).into());
+                if let Some(fam) = fonts.families.get_mut(&FontFamily::Proportional) {
+                    fam.insert(0, "linux_ui".to_owned());
+                }
+                break;
+            }
+        }
+
+        let sym_candidates = [
+            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        ];
+        for path in sym_candidates {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts
+                    .font_data
+                    .insert("linux_sym".to_owned(), FontData::from_owned(bytes).into());
+                if let Some(fam) = fonts.families.get_mut(&FontFamily::Proportional) {
+                    let idx = usize::min(1, fam.len());
+                    fam.insert(idx, "linux_sym".to_owned());
+                }
+                break;
+            }
+        }
+
+        let mono_candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
+        ];
+        for path in mono_candidates {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts
+                    .font_data
+                    .insert("linux_mono".to_owned(), FontData::from_owned(bytes).into());
+                if let Some(fam) = fonts.families.get_mut(&FontFamily::Monospace) {
+                    fam.insert(0, "linux_mono".to_owned());
+                }
+                break;
+            }
+        }
+    }
+
     if !fonts.families.contains_key(&FontFamily::Name("semibold".into())) {
         if let Some(prop) = fonts.families.get(&FontFamily::Proportional).cloned() {
             fonts

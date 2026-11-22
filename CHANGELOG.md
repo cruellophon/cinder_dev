@@ -4,6 +4,27 @@ All notable changes to **Cinder** are documented in this file.
 
 ---
 
+## [0.5.6-beta] — Cross-Platform macOS & Linux Support — 2026-11-22
+
+### Added
+- **First-Class macOS Support (Intel `x86_64-apple-darwin` & Apple Silicon `aarch64-apple-darwin`):**
+  - Native macOS full-size content view titlebar with traffic-light button clearance and `Cmd` keyboard shortcuts (`Cmd+B`, `Cmd+E`, `Cmd+Shift+E`, `Cmd+K`, `Cmd+,`, `Cmd+S`, `Cmd+F`, `Cmd+W`, ``Cmd+` ``, `Cmd+V`).
+  - macOS Finder GUI `PATH` augmentation (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.cargo/bin`, `~/.local/bin`) and `/Applications/Ollama.app/Contents/Resources/ollama` discovery.
+  - Intel Mac `system_profiler SPDisplaysDataType` GPU & VRAM probing (fixing false "Apple Silicon Unified Memory" reporting on `x86_64` Macs while preserving Unified Memory on `aarch64`).
+  - Native macOS system fonts (`SFNS`, `Helvetica Neue`, `Menlo`, `Apple Symbols`), escaped `osascript` multi-file/folder pickers, and `DYLD_LIBRARY_PATH` runtime loading for local `llama-server`.
+- **First-Class Linux Support (`x86_64-unknown-linux-gnu`):**
+  - Native Linux font loading (`DejaVu Sans`, `Ubuntu`, `Noto Sans`, `Liberation`), `/sys/class/drm` GPU VRAM fallback alongside `nvidia-smi`, `kdialog` fallback alongside `zenity`, and `LD_LIBRARY_PATH` setup for `llama-server`.
+- **Pure-Rust `.tar.gz` / `.tgz` Engine & Node.js Installers (`flate2` + `tar`):**
+  - Updated `llama.cpp` release asset matching & extraction (`select_llama_assets_for`, `extract_archive_flattened`) and Portable Node.js LTS toolchain installer (`nodejs_dist_spec_for`, `extract_targz_preserving_tree`) to support modern `.tar.gz` and `.zip` builds across Windows, macOS Intel/ARM64, and Linux, preserving symlinks and Unix `0o755` executable permissions.
+- **Automated Multi-Platform Packaging & GitHub Actions Workflows:**
+  - Added [`scripts/bundle-macos-app.sh`](scripts/bundle-macos-app.sh) (`Cinder.app` bundle + generated `Cinder.icns` + ad-hoc `codesign`), [`scripts/package-linux.sh`](scripts/package-linux.sh) (`.tar.gz` + `.desktop` + `install.sh`), [`.github/workflows/ci.yml`](.github/workflows/ci.yml), and [`.github/workflows/release.yml`](.github/workflows/release.yml).
+
+### Fixed
+- Replaced hardcoded `\` path joins in File Explorer, Drag-and-Drop, and Model Vault drive quick-select with portable `PathBuf::join` composition.
+- Updated `sandbox::tests::relative_to_workspace_handles_verbatim_prefix_mismatch` and `native_dialogs::tests` to verify both POSIX and Windows paths cross-platform.
+
+---
+
 ## [0.5.5] / v5.5 — 2026-11-22
 
 ### Added

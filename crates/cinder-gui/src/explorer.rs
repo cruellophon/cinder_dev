@@ -234,7 +234,9 @@ fn render_tree_node(
         }
 
         let rel_clone = node.rel_path.clone();
-        let abs_dir = ws_root.join(rel_clone.replace('/', "\\"));
+        let abs_dir = rel_clone
+            .split('/')
+            .fold(ws_root.to_path_buf(), |acc, seg| acc.join(seg));
         row_resp.context_menu(|ui| {
             let toggle_txt = if is_open {
                 "Collapse Folder"
@@ -414,7 +416,9 @@ fn render_leaf_row(
     }
 
     let rel_clone = rel_path.to_string();
-    let abs_file = ws_root.join(rel_clone.replace('/', "\\"));
+    let abs_file = rel_clone
+        .split('/')
+        .fold(ws_root.to_path_buf(), |acc, seg| acc.join(seg));
     resp.context_menu(|ui| {
         if ui.button("Open in Editor").clicked() {
             backend.load_workspace_file(rel_clone.clone());

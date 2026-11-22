@@ -332,7 +332,7 @@ fn probe_gpus() -> Vec<GpuInfo> {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if gpus.is_empty() {
         let ram = probe_system_ram_mb();
         if ram > 0 {
@@ -347,6 +347,155 @@ fn probe_gpus() -> Vec<GpuInfo> {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    if gpus.is_empty() {
+        if let Ok(out) = std::process::Command::new("system_profiler")
+            .args(["SPDisplaysDataType"])
+            .output()
+        {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                gpus.extend(parse_macos_spdisplays_gpus(&text));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if gpus.is_empty() {
+        gpus.extend(probe_linux_drm_gpus());
+    }
+
+    gpus
+}
+
+/// Parses `system_profiler SPDisplaysDataType` output into `GpuInfo` entries (used on Intel Macs).
+#[cfg(any(all(target_os = "macos", target_arch = "x86_64"), test))]
+fn parse_macos_spdisplays_gpus(text: &str) -> Vec<GpuInfo> {
+    let mut gpus: Vec<GpuInfo> = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_vram_mb: u64 = 0;
+
+    let flush_current = |gpus: &mut Vec<GpuInfo>, name_opt: &mut Option<String>, vram_mb: &mut u64| {
+        if let Some(name) = name_opt.take() {
+            let lower = name.to_ascii_lowercase();
+            let vendor = if lower.contains("radeon") || lower.contains("amd") {
+                "AMD"
+            } else if lower.contains("intel") {
+                "Intel"
+            } else if lower.contains("nvidia") || lower.contains("geforce") || lower.contains("quadro") {
+                "NVIDIA"
+            } else {
+                "Apple"
+            };
+            gpus.push(GpuInfo {
+                name,
+                vram_total_mb: *vram_mb,
+                vram_used_mb: 0,
+                vram_free_mb: *vram_mb,
+                driver_version: vendor.to_string(),
+                backend: "Metal".to_string(),
+            });
+        }
+        *vram_mb = 0;
+    };
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if let Some(rest) = line.strip_prefix("Chipset Model:") {
+            flush_current(&mut gpus, &mut current_name, &mut current_vram_mb);
+            let name = rest.trim().to_string();
+            if !name.is_empty() {
+                current_name = Some(name);
+            }
+        } else if current_name.is_some()
+            && (line.starts_with("VRAM (Total):") || line.starts_with("VRAM (Dynamic, Max):"))
+        {
+            if let Some((_, val_part)) = line.split_once(':') {
+                let mb = parse_vram_size_to_mb(val_part);
+                if mb > current_vram_mb {
+                    current_vram_mb = mb;
+                }
+            }
+        }
+    }
+    flush_current(&mut gpus, &mut current_name, &mut current_vram_mb);
+    gpus
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "x86_64"), test))]
+fn parse_vram_size_to_mb(raw: &str) -> u64 {
+    let mut tokens = raw.split_whitespace();
+    let Some(num_str) = tokens.next() else {
+        return 0;
+    };
+    let clean_num = num_str.replace(',', "");
+    let Ok(val) = clean_num.parse::<f64>() else {
+        return 0;
+    };
+    let unit = tokens.next().unwrap_or("").to_ascii_uppercase();
+    if unit.starts_with("GB") {
+        (val * 1024.0).round() as u64
+    } else if unit.starts_with("MB") {
+        val.round() as u64
+    } else if unit.starts_with("KB") {
+        (val / 1024.0).round() as u64
+    } else {
+        val.round() as u64
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn probe_linux_drm_gpus() -> Vec<GpuInfo> {
+    let mut gpus = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+        return gpus;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name().to_string_lossy().to_string();
+        if !fname.starts_with("card") || fname.contains('-') {
+            continue;
+        }
+        let dev_dir = entry.path().join("device");
+        let vram_path = dev_dir.join("mem_info_vram_total");
+        let Ok(vram_raw) = std::fs::read_to_string(&vram_path) else {
+            continue;
+        };
+        let Ok(vram_bytes) = vram_raw.trim().parse::<u64>() else {
+            continue;
+        };
+        if vram_bytes == 0 {
+            continue;
+        }
+        let vram_total_mb = vram_bytes / (1024 * 1024);
+        let vram_used_mb = std::fs::read_to_string(dev_dir.join("mem_info_vram_used"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|b| b / (1024 * 1024))
+            .unwrap_or(0);
+        let vendor_hex = std::fs::read_to_string(dev_dir.join("vendor"))
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let (vendor_name, backend) = match vendor_hex.as_str() {
+            "0x1002" => ("AMD Radeon", "Vulkan/ROCm"),
+            "0x8086" => ("Intel Graphics", "Vulkan"),
+            "0x10de" => ("NVIDIA", "Vulkan/CUDA"),
+            _ => ("Linux DRM GPU", "Vulkan"),
+        };
+        let name = std::fs::read_to_string(dev_dir.join("product_name"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("{vendor_name} ({fname})"));
+        gpus.push(GpuInfo {
+            name,
+            vram_total_mb,
+            vram_used_mb,
+            vram_free_mb: vram_total_mb.saturating_sub(vram_used_mb),
+            driver_version: vendor_name.to_string(),
+            backend: backend.to_string(),
+        });
+    }
     gpus
 }
 
@@ -1499,9 +1648,11 @@ impl ServerManager {
             }
 
             let target_clone = target_dir.clone();
-            let zip_clone = zip_path.clone();
-            tokio::task::spawn_blocking(move || extract_zip_flattened(&zip_clone, &target_clone))
-                .await??;
+            let archive_clone = zip_path.clone();
+            tokio::task::spawn_blocking(move || {
+                extract_archive_flattened(&archive_clone, &target_clone)
+            })
+            .await??;
             let _ = std::fs::remove_file(&zip_path);
         }
 
@@ -2021,6 +2172,26 @@ async fn spawn_and_wait_llama_server(
     }
     if let Some(parent) = bin.parent() {
         cmd.current_dir(parent);
+        #[cfg(target_os = "macos")]
+        {
+            let existing = std::env::var("DYLD_LIBRARY_PATH").unwrap_or_default();
+            let combined = if existing.is_empty() {
+                parent.to_string_lossy().to_string()
+            } else {
+                format!("{}:{existing}", parent.display())
+            };
+            cmd.env("DYLD_LIBRARY_PATH", combined);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+            let combined = if existing.is_empty() {
+                parent.to_string_lossy().to_string()
+            } else {
+                format!("{}:{existing}", parent.display())
+            };
+            cmd.env("LD_LIBRARY_PATH", combined);
+        }
     }
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -2060,7 +2231,12 @@ fn find_local_ollama_binary() -> Option<PathBuf> {
     }
     #[cfg(not(windows))]
     {
-        for candidate in ["/usr/local/bin/ollama", "/usr/bin/ollama", "/opt/homebrew/bin/ollama"] {
+        for candidate in [
+            "/Applications/Ollama.app/Contents/Resources/ollama",
+            "/opt/homebrew/bin/ollama",
+            "/usr/local/bin/ollama",
+            "/usr/bin/ollama",
+        ] {
             if Path::new(candidate).exists() {
                 return Some(PathBuf::from(candidate));
             }
@@ -2098,8 +2274,35 @@ fn pick_release_assets(
 }
 
 fn select_llama_assets(assets: &[GitHubAsset], backend_preference: &str) -> Vec<(String, String)> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
+    select_llama_assets_for(
+        assets,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        backend_preference,
+    )
+}
+
+fn find_asset_matching_needles<'a>(
+    assets: &'a [GitHubAsset],
+    needles: &[&str],
+) -> Option<&'a GitHubAsset> {
+    for needle in needles {
+        if let Some(found) = assets
+            .iter()
+            .find(|a| a.name.to_ascii_lowercase().contains(needle))
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn select_llama_assets_for(
+    assets: &[GitHubAsset],
+    os: &str,
+    arch: &str,
+    backend_preference: &str,
+) -> Vec<(String, String)> {
     let mut picked = Vec::new();
 
     if os == "windows" {
@@ -2117,15 +2320,18 @@ fn select_llama_assets(assets: &[GitHubAsset], backend_preference: &str) -> Vec<
                         n.contains("bin-win-cuda") && n.ends_with("-x64.zip") && !n.starts_with("cudart")
                     })
                 });
-            let cuda_rt = assets.iter().find(|a| {
-                let n = a.name.to_ascii_lowercase();
-                n.starts_with("cudart-llama-bin-win-cuda-12") && n.ends_with("-x64.zip")
-            }).or_else(|| {
-                assets.iter().find(|a| {
+            let cuda_rt = assets
+                .iter()
+                .find(|a| {
                     let n = a.name.to_ascii_lowercase();
-                    n.starts_with("cudart-llama-bin-win-cuda") && n.ends_with("-x64.zip")
+                    n.starts_with("cudart-llama-bin-win-cuda-12") && n.ends_with("-x64.zip")
                 })
-            });
+                .or_else(|| {
+                    assets.iter().find(|a| {
+                        let n = a.name.to_ascii_lowercase();
+                        n.starts_with("cudart-llama-bin-win-cuda") && n.ends_with("-x64.zip")
+                    })
+                });
 
             if let Some(bin) = cuda_bin {
                 picked.push((bin.name.clone(), bin.browser_download_url.clone()));
@@ -2136,48 +2342,176 @@ fn select_llama_assets(assets: &[GitHubAsset], backend_preference: &str) -> Vec<
             }
         }
 
-        if let Some(vk) = assets.iter().find(|a| {
-            let n = a.name.to_ascii_lowercase();
-            n.contains("bin-win-vulkan-x64.zip")
-        }) {
+        if let Some(vk) = find_asset_matching_needles(assets, &["bin-win-vulkan-x64.zip"]) {
             picked.push((vk.name.clone(), vk.browser_download_url.clone()));
             return picked;
         }
 
-        if let Some(cpu) = assets.iter().find(|a| {
-            let n = a.name.to_ascii_lowercase();
-            n.contains("bin-win-cpu-x64.zip")
-        }) {
+        if let Some(cpu) = find_asset_matching_needles(assets, &["bin-win-cpu-x64.zip"]) {
             picked.push((cpu.name.clone(), cpu.browser_download_url.clone()));
             return picked;
         }
     } else if os == "macos" {
-        let needle = if arch == "aarch64" {
-            "bin-macos-arm64.zip"
+        let needles: &[&str] = if arch == "aarch64" {
+            &[
+                "bin-macos-arm64.tar.gz",
+                "bin-macos-arm64.tgz",
+                "bin-macos-arm64.zip",
+            ]
         } else {
-            "bin-macos-x64.zip"
+            &[
+                "bin-macos-x64.tar.gz",
+                "bin-macos-x64.tgz",
+                "bin-macos-x64.zip",
+            ]
         };
-        if let Some(a) = assets.iter().find(|a| a.name.to_ascii_lowercase().contains(needle)) {
+        if let Some(a) = find_asset_matching_needles(assets, needles) {
             picked.push((a.name.clone(), a.browser_download_url.clone()));
             return picked;
         }
     } else if os == "linux" {
-        let needle = if backend_preference.eq_ignore_ascii_case("vulkan") {
-            "bin-ubuntu-vulkan-x64.zip"
+        let want_vulkan = backend_preference.eq_ignore_ascii_case("vulkan");
+        let found = if arch == "aarch64" {
+            let vk = if want_vulkan {
+                find_asset_matching_needles(
+                    assets,
+                    &[
+                        "bin-ubuntu-vulkan-arm64.tar.gz",
+                        "bin-ubuntu-vulkan-arm64.tgz",
+                        "bin-ubuntu-vulkan-arm64.zip",
+                    ],
+                )
+            } else {
+                None
+            };
+            vk.or_else(|| {
+                find_asset_matching_needles(
+                    assets,
+                    &[
+                        "bin-ubuntu-arm64.tar.gz",
+                        "bin-ubuntu-arm64.tgz",
+                        "bin-ubuntu-arm64.zip",
+                    ],
+                )
+            })
         } else {
-            "bin-ubuntu-x64.zip"
+            let vk = if want_vulkan {
+                find_asset_matching_needles(
+                    assets,
+                    &[
+                        "bin-ubuntu-vulkan-x64.tar.gz",
+                        "bin-ubuntu-vulkan-x64.tgz",
+                        "bin-ubuntu-vulkan-x64.zip",
+                    ],
+                )
+            } else {
+                None
+            };
+            vk.or_else(|| {
+                find_asset_matching_needles(
+                    assets,
+                    &[
+                        "bin-ubuntu-x64.tar.gz",
+                        "bin-ubuntu-x64.tgz",
+                        "bin-ubuntu-x64.zip",
+                    ],
+                )
+            })
         };
-        if let Some(a) = assets
-            .iter()
-            .find(|a| a.name.to_ascii_lowercase().contains(needle))
-            .or_else(|| assets.iter().find(|a| a.name.to_ascii_lowercase().contains("bin-ubuntu-x64.zip")))
-        {
+        if let Some(a) = found {
             picked.push((a.name.clone(), a.browser_download_url.clone()));
             return picked;
         }
     }
 
     picked
+}
+
+#[cfg(unix)]
+fn apply_unix_runtime_perms(path: &Path, archive_mode: Option<u32>) {
+    use std::os::unix::fs::PermissionsExt;
+    let fname = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_exec_name = fname == "llama-server"
+        || fname.ends_with(".dylib")
+        || fname.contains(".dylib.")
+        || fname.ends_with(".so")
+        || fname.contains(".so.");
+    let archive_exec = archive_mode.map(|m| (m & 0o111) != 0).unwrap_or(false);
+    let target_mode = if is_exec_name || archive_exec {
+        0o755
+    } else {
+        0o644
+    };
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(target_mode);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+fn extract_archive_flattened(archive_path: &Path, dest_dir: &Path) -> anyhow::Result<()> {
+    let lower = archive_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        extract_targz_flattened(archive_path, dest_dir)
+    } else {
+        extract_zip_flattened(archive_path, dest_dir)
+    }
+}
+
+fn extract_targz_flattened(archive_path: &Path, dest_dir: &Path) -> anyhow::Result<()> {
+    let file = std::fs::File::open(archive_path)?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    for entry_res in archive.entries()? {
+        let mut entry = entry_res?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            continue;
+        }
+        let rel_path = entry.path()?.into_owned();
+        if rel_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        let Some(entry_name) = rel_path.file_name().map(|n| n.to_os_string()) else {
+            continue;
+        };
+        let out_path = dest_dir.join(&entry_name);
+
+        if entry_type.is_symlink() {
+            #[cfg(unix)]
+            if let Ok(Some(link_target)) = entry.link_name() {
+                if let Some(target_name) = link_target.file_name() {
+                    let _ = std::fs::remove_file(&out_path);
+                    let _ = std::os::unix::fs::symlink(target_name, &out_path);
+                }
+            }
+            continue;
+        }
+
+        if !entry_type.is_file() {
+            continue;
+        }
+
+        #[cfg(unix)]
+        let mode = entry.header().mode().ok();
+        let _ = std::fs::remove_file(&out_path);
+        let mut out_file = std::fs::File::create(&out_path)?;
+        std::io::copy(&mut entry, &mut out_file)?;
+        #[cfg(unix)]
+        apply_unix_runtime_perms(&out_path, mode);
+    }
+    Ok(())
 }
 
 fn extract_zip_flattened(zip_path: &Path, dest_dir: &Path) -> anyhow::Result<()> {
@@ -2188,12 +2522,20 @@ fn extract_zip_flattened(zip_path: &Path, dest_dir: &Path) -> anyhow::Result<()>
         if entry.is_dir() {
             continue;
         }
-        let Some(entry_name) = entry.enclosed_name().and_then(|p| p.file_name().map(|n| n.to_os_string())) else {
+        let Some(entry_name) = entry
+            .enclosed_name()
+            .and_then(|p| p.file_name().map(|n| n.to_os_string()))
+        else {
             continue;
         };
+        #[cfg(unix)]
+        let mode = entry.unix_mode();
         let out_path = dest_dir.join(entry_name);
+        let _ = std::fs::remove_file(&out_path);
         let mut out_file = std::fs::File::create(&out_path)?;
         std::io::copy(&mut entry, &mut out_file)?;
+        #[cfg(unix)]
+        apply_unix_runtime_perms(&out_path, mode);
     }
     Ok(())
 }
@@ -2219,6 +2561,109 @@ mod tests {
     }
 
     #[test]
+    fn parse_macos_spdisplays_detects_intel_mac_discrete_and_integrated_gpus() {
+        let sample = r#"
+Graphics/Displays:
+
+    Intel UHD Graphics 630:
+
+      Chipset Model: Intel UHD Graphics 630
+      Type: GPU
+      Bus: Built-In
+      VRAM (Dynamic, Max): 1536 MB
+      Vendor: Intel
+      Metal Support: Metal 3
+
+    AMD Radeon Pro 5500M:
+
+      Chipset Model: AMD Radeon Pro 5500M
+      Type: GPU
+      Bus: PCIe
+      PCIe Lane Width: x8
+      VRAM (Total): 4 GB
+      Vendor: AMD (0x1002)
+      Metal Support: Metal 3
+"#;
+        let gpus = parse_macos_spdisplays_gpus(sample);
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].name, "Intel UHD Graphics 630");
+        assert_eq!(gpus[0].vram_total_mb, 1536);
+        assert_eq!(gpus[0].driver_version, "Intel");
+        assert_eq!(gpus[0].backend, "Metal");
+
+        assert_eq!(gpus[1].name, "AMD Radeon Pro 5500M");
+        assert_eq!(gpus[1].vram_total_mb, 4096);
+        assert_eq!(gpus[1].driver_version, "AMD");
+        assert_eq!(gpus[1].backend, "Metal");
+    }
+
+    #[test]
+    fn select_llama_assets_for_supports_windows_macos_intel_arm_and_linux() {
+        let assets = vec![
+            GitHubAsset {
+                name: "llama-b12800-bin-win-cuda-12.4-x64.zip".into(),
+                browser_download_url: "https://example.com/win-cuda.zip".into(),
+            },
+            GitHubAsset {
+                name: "cudart-llama-bin-win-cuda-12.4-x64.zip".into(),
+                browser_download_url: "https://example.com/win-cudart.zip".into(),
+            },
+            GitHubAsset {
+                name: "llama-b12800-bin-win-vulkan-x64.zip".into(),
+                browser_download_url: "https://example.com/win-vk.zip".into(),
+            },
+            GitHubAsset {
+                name: "llama-b12800-bin-macos-arm64.tar.gz".into(),
+                browser_download_url: "https://example.com/mac-arm64.tar.gz".into(),
+            },
+            GitHubAsset {
+                name: "llama-b12800-bin-macos-x64.tar.gz".into(),
+                browser_download_url: "https://example.com/mac-x64.tar.gz".into(),
+            },
+            GitHubAsset {
+                name: "llama-b12800-bin-ubuntu-x64.tar.gz".into(),
+                browser_download_url: "https://example.com/ubuntu-x64.tar.gz".into(),
+            },
+            GitHubAsset {
+                name: "llama-b12800-bin-ubuntu-vulkan-x64.zip".into(),
+                browser_download_url: "https://example.com/ubuntu-vk.zip".into(),
+            },
+        ];
+
+        let win_cuda = select_llama_assets_for(&assets, "windows", "x86_64", "cuda");
+        assert_eq!(win_cuda.len(), 2);
+        assert_eq!(win_cuda[0].0, "llama-b12800-bin-win-cuda-12.4-x64.zip");
+
+        let win_vk = select_llama_assets_for(&assets, "windows", "x86_64", "vulkan");
+        assert_eq!(win_vk.len(), 1);
+        assert_eq!(win_vk[0].0, "llama-b12800-bin-win-vulkan-x64.zip");
+
+        let mac_intel = select_llama_assets_for(&assets, "macos", "x86_64", "cuda");
+        assert_eq!(mac_intel.len(), 1);
+        assert_eq!(mac_intel[0].0, "llama-b12800-bin-macos-x64.tar.gz");
+
+        let mac_arm = select_llama_assets_for(&assets, "macos", "aarch64", "cuda");
+        assert_eq!(mac_arm.len(), 1);
+        assert_eq!(mac_arm[0].0, "llama-b12800-bin-macos-arm64.tar.gz");
+
+        let linux_cpu = select_llama_assets_for(&assets, "linux", "x86_64", "cuda");
+        assert_eq!(linux_cpu.len(), 1);
+        assert_eq!(linux_cpu[0].0, "llama-b12800-bin-ubuntu-x64.tar.gz");
+
+        let linux_vk = select_llama_assets_for(&assets, "linux", "x86_64", "vulkan");
+        assert_eq!(linux_vk.len(), 1);
+        assert_eq!(linux_vk[0].0, "llama-b12800-bin-ubuntu-vulkan-x64.zip");
+
+        // Legacy .zip format still matches on macOS Intel when .tar.gz is absent
+        let legacy_mac_zip = vec![GitHubAsset {
+            name: "llama-b12000-bin-macos-x64.zip".into(),
+            browser_download_url: "https://example.com/mac-x64.zip".into(),
+        }];
+        let mac_zip_picked = select_llama_assets_for(&legacy_mac_zip, "macos", "x86_64", "cuda");
+        assert_eq!(mac_zip_picked[0].0, "llama-b12000-bin-macos-x64.zip");
+    }
+
+    #[test]
     fn pick_release_assets_skips_dummy_v1_tag_and_picks_compatible_build() {
         let dummy = GitHubRelease {
             tag_name: "v1.0.0".into(),
@@ -2241,6 +2686,10 @@ mod tests {
                 GitHubAsset {
                     name: "llama-b12621-bin-macos-arm64.zip".into(),
                     browser_download_url: "https://example.com/macos-arm64.zip".into(),
+                },
+                GitHubAsset {
+                    name: "llama-b12621-bin-macos-x64.tar.gz".into(),
+                    browser_download_url: "https://example.com/macos-x64.tar.gz".into(),
                 },
                 GitHubAsset {
                     name: "llama-b12621-bin-ubuntu-x64.zip".into(),

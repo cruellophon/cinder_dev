@@ -7,6 +7,7 @@ edition.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+flate2.workspace = true
 futures-util.workspace = true
 harness-net = { path = "../harness-net" }
 harness-store = { path = "../harness-store" }
@@ -15,6 +16,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tar.workspace = true
 tokio.workspace = true
 url.workspace = true
 uuid.workspace = true

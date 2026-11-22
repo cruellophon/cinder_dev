@@ -391,7 +391,11 @@ fn render_terminal_drawer(
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut state.terminal_cmd)
                             .font(egui::TextStyle::Monospace)
-                            .hint_text("Run PowerShell/shell command in active workspace...")
+                            .hint_text(if cfg!(windows) {
+                                "Run PowerShell command in active workspace..."
+                            } else {
+                                "Run shell command in active workspace..."
+                            })
                             .desired_width((ui.available_width() - 96.0).max(140.0))
                             .frame(false),
                     );

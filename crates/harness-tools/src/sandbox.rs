@@ -592,17 +592,34 @@ mod tests {
 
     #[test]
     fn relative_to_workspace_handles_verbatim_prefix_mismatch() {
-        let root = PathBuf::from(r"C:\Users\alice\Workspace");
-        let entry = PathBuf::from(r"\\?\C:\Users\alice\Workspace\Vorlesung\notes.md");
+        #[cfg(windows)]
+        {
+            let root = PathBuf::from(r"C:\Users\alice\Workspace");
+            let entry = PathBuf::from(r"\\?\C:\Users\alice\Workspace\Vorlesung\notes.md");
+            assert_eq!(
+                relative_to_workspace(&root, &entry).as_deref(),
+                Some("Vorlesung/notes.md")
+            );
+            let root_verb = PathBuf::from(r"\\?\C:\Users\alice\Workspace");
+            let entry_plain = PathBuf::from(r"C:\Users\alice\Workspace\README.md");
+            assert_eq!(
+                relative_to_workspace(&root_verb, &entry_plain).as_deref(),
+                Some("README.md")
+            );
+        }
+
+        let posix_root = PathBuf::from("/Users/alice/Workspace");
+        let posix_entry = PathBuf::from("/Users/alice/Workspace/Vorlesung/notes.md");
         assert_eq!(
-            relative_to_workspace(&root, &entry).as_deref(),
+            relative_to_workspace(&posix_root, &posix_entry).as_deref(),
             Some("Vorlesung/notes.md")
         );
-        let root_verb = PathBuf::from(r"\\?\C:\Users\alice\Workspace");
-        let entry_plain = PathBuf::from(r"C:\Users\alice\Workspace\README.md");
+
+        let verbatim_root = PathBuf::from("Users/alice/Workspace");
+        let verbatim_entry = PathBuf::from("//?/Users/alice/Workspace/Vorlesung/notes.md");
         assert_eq!(
-            relative_to_workspace(&root_verb, &entry_plain).as_deref(),
-            Some("README.md")
+            relative_to_workspace(&verbatim_root, &verbatim_entry).as_deref(),
+            Some("Vorlesung/notes.md")
         );
     }
 

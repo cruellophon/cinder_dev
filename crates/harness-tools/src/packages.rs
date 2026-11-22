@@ -253,6 +253,20 @@ fn build_npm_tokio_command(node_path: &Path, npm_path: &Path) -> tokio::process:
     cmd
 }
 
+fn nodejs_dist_spec_for(
+    os: &str,
+    arch: &str,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    match (os, arch) {
+        ("windows", "x86_64") => Some(("win-x64-zip", "win-x64.zip", "zip")),
+        ("macos", "aarch64") => Some(("osx-arm64-tar", "darwin-arm64.tar.gz", "targz")),
+        ("macos", "x86_64") => Some(("osx-x64-tar", "darwin-x64.tar.gz", "targz")),
+        ("linux", "x86_64") => Some(("linux-x64", "linux-x64.tar.gz", "targz")),
+        ("linux", "aarch64") => Some(("linux-arm64", "linux-arm64.tar.gz", "targz")),
+        _ => None,
+    }
+}
+
 async fn ensure_node_and_npm<F>(
     gate: &NetworkGate,
     paths: &BumboPaths,
@@ -274,6 +288,15 @@ where
             "Strict Local Mode blocked downloading Portable Node.js LTS. Switch to Hybrid Mode first."
         );
     }
+
+    let (index_file_tag, archive_suffix, archive_kind) =
+        nodejs_dist_spec_for(std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Automatic Portable Node.js LTS install is not configured for {}/{}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        })?;
 
     let stage = TempStageDir::create(stage_root, "nodejs-lts")?;
     on_log(
@@ -297,21 +320,25 @@ where
         .iter()
         .find(|r| {
             let is_lts = r.get("lts").map(|v| v.is_string()).unwrap_or(false);
-            let has_win = r["files"]
+            let has_target = r["files"]
                 .as_array()
-                .map(|a| a.iter().any(|f| f.as_str() == Some("win-x64-zip")))
+                .map(|a| a.iter().any(|f| f.as_str() == Some(index_file_tag)))
                 .unwrap_or(false);
-            is_lts && has_win
+            is_lts && has_target
         })
-        .ok_or_else(|| anyhow::anyhow!("Could not locate a Windows x64 Node.js LTS zip."))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not locate a Node.js LTS release matching '{index_file_tag}'."
+            )
+        })?;
 
     let ver = lts["version"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing Node.js LTS version field"))?;
-    let zip_name = format!("node-{ver}-win-x64.zip");
-    let url = format!("https://nodejs.org/dist/{ver}/{zip_name}");
+    let archive_name = format!("node-{ver}-{archive_suffix}");
+    let url = format!("https://nodejs.org/dist/{ver}/{archive_name}");
 
-    on_log(18, format!("Downloading {zip_name} into temp folder..."));
+    on_log(18, format!("Downloading {archive_name} into temp folder..."));
     let resp = gate
         .download_request(Method::GET, &url, "toolchain_nodejs_download")?
         .send()
@@ -321,8 +348,8 @@ where
     }
 
     let total_len = resp.content_length().unwrap_or(0);
-    let zip_path = stage.path().join(&zip_name);
-    let mut file = std::fs::File::create(&zip_path)?;
+    let archive_path = stage.path().join(&archive_name);
+    let mut file = std::fs::File::create(&archive_path)?;
     let mut stream = resp.bytes_stream();
     let mut downloaded = 0u64;
     let mut last_pct = 18u8;
@@ -338,7 +365,7 @@ where
                 let mb_tot = total_len as f64 / (1024.0 * 1024.0);
                 on_log(
                     pct,
-                    format!("Downloading {zip_name} ({mb_done:.1} / {mb_tot:.1} MB)..."),
+                    format!("Downloading {archive_name} ({mb_done:.1} / {mb_tot:.1} MB)..."),
                 );
             }
         }
@@ -348,19 +375,42 @@ where
 
     on_log(60, "Extracting Node.js LTS archive inside temp folder...".into());
     let extract_dir = stage.path().join("extracted");
-    let zp = zip_path.clone();
+    let ap = archive_path.clone();
     let ed = extract_dir.clone();
-    tokio::task::spawn_blocking(move || extract_zip_preserving_tree(&zp, &ed)).await??;
+    tokio::task::spawn_blocking(move || {
+        if archive_kind == "zip" {
+            extract_zip_preserving_tree(&ap, &ed)
+        } else {
+            extract_targz_preserving_tree(&ap, &ed)
+        }
+    })
+    .await??;
 
     let inner_dir = std::fs::read_dir(&extract_dir)?
         .flatten()
         .map(|e| e.path())
-        .find(|p| p.is_dir() && p.join("node.exe").exists())
-        .ok_or_else(|| anyhow::anyhow!("Extracted Node.js archive did not contain node.exe"))?;
+        .find(|p| {
+            if !p.is_dir() {
+                return false;
+            }
+            #[cfg(windows)]
+            {
+                p.join("node.exe").exists()
+            }
+            #[cfg(not(windows))]
+            {
+                p.join("bin").join("node").exists()
+            }
+        })
+        .ok_or_else(|| anyhow::anyhow!("Extracted Node.js archive did not contain node binary"))?;
 
-    let _ver_check =
-        probe_cmd_version(&inner_dir.join("node.exe").to_string_lossy(), &["--version"])
-            .ok_or_else(|| anyhow::anyhow!("Downloaded node.exe failed --version check"))?;
+    #[cfg(windows)]
+    let node_bin = inner_dir.join("node.exe");
+    #[cfg(not(windows))]
+    let node_bin = inner_dir.join("bin").join("node");
+
+    let _ver_check = probe_cmd_version(&node_bin.to_string_lossy(), &["--version"])
+        .ok_or_else(|| anyhow::anyhow!("Downloaded node binary failed --version check"))?;
 
     let final_dir = portable_node_dir(paths);
     if final_dir.exists() {
@@ -1753,9 +1803,9 @@ pub fn curated_plugin_catalog() -> Vec<CuratedPluginEntry> {
             kind: "toolchain".into(),
             category: "Managed Runtime".into(),
             version: "LTS".into(),
-            package_spec: "nodejs-lts-win-x64".into(),
-            entrypoint: "node.exe".into(),
-            description: "Downloads official Node.js LTS zip into Cinder's local toolchains folder — unlocks Node MCP servers & npm dependencies without system install.".into(),
+            package_spec: "nodejs-lts".into(),
+            entrypoint: if cfg!(windows) { "node.exe" } else { "bin/node" }.into(),
+            description: "Downloads official Node.js LTS archive into Cinder's local toolchains folder — unlocks Node MCP servers & npm dependencies without system install.".into(),
             requires_toolchain: None,
             needs_network: true,
             read_only: true,
@@ -2281,6 +2331,15 @@ fn extract_zip_preserving_tree(zip_path: &Path, dest_dir: &Path) -> anyhow::Resu
     Ok(())
 }
 
+fn extract_targz_preserving_tree(archive_path: &Path, dest_dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dest_dir)?;
+    let file = std::fs::File::open(archive_path)?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    archive.unpack(dest_dir)?;
+    Ok(())
+}
+
 pub fn uninstall_curated_plugin(paths: &BumboPaths, plugin_id: &str) -> anyhow::Result<Option<String>> {
     let entry = curated_plugin_catalog()
         .into_iter()
@@ -2782,5 +2841,29 @@ mod tests {
         assert!(validate_custom_package_name("python", "requests && calc.exe").is_err());
         assert!(validate_custom_package_name("npm", "../evil").is_err());
         assert!(validate_custom_package_name("cargo", "@foo/bar").is_err());
+    }
+
+    #[test]
+    fn nodejs_dist_spec_for_supports_windows_macos_intel_arm_and_linux() {
+        assert_eq!(
+            nodejs_dist_spec_for("windows", "x86_64"),
+            Some(("win-x64-zip", "win-x64.zip", "zip"))
+        );
+        assert_eq!(
+            nodejs_dist_spec_for("macos", "x86_64"),
+            Some(("osx-x64-tar", "darwin-x64.tar.gz", "targz"))
+        );
+        assert_eq!(
+            nodejs_dist_spec_for("macos", "aarch64"),
+            Some(("osx-arm64-tar", "darwin-arm64.tar.gz", "targz"))
+        );
+        assert_eq!(
+            nodejs_dist_spec_for("linux", "x86_64"),
+            Some(("linux-x64", "linux-x64.tar.gz", "targz"))
+        );
+        assert_eq!(
+            nodejs_dist_spec_for("linux", "aarch64"),
+            Some(("linux-arm64", "linux-arm64.tar.gz", "targz"))
+        );
     }
 }

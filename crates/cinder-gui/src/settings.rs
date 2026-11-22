@@ -953,14 +953,10 @@ fn render_engine_section(
                             }
                         );
                         if secondary_button(ui, p, &lbl).clicked() {
-                            let sep = if d.mount_point.ends_with('\\') || d.mount_point.ends_with('/')
-                            {
-                                ""
-                            } else {
-                                "\\"
-                            };
-                            state.vault_dir_draft =
-                                format!("{}{}Project_Bumbo_Models", d.mount_point, sep);
+                            state.vault_dir_draft = std::path::PathBuf::from(&d.mount_point)
+                                .join("Project_Bumbo_Models")
+                                .to_string_lossy()
+                                .to_string();
                         }
                     }
                 });

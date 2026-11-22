@@ -287,6 +287,11 @@ pub mod win32 {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn escape_applescript_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Open the native OS folder chooser on a dedicated STA thread (safe alongside winit/eframe).
 pub fn pick_folder(title: &str) -> anyhow::Result<Option<String>> {
     #[cfg(windows)]
@@ -299,10 +304,11 @@ pub fn pick_folder(title: &str) -> anyhow::Result<Option<String>> {
     }
     #[cfg(target_os = "macos")]
     {
+        let escaped = escape_applescript_string(title);
         let out = std::process::Command::new("osascript")
             .args([
                 "-e",
-                &format!("POSIX path of (choose folder with prompt \"{title}\")"),
+                &format!("POSIX path of (choose folder with prompt \"{escaped}\")"),
             ])
             .output()?;
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -310,9 +316,15 @@ pub fn pick_folder(title: &str) -> anyhow::Result<Option<String>> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let out = std::process::Command::new("zenity")
+        let out = match std::process::Command::new("zenity")
             .args(["--file-selection", "--directory", &format!("--title={title}")])
-            .output()?;
+            .output()
+        {
+            Ok(out) => out,
+            Err(_) => std::process::Command::new("kdialog")
+                .args(["--getexistingdirectory", ".", "--title", title])
+                .output()?,
+        };
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         return Ok(if s.is_empty() { None } else { Some(s) });
     }
@@ -330,26 +342,64 @@ pub fn pick_files(title: &str) -> anyhow::Result<Vec<String>> {
     }
     #[cfg(target_os = "macos")]
     {
+        let escaped = escape_applescript_string(title);
+        let script = format!(
+            "set picked to choose file with prompt \"{escaped}\" with multiple selections allowed\n\
+             set outList to \"\"\n\
+             repeat with f in picked\n\
+               set outList to outList & (POSIX path of f) & linefeed\n\
+             end repeat\n\
+             return outList"
+        );
         let out = std::process::Command::new("osascript")
-            .args([
-                "-e",
-                &format!("POSIX path of (choose file with prompt \"{title}\")"),
-            ])
+            .args(["-e", &script])
             .output()?;
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        return Ok(if s.is_empty() { Vec::new() } else { vec![s] });
+        let text = String::from_utf8_lossy(&out.stdout);
+        return Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect());
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let out = std::process::Command::new("zenity")
+        match std::process::Command::new("zenity")
             .args(["--file-selection", "--multiple", &format!("--title={title}")])
-            .output()?;
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        return Ok(if s.is_empty() {
-            Vec::new()
-        } else {
-            s.split('|').map(|x| x.to_string()).collect()
-        });
+            .output()
+        {
+            Ok(out) => {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                return Ok(if s.is_empty() {
+                    Vec::new()
+                } else {
+                    s.split('|')
+                        .map(str::trim)
+                        .filter(|x| !x.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                });
+            }
+            Err(_) => {
+                let out = std::process::Command::new("kdialog")
+                    .args([
+                        "--getopenfilename",
+                        ".",
+                        "--multiple",
+                        "--separate-output",
+                        "--title",
+                        title,
+                    ])
+                    .output()?;
+                let text = String::from_utf8_lossy(&out.stdout);
+                return Ok(text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect());
+            }
+        }
     }
 }
 
@@ -466,7 +516,7 @@ pub fn open_url_safely(raw_url: &str) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     #[test]
     fn open_url_safely_rejects_dangerous_schemes() {
@@ -483,6 +533,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn escape_applescript_string_escapes_quotes_and_backslashes() {
+        assert_eq!(
+            super::escape_applescript_string(r#"Pick "Project" in C:\Work"#),
+            r#"Pick \"Project\" in C:\\Work"#
+        );
+    }
+
+    #[cfg(windows)]
     #[test]
     fn win32_dialogs_initialize_on_sta_thread() {
         let ok_folder = std::thread::spawn(|| {

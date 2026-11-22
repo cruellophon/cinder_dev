@@ -74,12 +74,20 @@ pub fn run_native_cinder_with_options(
 }
 
 pub fn run_native_cinder_with_launch(opts: CinderLaunchOptions) -> anyhow::Result<()> {
-    let mut viewport = egui::ViewportBuilder::default()
+    let viewport = egui::ViewportBuilder::default()
         .with_inner_size([1560.0, 960.0])
         .with_min_inner_size([960.0, 640.0])
         .with_title("Cinder v5.5 — Local Agentic IDE & Model Forge")
-        .with_decorations(false)
         .with_drag_and_drop(true);
+    #[cfg(target_os = "macos")]
+    let mut viewport = viewport
+        .with_decorations(true)
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(false)
+        .with_titlebar_buttons_shown(true);
+    #[cfg(not(target_os = "macos"))]
+    let mut viewport = viewport.with_decorations(false);
     if let Some(icon) = load_cinder_icon_data() {
         viewport = viewport.with_icon(Arc::new(icon));
     }
@@ -380,33 +388,34 @@ impl CinderApp {
     fn handle_shortcuts_and_dnd(&mut self, ctx: &egui::Context) {
         let wants_kbd = ctx.wants_keyboard_input();
         let (focused, ctrl_active, has_text_paste, fallback_paste_evt, dropped) = ctx.input(|i| {
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::B) {
+            let cmd = i.modifiers.command || i.modifiers.ctrl;
+            if cmd && i.key_pressed(egui::Key::B) {
                 self.state.show_sidebar = !self.state.show_sidebar;
             }
             if self.state.main_view == MainView::Chat {
-                if i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::E) {
+                if cmd && i.modifiers.shift && i.key_pressed(egui::Key::E) {
                     self.state.show_explorer = !self.state.show_explorer;
-                } else if i.modifiers.ctrl && i.key_pressed(egui::Key::E) {
+                } else if cmd && i.key_pressed(egui::Key::E) {
                     self.state.show_workbench = !self.state.show_workbench;
                 }
-                if i.modifiers.ctrl && i.key_pressed(egui::Key::Backtick) {
+                if cmd && i.key_pressed(egui::Key::Backtick) {
                     self.state.show_terminal = !self.state.show_terminal;
                     if self.state.show_terminal {
                         self.state.open_stage_tab(StageTab::Editor);
                     }
                 }
             }
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::K) {
+            if cmd && i.key_pressed(egui::Key::K) {
                 self.state.show_cmd_palette = !self.state.show_cmd_palette;
             }
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::Comma) {
+            if cmd && i.key_pressed(egui::Key::Comma) {
                 if self.state.show_settings_modal {
                     self.state.show_settings_modal = false;
                 } else {
                     self.state.open_settings(self.state.settings_tab);
                 }
             }
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::S) {
+            if cmd && i.key_pressed(egui::Key::S) {
                 if let Some(ap) = self.state.active_tab_path.clone() {
                     if let Some(tab) = self.state.editor_tabs.iter_mut().find(|t| t.rel_path == ap)
                     {
@@ -422,10 +431,10 @@ impl CinderApp {
                 && self.state.show_workbench
                 && self.state.stage_tab == StageTab::Editor
             {
-                if i.modifiers.ctrl && i.key_pressed(egui::Key::F) {
+                if cmd && i.key_pressed(egui::Key::F) {
                     self.state.editor_find_open = !self.state.editor_find_open;
                 }
-                if i.modifiers.ctrl && i.key_pressed(egui::Key::W) {
+                if cmd && i.key_pressed(egui::Key::W) {
                     if let Some(ap) = self.state.active_tab_path.clone() {
                         self.state.editor_tabs.retain(|t| t.rel_path != ap);
                         self.state.active_tab_path =
@@ -441,7 +450,7 @@ impl CinderApp {
                 self.state.dragging_explorer_item = None;
             }
 
-            let ctrl_active = i.modifiers.ctrl || i.modifiers.command;
+            let ctrl_active = cmd;
             let has_text_paste = i
                 .events
                 .iter()
@@ -490,7 +499,10 @@ impl CinderApp {
         #[cfg(windows)]
         let win32_ctrl_v = focused && poll_win32_ctrl_v_down();
         #[cfg(not(windows))]
-        let win32_ctrl_v = false;
+        let win32_ctrl_v = {
+            let _ = focused;
+            false
+        };
 
         let rising_ctrl_v = win32_ctrl_v && !self.state.ctrl_v_latch;
         if win32_ctrl_v {
@@ -571,7 +583,7 @@ impl eframe::App for CinderApp {
 
         // App-styled frameless Title / Menu Bar with single 1px bottom hairline separator
         egui::TopBottomPanel::top("cinder_topbar")
-            .exact_height(30.0)
+            .exact_height(if cfg!(target_os = "macos") { 34.0 } else { 30.0 })
             .show_separator_line(true)
             .frame(
                 Frame::new()
@@ -742,7 +754,9 @@ impl eframe::App for CinderApp {
                                 .map(|s| s.settings.active_workspace_path.clone())
                                 .unwrap_or_default();
                             if !ws_root.trim().is_empty() {
-                                let abs = PathBuf::from(&ws_root).join(drag_rel.replace('/', "\\"));
+                                let abs = drag_rel
+                                    .split('/')
+                                    .fold(PathBuf::from(&ws_root), |acc, seg| acc.join(seg));
                                 self.state.attach_external_paths(&[abs]);
                             } else if !self.state.attached_files.iter().any(|f| f == &drag_rel) {
                                 self.state.attached_files.push(drag_rel.clone());

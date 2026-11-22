@@ -15,6 +15,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+const MOD_KEY: &str = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+
 pub fn render_topbar(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
@@ -73,6 +75,8 @@ pub fn render_topbar(
 
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
+            #[cfg(target_os = "macos")]
+            ui.add_space(74.0);
 
             // Top-left animated Cinder Glowing Orb (version hidden cleanly inside tooltip)
             let (orb_rect, orb_resp) =
@@ -104,11 +108,14 @@ pub fn render_topbar(
                     state.switch_main_view(MainView::Chat, true);
                     ui.close_menu();
                 }
-                if ui.button("Command Palette (Ctrl+K)").clicked() {
+                if ui
+                    .button(format!("Command Palette ({MOD_KEY}+K)"))
+                    .clicked()
+                {
                     state.show_cmd_palette = true;
                     ui.close_menu();
                 }
-                if ui.button("Settings (Ctrl+,)").clicked() {
+                if ui.button(format!("Settings ({MOD_KEY}+,)")).clicked() {
                     state.open_settings(state.settings_tab);
                     ui.close_menu();
                 }
@@ -145,7 +152,10 @@ pub fn render_topbar(
                     );
                     ui.close_menu();
                 }
-                if ui.button("Toggle File Explorer (Ctrl+Shift+E)").clicked() {
+                if ui
+                    .button(format!("Toggle File Explorer ({MOD_KEY}+Shift+E)"))
+                    .clicked()
+                {
                     state.main_view = MainView::Chat;
                     state.show_settings_modal = false;
                     state.show_explorer = !state.show_explorer;
@@ -162,23 +172,35 @@ pub fn render_topbar(
             });
 
             ui.menu_button("View", |ui| {
-                if ui.button("Toggle Sidebar (Ctrl+B)").clicked() {
+                if ui
+                    .button(format!("Toggle Sidebar ({MOD_KEY}+B)"))
+                    .clicked()
+                {
                     state.show_sidebar = !state.show_sidebar;
                     ui.close_menu();
                 }
-                if ui.button("Toggle Coding Stage (Ctrl+E)").clicked() {
+                if ui
+                    .button(format!("Toggle Coding Stage ({MOD_KEY}+E)"))
+                    .clicked()
+                {
                     state.main_view = MainView::Chat;
                     state.show_settings_modal = false;
                     state.show_workbench = !state.show_workbench;
                     ui.close_menu();
                 }
-                if ui.button("Toggle File Explorer (Ctrl+Shift+E)").clicked() {
+                if ui
+                    .button(format!("Toggle File Explorer ({MOD_KEY}+Shift+E)"))
+                    .clicked()
+                {
                     state.main_view = MainView::Chat;
                     state.show_settings_modal = false;
                     state.show_explorer = !state.show_explorer;
                     ui.close_menu();
                 }
-                if ui.button("Toggle Terminal (Ctrl+`)").clicked() {
+                if ui
+                    .button(format!("Toggle Terminal ({MOD_KEY}+`)"))
+                    .clicked()
+                {
                     state.show_terminal = !state.show_terminal;
                     if state.show_terminal {
                         state.open_stage_tab(StageTab::Editor);
@@ -215,68 +237,71 @@ pub fn render_topbar(
                     ui.spacing_mut().item_spacing.x = 4.0;
                     let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
 
-                    // Window Close button
-                    let (close_rect, close_resp) =
-                        ui.allocate_exact_size(egui::vec2(28.0, 22.0), egui::Sense::click());
-                    if close_resp.hovered() {
-                        ui.painter().rect_filled(
-                            close_rect,
-                            CornerRadius::same(5),
-                            Color32::from_rgb(196, 43, 43),
-                        );
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    draw_icon(
-                        ui.painter(),
-                        egui::Rect::from_center_size(close_rect.center(), egui::vec2(15.0, 15.0)),
-                        Icon::Close,
-                        if close_resp.hovered() {
-                            Color32::WHITE
-                        } else {
-                            p.muted
-                        },
-                    );
-                    if close_resp.on_hover_text("Close Window").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-
-                    // Window Maximize / Restore button
-                    let (max_rect, max_resp) =
-                        ui.allocate_exact_size(egui::vec2(28.0, 22.0), egui::Sense::click());
-                    if max_resp.hovered() {
-                        ui.painter()
-                            .rect_filled(max_rect, CornerRadius::same(5), p.bg_hover);
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    draw_icon(
-                        ui.painter(),
-                        egui::Rect::from_center_size(max_rect.center(), egui::vec2(15.0, 15.0)),
-                        Icon::WindowMaximize,
-                        if max_resp.hovered() { p.text } else { p.muted },
-                    );
-                    if max_resp
-                        .on_hover_text(if is_max { "Restore" } else { "Maximize" })
-                        .clicked()
+                    #[cfg(not(target_os = "macos"))]
                     {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
-                    }
+                        // Window Close button
+                        let (close_rect, close_resp) =
+                            ui.allocate_exact_size(egui::vec2(28.0, 22.0), egui::Sense::click());
+                        if close_resp.hovered() {
+                            ui.painter().rect_filled(
+                                close_rect,
+                                CornerRadius::same(5),
+                                Color32::from_rgb(196, 43, 43),
+                            );
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        draw_icon(
+                            ui.painter(),
+                            egui::Rect::from_center_size(close_rect.center(), egui::vec2(15.0, 15.0)),
+                            Icon::Close,
+                            if close_resp.hovered() {
+                                Color32::WHITE
+                            } else {
+                                p.muted
+                            },
+                        );
+                        if close_resp.on_hover_text("Close Window").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
 
-                    // Window Minimize button
-                    let (min_rect, min_resp) =
-                        ui.allocate_exact_size(egui::vec2(28.0, 22.0), egui::Sense::click());
-                    if min_resp.hovered() {
-                        ui.painter()
-                            .rect_filled(min_rect, CornerRadius::same(5), p.bg_hover);
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    draw_icon(
-                        ui.painter(),
-                        egui::Rect::from_center_size(min_rect.center(), egui::vec2(15.0, 15.0)),
-                        Icon::WindowMinimize,
-                        if min_resp.hovered() { p.text } else { p.muted },
-                    );
-                    if min_resp.on_hover_text("Minimize").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        // Window Maximize / Restore button
+                        let (max_rect, max_resp) =
+                            ui.allocate_exact_size(egui::vec2(28.0, 22.0), egui::Sense::click());
+                        if max_resp.hovered() {
+                            ui.painter()
+                                .rect_filled(max_rect, CornerRadius::same(5), p.bg_hover);
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        draw_icon(
+                            ui.painter(),
+                            egui::Rect::from_center_size(max_rect.center(), egui::vec2(15.0, 15.0)),
+                            Icon::WindowMaximize,
+                            if max_resp.hovered() { p.text } else { p.muted },
+                        );
+                        if max_resp
+                            .on_hover_text(if is_max { "Restore" } else { "Maximize" })
+                            .clicked()
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                        }
+
+                        // Window Minimize button
+                        let (min_rect, min_resp) =
+                            ui.allocate_exact_size(egui::vec2(28.0, 22.0), egui::Sense::click());
+                        if min_resp.hovered() {
+                            ui.painter()
+                                .rect_filled(min_rect, CornerRadius::same(5), p.bg_hover);
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        draw_icon(
+                            ui.painter(),
+                            egui::Rect::from_center_size(min_rect.center(), egui::vec2(15.0, 15.0)),
+                            Icon::WindowMinimize,
+                            if min_resp.hovered() { p.text } else { p.muted },
+                        );
+                        if min_resp.on_hover_text("Minimize").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
                     }
 
                     // Browser-style Download Progress Pill in top-right titlebar
