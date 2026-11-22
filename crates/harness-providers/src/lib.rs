@@ -1,0 +1,2661 @@
+use futures_util::StreamExt;
+use harness_models::{ActiveServerBackend, LocalModelEntry, ServerManager};
+use harness_net::NetworkGate;
+use harness_store::{
+    is_viable_gemini_chat_model, sort_gemini_models_by_priority, BumboStore, ModelCatalogEntry,
+    ModelQuotaLimit, ProviderKind,
+};
+use reqwest::header::HeaderMap;
+use reqwest::Method;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters_schema: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRequest {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+    #[serde(default)]
+    pub thought_signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderMessage {
+    pub role: String, // "user" | "assistant" | "tool"
+    pub content: String,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_calls: Vec<ToolCallRequest>,
+    #[serde(default)]
+    pub images: Vec<(String, String)>, // (mime_type, data_base64)
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletionRequest {
+    pub model_id: String,
+    pub system_prompt: String,
+    pub messages: Vec<ProviderMessage>,
+    pub tools: Vec<ToolSpec>,
+    pub enable_thinking: bool,
+    pub max_tokens: u32,
+    pub temperature: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionResponse {
+    pub content: String,
+    pub thinking: Option<String>,
+    pub tool_calls: Vec<ToolCallRequest>,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub thinking_tokens: u64,
+    pub latency_ms: u64,
+    /// The actual model ID that generated this response (may differ if auto-switched).
+    #[serde(default)]
+    pub actual_model_id: String,
+    /// Original model ID if Cinder automatically switched away from a failing/rate-limited model.
+    #[serde(default)]
+    pub switched_from: Option<String>,
+    /// Human-readable reason for automatic model switching.
+    #[serde(default)]
+    pub switch_reason: Option<String>,
+}
+
+async fn complete_single(
+    gate: &NetworkGate,
+    store: &BumboStore,
+    settings: &harness_store::AppSettings,
+    server_mgr: &ServerManager,
+    local_models: &[LocalModelEntry],
+    catalog: &[ModelCatalogEntry],
+    req: &CompletionRequest,
+) -> anyhow::Result<(CompletionResponse, Option<RateHeaders>)> {
+    // 1. Local model routing
+    if req.model_id.starts_with("local::") {
+        let target_local = local_models
+            .iter()
+            .find(|m| m.id == req.model_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Local model '{}' was not found in the vault or Ollama blobs.",
+                    req.model_id
+                )
+            })?;
+
+        let status = server_mgr.server_status().await;
+        if !status.running || status.model_id.as_deref() != Some(&target_local.id) {
+            server_mgr
+                .start_local_model(
+                    gate,
+                    target_local,
+                    settings.local_server_port,
+                    settings.local_ctx_size,
+                    settings.local_gpu_layers,
+                    settings.expose_local_api,
+                )
+                .await?;
+        }
+
+        let (backend, endpoint, token, model_name) = server_mgr
+            .active_endpoint_and_token()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Local model server is not active."))?;
+
+        let active_status = server_mgr.server_status().await;
+        let has_images = req.messages.iter().any(|m| !m.images.is_empty());
+        let adjusted_req;
+        let effective_req = if backend == ActiveServerBackend::LlamaServer
+            && has_images
+            && !active_status.has_mmproj
+        {
+            adjusted_req = strip_images_with_vision_hint(
+                req,
+                "active local GGUF model has no companion --mmproj vision projector",
+            );
+            &adjusted_req
+        } else {
+            req
+        };
+
+        let mut resp = match backend {
+            ActiveServerBackend::LlamaServer => {
+                complete_openai_compat(
+                    gate,
+                    &format!("{endpoint}/v1/chat/completions"),
+                    token.as_deref(),
+                    &model_name,
+                    effective_req,
+                    "local_inference",
+                )
+                .await?
+            }
+            ActiveServerBackend::OllamaLoopback => {
+                complete_ollama_loopback(gate, store, &endpoint, &model_name, effective_req)
+                    .await?
+            }
+            ActiveServerBackend::None => anyhow::bail!("Local model backend not initialized."),
+        };
+        resp.actual_model_id = req.model_id.clone();
+        return Ok((resp, None));
+    }
+
+    // 2. Cloud catalog routing
+    let entry = catalog.iter().find(|c| c.id == req.model_id);
+    let cloud_supports_vision = entry.map(|e| e.supports_vision).unwrap_or(true);
+    let cloud_adjusted_req;
+    let effective_cloud_req = if !cloud_supports_vision
+        && req.messages.iter().any(|m| !m.images.is_empty())
+    {
+        cloud_adjusted_req = strip_images_with_vision_hint(req, "selected text-only cloud model");
+        &cloud_adjusted_req
+    } else {
+        req
+    };
+    let provider = entry
+        .map(|e| e.provider)
+        .unwrap_or_else(|| infer_provider_from_id(&effective_cloud_req.model_id));
+
+    let (mut resp, rate_headers) = match provider {
+        ProviderKind::GoogleGemini => {
+            if settings.api_keys.gemini_api_key.trim().is_empty() {
+                anyhow::bail!(
+                    "Gemini API key is not configured. Open Settings -> Cloud Keys & Models to add your Google AI / Gemini API key (or switch to a Local model)."
+                );
+            }
+            let supports_thinking = entry.map(|e| e.supports_thinking).unwrap_or_else(|| {
+                let lower = effective_cloud_req.model_id.to_ascii_lowercase();
+                lower.contains("thinking") || lower.contains("gemini-3-flash")
+            });
+            let supports_tools = entry.map(|e| e.supports_tools).unwrap_or_else(|| {
+                !effective_cloud_req
+                    .model_id
+                    .to_ascii_lowercase()
+                    .starts_with("gemma")
+            });
+            complete_gemini(
+                gate,
+                store,
+                &settings.api_keys.gemini_api_key,
+                effective_cloud_req,
+                supports_thinking,
+                supports_tools,
+            )
+            .await?
+        }
+        ProviderKind::Anthropic => {
+            if settings.api_keys.anthropic_api_key.trim().is_empty() {
+                anyhow::bail!("Anthropic API key is not configured. Add it in Settings -> Cloud Keys & Models.");
+            }
+            complete_anthropic(
+                gate,
+                &settings.api_keys.anthropic_api_key,
+                effective_cloud_req,
+            )
+            .await?
+        }
+        ProviderKind::OpenRouter => {
+            if settings.api_keys.openrouter_api_key.trim().is_empty() {
+                anyhow::bail!("OpenRouter API key is not configured. Add it in Settings -> Cloud Keys & Models.");
+            }
+            complete_openai_compat_with_headers(
+                gate,
+                "https://openrouter.ai/api/v1/chat/completions",
+                Some(settings.api_keys.openrouter_api_key.trim()),
+                &effective_cloud_req.model_id,
+                effective_cloud_req,
+                "openrouter_api",
+            )
+            .await?
+        }
+        ProviderKind::OpenAiCompat => {
+            let base = settings.api_keys.openai_compat_base_url.trim().trim_end_matches('/');
+            if base.is_empty() {
+                anyhow::bail!("Custom OpenAI-compatible Base URL is not configured.");
+            }
+            let key = settings.api_keys.openai_compat_api_key.trim();
+            complete_openai_compat_with_headers(
+                gate,
+                &format!("{base}/chat/completions"),
+                if key.is_empty() { None } else { Some(key) },
+                &effective_cloud_req.model_id,
+                effective_cloud_req,
+                "openai_compat_api",
+            )
+            .await?
+        }
+        ProviderKind::LocalLlama | ProviderKind::LocalOllama => {
+            anyhow::bail!("Local provider must use local:: model prefix.");
+        }
+    };
+
+    resp.actual_model_id = req.model_id.clone();
+    Ok((resp, Some(rate_headers)))
+}
+
+fn strip_images_with_vision_hint(req: &CompletionRequest, reason: &str) -> CompletionRequest {
+    let mut cloned = req.clone();
+    for m in &mut cloned.messages {
+        if !m.images.is_empty() {
+            let count = m.images.len();
+            m.images.clear();
+            m.content.push_str(&format!(
+                "\n[Attached image(s) ({count}) cannot be viewed directly by this model ({reason}). Call the `delegate_vision` tool with a clear `prompt` to inspect them via the Vision Sub-Agent.]"
+            ));
+        }
+    }
+    cloned
+}
+
+pub async fn complete(
+    gate: &NetworkGate,
+    store: &BumboStore,
+    server_mgr: &ServerManager,
+    local_models: &[LocalModelEntry],
+    req: CompletionRequest,
+) -> anyhow::Result<CompletionResponse> {
+    let settings = store.snapshot().await.settings;
+    let (catalog, _) = store.build_cloud_catalog_and_quotas().await;
+
+    let first_attempt = complete_single(
+        gate,
+        store,
+        &settings,
+        server_mgr,
+        local_models,
+        &catalog,
+        &req,
+    )
+    .await;
+
+    let (resp, maybe_rate_headers, usage_model_id) = match first_attempt {
+        Ok((resp, headers)) => (resp, headers, req.model_id.clone()),
+        Err(first_err) => {
+            let raw_err = first_err.to_string();
+            let (should_switch, should_block, reason) = classify_provider_error(&raw_err);
+            let is_local = req.model_id.starts_with("local::");
+
+            if should_block && !is_local {
+                let _ = store
+                    .mark_model_blocked(&req.model_id, reason)
+                    .await;
+            }
+
+            if !settings.auto_switch_models || !should_switch {
+                anyhow::bail!("{}", format_clean_provider_error(&raw_err));
+            }
+
+            let failed_provider = if is_local {
+                ProviderKind::LocalLlama
+            } else {
+                catalog
+                    .iter()
+                    .find(|c| c.id == req.model_id)
+                    .map(|e| e.provider)
+                    .unwrap_or_else(|| infer_provider_from_id(&req.model_id))
+            };
+
+            let (fresh_catalog, _) = store.build_cloud_catalog_and_quotas().await;
+            let candidates = build_fallback_candidates(
+                &req.model_id,
+                failed_provider,
+                &fresh_catalog,
+                local_models,
+                settings.fallback_to_local,
+            );
+
+            if candidates.is_empty() {
+                anyhow::bail!("{}", format_clean_provider_error(&raw_err));
+            }
+
+            let mut last_fb_err = String::new();
+            let mut switched_ok: Option<(CompletionResponse, Option<RateHeaders>, String)> = None;
+
+            for cand_id in candidates.into_iter().take(3) {
+                let mut fb_req = req.clone();
+                fb_req.model_id = cand_id.clone();
+                match complete_single(
+                    gate,
+                    store,
+                    &settings,
+                    server_mgr,
+                    local_models,
+                    &fresh_catalog,
+                    &fb_req,
+                )
+                .await
+                {
+                    Ok((mut fb_resp, fb_headers)) => {
+                        let _ = store
+                            .update(|s| {
+                                s.settings.active_model_id = cand_id.clone();
+                            })
+                            .await;
+                        let note = format!(
+                            "[Auto-Switch] Model '{}' hit {} — switched automatically to '{}'.",
+                            req.model_id, reason, cand_id
+                        );
+                        fb_resp.thinking = Some(match fb_resp.thinking.take() {
+                            Some(prev) if !prev.trim().is_empty() => format!("{note}\n\n{prev}"),
+                            _ => note,
+                        });
+                        fb_resp.actual_model_id = cand_id.clone();
+                        fb_resp.switched_from = Some(req.model_id.clone());
+                        fb_resp.switch_reason = Some(reason.to_string());
+                        switched_ok = Some((fb_resp, fb_headers, cand_id));
+                        break;
+                    }
+                    Err(fb_err) => {
+                        let fb_raw = fb_err.to_string();
+                        let (_, fb_block, fb_reason) = classify_provider_error(&fb_raw);
+                        if fb_block && !cand_id.starts_with("local::") {
+                            let _ = store.mark_model_blocked(&cand_id, fb_reason).await;
+                        }
+                        last_fb_err = format!(
+                            "{cand_id}: {}",
+                            format_clean_provider_error(&fb_raw)
+                        );
+                    }
+                }
+            }
+
+            match switched_ok {
+                Some(ok) => ok,
+                None => anyhow::bail!(
+                    "Model '{}' failed ({}) and auto-switch fallbacks failed ({})",
+                    req.model_id,
+                    format_clean_provider_error(&raw_err),
+                    last_fb_err
+                ),
+            }
+        }
+    };
+
+    if let Some(headers) = maybe_rate_headers {
+        store
+            .record_usage(
+                &usage_model_id,
+                resp.prompt_tokens,
+                resp.completion_tokens,
+                resp.thinking_tokens,
+                headers.rem_req,
+                headers.lim_req,
+                headers.rem_tok,
+                headers.lim_tok,
+            )
+            .await?;
+    }
+
+    Ok(resp)
+}
+
+pub fn classify_provider_error(err_str: &str) -> (bool, bool, &'static str) {
+    let lower = err_str.to_ascii_lowercase();
+    if lower.contains("limit: 0") || err_str.contains("HTTP 404") || err_str.contains("NOT_FOUND") {
+        return (true, true, "0 quota / unavailable on current API tier");
+    }
+    if err_str.contains("HTTP 429")
+        || err_str.contains("RESOURCE_EXHAUSTED")
+        || lower.contains("too many requests")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("quota exceeded")
+    {
+        return (true, false, "rate limit / quota exhausted");
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return (true, false, "request timed out");
+    }
+    if lower.contains("connection")
+        || lower.contains("error sending request")
+        || lower.contains("channel closed")
+        || lower.contains("eof")
+    {
+        return (true, false, "connection dropped / reset");
+    }
+    if err_str.contains("HTTP 500")
+        || err_str.contains("HTTP 503")
+        || err_str.contains("HTTP 529")
+        || err_str.contains("HTTP 502")
+        || err_str.contains("HTTP 504")
+        || lower.contains("overloaded")
+        || err_str.contains("UNAVAILABLE")
+        || err_str.contains("INTERNAL")
+    {
+        return (true, false, "provider overloaded / temporarily unavailable");
+    }
+    if err_str.contains("HTTP 401") || err_str.contains("HTTP 403") {
+        return (true, false, "authentication / access denied");
+    }
+    (false, false, "provider error")
+}
+
+pub fn build_fallback_candidates(
+    failed_id: &str,
+    failed_provider: ProviderKind,
+    catalog: &[ModelCatalogEntry],
+    local_models: &[LocalModelEntry],
+    fallback_to_local: bool,
+) -> Vec<String> {
+    const GEMINI_PRIORITY: &[&str] = &[
+        "gemini-3-flash-preview",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-flash-lite-latest",
+        "gemini-3.1-flash-lite-preview",
+        "gemma-4-26b-a4b-it",
+    ];
+
+    let mut out: Vec<String> = Vec::new();
+    let mut push_unique = |id: &str| {
+        if id != failed_id && !out.iter().any(|x| x == id) {
+            out.push(id.to_string());
+        }
+    };
+
+    // 1. Preferred same-provider fallbacks first
+    if failed_provider == ProviderKind::GoogleGemini {
+        for pref in GEMINI_PRIORITY {
+            if catalog
+                .iter()
+                .any(|c| c.id == *pref && c.provider == ProviderKind::GoogleGemini && c.reachable)
+            {
+                push_unique(pref);
+            }
+        }
+    }
+    for c in catalog
+        .iter()
+        .filter(|c| c.provider == failed_provider && c.reachable)
+    {
+        push_unique(&c.id);
+    }
+
+    // 2. Cross-provider reachable cloud models
+    let provider_order = [
+        ProviderKind::GoogleGemini,
+        ProviderKind::Anthropic,
+        ProviderKind::OpenRouter,
+        ProviderKind::OpenAiCompat,
+    ];
+    for p in provider_order {
+        if p == failed_provider {
+            continue;
+        }
+        if p == ProviderKind::GoogleGemini {
+            for pref in GEMINI_PRIORITY {
+                if catalog
+                    .iter()
+                    .any(|c| c.id == *pref && c.provider == ProviderKind::GoogleGemini && c.reachable)
+                {
+                    push_unique(pref);
+                }
+            }
+        }
+        for c in catalog.iter().filter(|c| c.provider == p && c.reachable) {
+            push_unique(&c.id);
+        }
+    }
+
+    // 3. Optional fallback to local GGUF/Ollama models (only when opted in)
+    if fallback_to_local {
+        let mut locals: Vec<&LocalModelEntry> = local_models
+            .iter()
+            .filter(|m| !m.is_embedding && m.is_valid_gguf && m.id != failed_id)
+            .collect();
+        locals.sort_by_key(|m| m.vram_fit.estimated_total_mb);
+        for m in locals {
+            push_unique(&m.id);
+        }
+    }
+
+    out
+}
+
+pub fn format_clean_provider_error(raw: &str) -> String {
+    if let Some(json_start) = raw.find('{') {
+        let prefix = raw[..json_start].trim().trim_end_matches(':').trim();
+        let json_part = &raw[json_start..];
+        if let Ok(val) = serde_json::from_str::<Value>(json_part) {
+            if let Some(msg) = val["error"]["message"].as_str() {
+                let first_line = msg.lines().next().unwrap_or(msg).trim();
+                let short_msg: String = first_line.chars().take(240).collect();
+                return if prefix.is_empty() {
+                    short_msg
+                } else {
+                    format!("{prefix}: {short_msg}")
+                };
+            }
+        }
+    }
+    raw.chars().take(280).collect()
+}
+
+fn infer_provider_from_id(id: &str) -> ProviderKind {
+    let lower = id.to_ascii_lowercase();
+    if lower.starts_with("gemini-") || lower.starts_with("gemma-") {
+        ProviderKind::GoogleGemini
+    } else if lower.starts_with("claude-") {
+        ProviderKind::Anthropic
+    } else if lower.contains('/') {
+        ProviderKind::OpenRouter
+    } else {
+        ProviderKind::OpenAiCompat
+    }
+}
+
+#[derive(Default)]
+struct RateHeaders {
+    rem_req: Option<u64>,
+    lim_req: Option<u64>,
+    rem_tok: Option<u64>,
+    lim_tok: Option<u64>,
+}
+
+fn extract_rate_headers(headers: &HeaderMap) -> RateHeaders {
+    let parse_h = |names: &[&str]| -> Option<u64> {
+        for n in names {
+            if let Some(val) = headers.get(*n).and_then(|v| v.to_str().ok()) {
+                if let Ok(parsed) = val.trim().parse::<u64>() {
+                    return Some(parsed);
+                }
+            }
+        }
+        None
+    };
+
+    RateHeaders {
+        rem_req: parse_h(&[
+            "x-ratelimit-remaining-requests",
+            "anthropic-ratelimit-requests-remaining",
+        ]),
+        lim_req: parse_h(&[
+            "x-ratelimit-limit-requests",
+            "anthropic-ratelimit-requests-limit",
+        ]),
+        rem_tok: parse_h(&[
+            "x-ratelimit-remaining-tokens",
+            "anthropic-ratelimit-tokens-remaining",
+        ]),
+        lim_tok: parse_h(&[
+            "x-ratelimit-limit-tokens",
+            "anthropic-ratelimit-tokens-limit",
+        ]),
+    }
+}
+
+async fn complete_ollama_loopback(
+    gate: &NetworkGate,
+    store: &BumboStore,
+    endpoint: &str,
+    model_name: &str,
+    req: &CompletionRequest,
+) -> anyhow::Result<CompletionResponse> {
+    let start = Instant::now();
+    let url = format!("{endpoint}/api/chat");
+
+    let mut msgs = Vec::new();
+    if !req.system_prompt.trim().is_empty() {
+        msgs.push(json!({ "role": "system", "content": req.system_prompt }));
+    }
+    for m in &req.messages {
+        if m.role == "assistant" && !m.tool_calls.is_empty() {
+            let tcs: Vec<Value> = m
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    json!({
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                        }
+                    })
+                })
+                .collect();
+            msgs.push(json!({
+                "role": "assistant",
+                "content": m.content,
+                "tool_calls": tcs,
+            }));
+        } else if m.role == "tool" {
+            msgs.push(json!({
+                "role": "tool",
+                "content": m.content,
+                "tool_name": m.tool_name.clone().unwrap_or_default(),
+            }));
+        } else if m.images.is_empty() {
+            msgs.push(json!({
+                "role": m.role,
+                "content": m.content,
+            }));
+        } else {
+            let imgs: Vec<&str> = m.images.iter().map(|(_, b64)| b64.as_str()).collect();
+            msgs.push(json!({
+                "role": m.role,
+                "content": m.content,
+                "images": imgs,
+            }));
+        }
+    }
+
+    let tools: Vec<Value> = req
+        .tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters_schema,
+                }
+            })
+        })
+        .collect();
+
+    let mut body = json!({
+        "model": model_name,
+        "messages": msgs,
+        "stream": true,
+        "options": {
+            "temperature": req.temperature,
+            "num_predict": req.max_tokens,
+        }
+    });
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools);
+    }
+
+    let resp = gate
+        .request(Method::POST, &url, "local_ollama_inference")?
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Local Ollama returned {status}: {text}");
+    }
+
+    let mut raw_content = String::new();
+    let mut raw_thinking = String::new();
+    let mut tool_calls = Vec::new();
+    let mut prompt_tokens = 0u64;
+    let mut completion_tokens = 0u64;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut last_flush = Instant::now();
+    let mut stream = resp.bytes_stream();
+
+    let process_line = |line: &str,
+                        raw_content: &mut String,
+                        raw_thinking: &mut String,
+                        tool_calls: &mut Vec<ToolCallRequest>,
+                        prompt_tokens: &mut u64,
+                        completion_tokens: &mut u64|
+     -> bool {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+            return false;
+        };
+        let mut updated = false;
+        if let Some(c) = val["message"]["content"].as_str() {
+            if !c.is_empty() {
+                raw_content.push_str(c);
+                updated = true;
+            }
+        }
+        if let Some(t) = val["message"]["thinking"].as_str() {
+            if !t.is_empty() {
+                raw_thinking.push_str(t);
+                updated = true;
+            }
+        }
+        if let Some(arr) = val["message"]["tool_calls"].as_array() {
+            for tc in arr {
+                if let Some(name) = tc["function"]["name"].as_str() {
+                    let args = tc["function"]["arguments"].clone();
+                    tool_calls.push(ToolCallRequest {
+                        id: Uuid::new_v4().to_string(),
+                        name: name.to_string(),
+                        arguments: args,
+                        thought_signature: None,
+                    });
+                }
+            }
+        }
+        if let Some(pe) = val["prompt_eval_count"].as_u64() {
+            *prompt_tokens = pe;
+        }
+        if let Some(ec) = val["eval_count"].as_u64() {
+            *completion_tokens = ec;
+        }
+        updated
+    };
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        buf.extend_from_slice(&chunk);
+        let mut any_delta = false;
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            if process_line(
+                &line,
+                &mut raw_content,
+                &mut raw_thinking,
+                &mut tool_calls,
+                &mut prompt_tokens,
+                &mut completion_tokens,
+            ) {
+                any_delta = true;
+            }
+        }
+        if any_delta && last_flush.elapsed() >= Duration::from_millis(75) {
+            let (clean_so_far, tag_th) = extract_think_tags_streaming(&raw_content);
+            let combined_th = match (raw_thinking.trim().is_empty(), tag_th) {
+                (true, Some(t)) => t,
+                (false, Some(t)) => format!("{}\n\n{t}", raw_thinking.trim()),
+                (false, None) => raw_thinking.clone(),
+                (true, None) => String::new(),
+            };
+            store
+                .update_activity_deltas(&combined_th, &clean_so_far)
+                .await;
+            last_flush = Instant::now();
+        }
+    }
+
+    if !buf.is_empty() {
+        let line = String::from_utf8_lossy(&buf);
+        let _ = process_line(
+            &line,
+            &mut raw_content,
+            &mut raw_thinking,
+            &mut tool_calls,
+            &mut prompt_tokens,
+            &mut completion_tokens,
+        );
+    }
+
+    let (clean_content, tag_thinking) = extract_think_tags(&raw_content);
+    let msg_thinking = if raw_thinking.trim().is_empty() {
+        None
+    } else {
+        Some(raw_thinking.trim().to_string())
+    };
+    let thinking = match (msg_thinking, tag_thinking) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+
+    if tool_calls.is_empty() && !req.tools.is_empty() {
+        tool_calls = extract_fallback_tool_calls(&clean_content);
+    }
+
+    Ok(CompletionResponse {
+        content: clean_content,
+        thinking,
+        tool_calls,
+        prompt_tokens,
+        completion_tokens,
+        thinking_tokens: 0,
+        latency_ms: start.elapsed().as_millis() as u64,
+        actual_model_id: req.model_id.clone(),
+        switched_from: None,
+        switch_reason: None,
+    })
+}
+
+async fn complete_openai_compat(
+    gate: &NetworkGate,
+    url: &str,
+    bearer_token: Option<&str>,
+    model_name: &str,
+    req: &CompletionRequest,
+    purpose: &str,
+) -> anyhow::Result<CompletionResponse> {
+    let (resp, _) =
+        complete_openai_compat_with_headers(gate, url, bearer_token, model_name, req, purpose)
+            .await?;
+    Ok(resp)
+}
+
+async fn complete_openai_compat_with_headers(
+    gate: &NetworkGate,
+    url: &str,
+    bearer_token: Option<&str>,
+    model_name: &str,
+    req: &CompletionRequest,
+    purpose: &str,
+) -> anyhow::Result<(CompletionResponse, RateHeaders)> {
+    let start = Instant::now();
+
+    let mut msgs = Vec::new();
+    if !req.system_prompt.trim().is_empty() {
+        msgs.push(json!({ "role": "system", "content": req.system_prompt }));
+    }
+    for m in &req.messages {
+        if m.role == "assistant" && !m.tool_calls.is_empty() {
+            let tcs: Vec<Value> = m
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments.to_string(),
+                        }
+                    })
+                })
+                .collect();
+            msgs.push(json!({
+                "role": "assistant",
+                "content": m.content,
+                "tool_calls": tcs,
+            }));
+        } else if m.role == "tool" {
+            msgs.push(json!({
+                "role": "tool",
+                "tool_call_id": m.tool_call_id.clone().unwrap_or_else(|| "call_0".into()),
+                "content": m.content,
+            }));
+        } else if m.images.is_empty() {
+            msgs.push(json!({
+                "role": m.role,
+                "content": m.content,
+            }));
+        } else {
+            let mut parts = Vec::new();
+            if !m.content.trim().is_empty() {
+                parts.push(json!({ "type": "text", "text": m.content }));
+            }
+            for (mime, b64) in &m.images {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{mime};base64,{b64}") },
+                }));
+            }
+            msgs.push(json!({
+                "role": m.role,
+                "content": parts,
+            }));
+        }
+    }
+
+    let tools: Vec<Value> = req
+        .tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters_schema,
+                }
+            })
+        })
+        .collect();
+
+    let mut body = json!({
+        "model": model_name,
+        "messages": msgs,
+        "temperature": req.temperature,
+        "max_tokens": req.max_tokens,
+        "stream": false,
+    });
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools);
+    }
+
+    let mut http_req = gate.request(Method::POST, url, purpose)?.json(&body);
+    if let Some(tok) = bearer_token {
+        http_req = http_req.bearer_auth(tok);
+    }
+
+    let resp = http_req.send().await?;
+    let rate_headers = extract_rate_headers(resp.headers());
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Endpoint {url} returned HTTP {status}: {text}");
+    }
+
+    let val: Value = resp.json().await?;
+    let msg = &val["choices"][0]["message"];
+    let raw_content = msg["content"].as_str().unwrap_or("").to_string();
+    let reasoning_content = msg["reasoning_content"]
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let (clean_content, tag_thinking) = extract_think_tags(&raw_content);
+    let thinking = reasoning_content.or(tag_thinking);
+
+    let mut tool_calls = Vec::new();
+    if let Some(arr) = msg["tool_calls"].as_array() {
+        for tc in arr {
+            if let Some(name) = tc["function"]["name"].as_str() {
+                let id = tc["id"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+                let raw_args = &tc["function"]["arguments"];
+                let arguments = if let Some(s) = raw_args.as_str() {
+                    serde_json::from_str(s).unwrap_or_else(|_| json!({ "raw": s }))
+                } else {
+                    raw_args.clone()
+                };
+                tool_calls.push(ToolCallRequest {
+                    id,
+                    name: name.to_string(),
+                    arguments,
+                    thought_signature: None,
+                });
+            }
+        }
+    }
+    if tool_calls.is_empty() && !req.tools.is_empty() {
+        tool_calls = extract_fallback_tool_calls(&clean_content);
+    }
+
+    Ok((
+        CompletionResponse {
+            content: clean_content,
+            thinking,
+            tool_calls,
+            prompt_tokens: val["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+            completion_tokens: val["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+            thinking_tokens: val["usage"]["completion_tokens_details"]["reasoning_tokens"]
+                .as_u64()
+                .unwrap_or(0),
+            latency_ms: start.elapsed().as_millis() as u64,
+            actual_model_id: req.model_id.clone(),
+            switched_from: None,
+            switch_reason: None,
+        },
+        rate_headers,
+    ))
+}
+
+fn apply_gemini_chunk_value(
+    val: &Value,
+    thought_out: &mut String,
+    text_out: &mut String,
+    tool_calls: &mut Vec<ToolCallRequest>,
+    prompt_tokens: &mut u64,
+    completion_tokens: &mut u64,
+    thinking_tokens: &mut u64,
+) -> bool {
+    let mut updated = false;
+    if let Some(parts) = val["candidates"][0]["content"]["parts"].as_array() {
+        for p in parts {
+            let is_thought = p["thought"].as_bool().unwrap_or(false);
+            if let Some(txt) = p["text"].as_str() {
+                if !txt.is_empty() {
+                    if is_thought {
+                        thought_out.push_str(txt);
+                    } else {
+                        text_out.push_str(txt);
+                    }
+                    updated = true;
+                }
+            }
+            if let Some(fc) = p.get("functionCall") {
+                if let Some(name) = fc["name"].as_str() {
+                    let thought_signature = p
+                        .get("thoughtSignature")
+                        .or_else(|| p.get("thought_signature"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let id = fc["id"]
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| Uuid::new_v4().to_string());
+                    let args = if fc["args"].is_object() {
+                        fc["args"].clone()
+                    } else {
+                        json!({})
+                    };
+                    tool_calls.push(ToolCallRequest {
+                        id,
+                        name: name.to_string(),
+                        arguments: args,
+                        thought_signature,
+                    });
+                    updated = true;
+                }
+            }
+        }
+    }
+
+    let usage = &val["usageMetadata"];
+    if let Some(v) = usage["promptTokenCount"].as_u64() {
+        *prompt_tokens = v;
+    }
+    if let Some(v) = usage["candidatesTokenCount"].as_u64() {
+        *completion_tokens = v;
+    }
+    if let Some(v) = usage["thoughtsTokenCount"].as_u64() {
+        *thinking_tokens = v;
+    }
+    updated
+}
+
+fn build_gemini_contents(messages: &[ProviderMessage]) -> Vec<Value> {
+    let mut contents: Vec<Value> = Vec::new();
+    for m in messages {
+        if m.role == "assistant" {
+            let mut parts = Vec::new();
+            if !m.content.trim().is_empty() {
+                parts.push(json!({ "text": m.content }));
+            }
+            for tc in &m.tool_calls {
+                let args = if tc.arguments.is_object() {
+                    tc.arguments.clone()
+                } else {
+                    json!({})
+                };
+                let mut part = json!({
+                    "functionCall": {
+                        "name": tc.name,
+                        "args": args,
+                    }
+                });
+                if let Some(ref sig) = tc.thought_signature {
+                    part["thoughtSignature"] = Value::String(sig.clone());
+                }
+                parts.push(part);
+            }
+            if !parts.is_empty() {
+                contents.push(json!({ "role": "model", "parts": parts }));
+            }
+        } else if m.role == "tool" {
+            let fn_name = m.tool_name.clone().unwrap_or_else(|| "tool".into());
+            let part = json!({
+                "functionResponse": {
+                    "name": fn_name,
+                    "response": { "result": m.content }
+                }
+            });
+            let merged_into_prev = if let Some(last) = contents.last_mut() {
+                let is_user_tool_turn = last["role"] == "user"
+                    && last["parts"]
+                        .as_array()
+                        .map(|arr| arr.iter().any(|p| p.get("functionResponse").is_some()))
+                        .unwrap_or(false);
+                if is_user_tool_turn {
+                    if let Some(arr) = last["parts"].as_array_mut() {
+                        arr.push(part.clone());
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !merged_into_prev {
+                contents.push(json!({
+                    "role": "user",
+                    "parts": [part]
+                }));
+            }
+        } else {
+            let mut parts = Vec::new();
+            if !m.content.trim().is_empty() || m.images.is_empty() {
+                parts.push(json!({ "text": m.content }));
+            }
+            for (mime, b64) in &m.images {
+                parts.push(json!({
+                    "inlineData": {
+                        "mimeType": mime,
+                        "data": b64,
+                    }
+                }));
+            }
+            contents.push(json!({
+                "role": "user",
+                "parts": parts,
+            }));
+        }
+    }
+    contents
+}
+
+async fn complete_gemini(
+    gate: &NetworkGate,
+    store: &BumboStore,
+    api_key: &str,
+    req: &CompletionRequest,
+    supports_thinking: bool,
+    supports_tools: bool,
+) -> anyhow::Result<(CompletionResponse, RateHeaders)> {
+    let start = Instant::now();
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse",
+        req.model_id
+    );
+
+    let contents = build_gemini_contents(&req.messages);
+
+    let mut generation_config = json!({
+        "temperature": req.temperature,
+        "maxOutputTokens": req.max_tokens,
+    });
+    if supports_thinking && req.enable_thinking {
+        generation_config["thinkingConfig"] = json!({ "includeThoughts": true });
+    }
+
+    let mut body = json!({
+        "contents": contents,
+        "generationConfig": generation_config,
+    });
+
+    if !req.system_prompt.trim().is_empty() {
+        body["systemInstruction"] = json!({
+            "parts": [{ "text": req.system_prompt }]
+        });
+    }
+
+    if supports_tools && !req.tools.is_empty() {
+        let decls: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|t| {
+                let params = clean_schema_for_gemini(&t.parameters_schema);
+                let has_props = params
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .map(|m| !m.is_empty())
+                    .unwrap_or(false);
+                let mut decl = json!({
+                    "name": t.name,
+                    "description": t.description,
+                });
+                if has_props {
+                    decl["parameters"] = params;
+                }
+                decl
+            })
+            .collect();
+        body["tools"] = json!([{ "functionDeclarations": decls }]);
+    }
+
+    let http_req = gate
+        .request(Method::POST, &url, "gemini_api")?
+        .header("x-goog-api-key", api_key.trim())
+        .json(&body);
+
+    let resp = tokio::time::timeout(Duration::from_secs(45), http_req.send())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Gemini API request timed out after 45s for model '{}'",
+                req.model_id
+            )
+        })??;
+
+    let rate_headers = extract_rate_headers(resp.headers());
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Gemini API HTTP {status}: {text}");
+    }
+
+    let mut text_out = String::new();
+    let mut thought_out = String::new();
+    let mut tool_calls = Vec::new();
+    let mut prompt_tokens = 0u64;
+    let mut completion_tokens = 0u64;
+    let mut thinking_tokens = 0u64;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut raw_body: Vec<u8> = Vec::new();
+    let mut saw_sse_data = false;
+    let mut last_flush = Instant::now();
+    let mut stream = resp.bytes_stream();
+
+    loop {
+        let next_item = tokio::time::timeout(Duration::from_secs(45), stream.next())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Gemini API stream stalled (timed out after 45s) for model '{}'",
+                    req.model_id
+                )
+            })?;
+        let Some(chunk) = next_item else {
+            break;
+        };
+        let chunk = chunk?;
+        if !saw_sse_data {
+            raw_body.extend_from_slice(&chunk);
+        }
+        buf.extend_from_slice(&chunk);
+
+        let mut any_delta = false;
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            let trimmed = line.trim();
+            if let Some(data_payload) = trimmed.strip_prefix("data:") {
+                if !saw_sse_data {
+                    saw_sse_data = true;
+                    raw_body.clear();
+                }
+                let json_str = data_payload.trim();
+                if json_str.is_empty() || json_str == "[DONE]" {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<Value>(json_str) {
+                    if apply_gemini_chunk_value(
+                        &val,
+                        &mut thought_out,
+                        &mut text_out,
+                        &mut tool_calls,
+                        &mut prompt_tokens,
+                        &mut completion_tokens,
+                        &mut thinking_tokens,
+                    ) {
+                        any_delta = true;
+                    }
+                }
+            }
+        }
+
+        if any_delta && last_flush.elapsed() >= Duration::from_millis(45) {
+            store.update_activity_deltas(&thought_out, &text_out).await;
+            last_flush = Instant::now();
+        }
+    }
+
+    if !buf.is_empty() {
+        let line = String::from_utf8_lossy(&buf);
+        let trimmed = line.trim();
+        if let Some(data_payload) = trimmed.strip_prefix("data:") {
+            saw_sse_data = true;
+            raw_body.clear();
+            let json_str = data_payload.trim();
+            if let Ok(val) = serde_json::from_str::<Value>(json_str) {
+                let _ = apply_gemini_chunk_value(
+                    &val,
+                    &mut thought_out,
+                    &mut text_out,
+                    &mut tool_calls,
+                    &mut prompt_tokens,
+                    &mut completion_tokens,
+                    &mut thinking_tokens,
+                );
+            }
+        }
+    }
+
+    if !saw_sse_data && !raw_body.is_empty() {
+        if let Ok(val) = serde_json::from_slice::<Value>(&raw_body) {
+            match val {
+                Value::Array(items) => {
+                    for item in &items {
+                        let _ = apply_gemini_chunk_value(
+                            item,
+                            &mut thought_out,
+                            &mut text_out,
+                            &mut tool_calls,
+                            &mut prompt_tokens,
+                            &mut completion_tokens,
+                            &mut thinking_tokens,
+                        );
+                    }
+                }
+                other => {
+                    let _ = apply_gemini_chunk_value(
+                        &other,
+                        &mut thought_out,
+                        &mut text_out,
+                        &mut tool_calls,
+                        &mut prompt_tokens,
+                        &mut completion_tokens,
+                        &mut thinking_tokens,
+                    );
+                }
+            }
+        }
+    }
+
+    store.update_activity_deltas(&thought_out, &text_out).await;
+
+    Ok((
+        CompletionResponse {
+            content: text_out,
+            thinking: if thought_out.trim().is_empty() {
+                None
+            } else {
+                Some(thought_out)
+            },
+            tool_calls,
+            prompt_tokens,
+            completion_tokens,
+            thinking_tokens,
+            latency_ms: start.elapsed().as_millis() as u64,
+            actual_model_id: req.model_id.clone(),
+            switched_from: None,
+            switch_reason: None,
+        },
+        rate_headers,
+    ))
+}
+
+fn build_anthropic_messages(messages_in: &[ProviderMessage]) -> Vec<Value> {
+    let mut messages: Vec<Value> = Vec::new();
+    for m in messages_in {
+        if m.role == "assistant" {
+            let mut blocks = Vec::new();
+            if !m.content.trim().is_empty() {
+                blocks.push(json!({ "type": "text", "text": m.content }));
+            }
+            for tc in &m.tool_calls {
+                let input = if tc.arguments.is_object() {
+                    tc.arguments.clone()
+                } else {
+                    json!({})
+                };
+                blocks.push(json!({
+                    "type": "tool_use",
+                    "id": tc.id,
+                    "name": tc.name,
+                    "input": input,
+                }));
+            }
+            if blocks.is_empty() {
+                messages.push(json!({ "role": "assistant", "content": "" }));
+            } else {
+                messages.push(json!({ "role": "assistant", "content": blocks }));
+            }
+        } else if m.role == "tool" {
+            let block = json!({
+                "type": "tool_result",
+                "tool_use_id": m.tool_call_id.clone().unwrap_or_else(|| "tool_0".into()),
+                "content": m.content,
+            });
+            let merged_into_prev = if let Some(last) = messages.last_mut() {
+                let is_user_tool_turn = last["role"] == "user"
+                    && last["content"]
+                        .as_array()
+                        .map(|arr| arr.iter().any(|b| b["type"] == "tool_result"))
+                        .unwrap_or(false);
+                if is_user_tool_turn {
+                    if let Some(arr) = last["content"].as_array_mut() {
+                        arr.push(block.clone());
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !merged_into_prev {
+                messages.push(json!({
+                    "role": "user",
+                    "content": [block]
+                }));
+            }
+        } else if m.images.is_empty() {
+            messages.push(json!({ "role": "user", "content": m.content }));
+        } else {
+            let mut blocks = Vec::new();
+            for (mime, b64) in &m.images {
+                blocks.push(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime,
+                        "data": b64,
+                    }
+                }));
+            }
+            blocks.push(json!({ "type": "text", "text": m.content }));
+            messages.push(json!({ "role": "user", "content": blocks }));
+        }
+    }
+    messages
+}
+
+async fn complete_anthropic(
+    gate: &NetworkGate,
+    api_key: &str,
+    req: &CompletionRequest,
+) -> anyhow::Result<(CompletionResponse, RateHeaders)> {
+    let start = Instant::now();
+    let url = "https://api.anthropic.com/v1/messages";
+
+    let messages = build_anthropic_messages(&req.messages);
+
+    let mut body = json!({
+        "model": req.model_id,
+        "max_tokens": req.max_tokens.max(1024),
+        "messages": messages,
+    });
+    if !req.system_prompt.trim().is_empty() {
+        body["system"] = Value::String(req.system_prompt.clone());
+    }
+    if !req.tools.is_empty() {
+        let tools: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters_schema,
+                })
+            })
+            .collect();
+        body["tools"] = Value::Array(tools);
+    }
+
+    let resp = gate
+        .request(Method::POST, url, "anthropic_api")?
+        .header("x-api-key", api_key.trim())
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await?;
+
+    let rate_headers = extract_rate_headers(resp.headers());
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Anthropic API HTTP {status}: {text}");
+    }
+
+    let val: Value = resp.json().await?;
+    let mut text_out = String::new();
+    let mut thought_out = String::new();
+    let mut tool_calls = Vec::new();
+
+    if let Some(blocks) = val["content"].as_array() {
+        for b in blocks {
+            match b["type"].as_str().unwrap_or("") {
+                "thinking" => {
+                    if let Some(t) = b["thinking"].as_str() {
+                        thought_out.push_str(t);
+                    }
+                }
+                "text" => {
+                    if let Some(t) = b["text"].as_str() {
+                        if !text_out.is_empty() {
+                            text_out.push('\n');
+                        }
+                        text_out.push_str(t);
+                    }
+                }
+                "tool_use" => {
+                    if let Some(name) = b["name"].as_str() {
+                        tool_calls.push(ToolCallRequest {
+                            id: b["id"]
+                                .as_str()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                            name: name.to_string(),
+                            arguments: b["input"].clone(),
+                            thought_signature: None,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok((
+        CompletionResponse {
+            content: text_out,
+            thinking: if thought_out.trim().is_empty() {
+                None
+            } else {
+                Some(thought_out)
+            },
+            tool_calls,
+            prompt_tokens: val["usage"]["input_tokens"].as_u64().unwrap_or(0),
+            completion_tokens: val["usage"]["output_tokens"].as_u64().unwrap_or(0),
+            thinking_tokens: 0,
+            latency_ms: start.elapsed().as_millis() as u64,
+            actual_model_id: req.model_id.clone(),
+            switched_from: None,
+            switch_reason: None,
+        },
+        rate_headers,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiModelsListResp {
+    models: Option<Vec<GeminiModelRaw>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiModelRaw {
+    name: String,
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
+    description: Option<String>,
+    #[serde(rename = "inputTokenLimit")]
+    input_token_limit: Option<u64>,
+    #[serde(rename = "supportedGenerationMethods")]
+    supported_generation_methods: Option<Vec<String>>,
+}
+
+pub async fn probe_gemini_model_live(gate: &NetworkGate, api_key: &str, model_id: &str) -> bool {
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+        model_id
+    );
+    let Ok(builder) = gate.request(Method::POST, &url, "gemini_model_live_probe") else {
+        return false;
+    };
+    let req = builder
+        .header("x-goog-api-key", api_key.trim())
+        .json(&json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "ok" }] }],
+            "generationConfig": { "maxOutputTokens": 1 }
+        }));
+
+    let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(4), req.send()).await else {
+        return false;
+    };
+    resp.status().is_success()
+}
+
+pub async fn sync_google_models(
+    gate: &NetworkGate,
+    api_key: &str,
+) -> anyhow::Result<Vec<ModelCatalogEntry>> {
+    if api_key.trim().is_empty() {
+        anyhow::bail!("Enter a Gemini API key first.");
+    }
+    let url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100";
+    let resp = gate
+        .request(Method::GET, url, "gemini_model_catalog_sync")?
+        .header("x-goog-api-key", api_key.trim())
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "Google models sync HTTP error: {}",
+            format_clean_provider_error(&text)
+        );
+    }
+
+    let parsed: GeminiModelsListResp = resp.json().await?;
+    let mut candidates = Vec::new();
+    for m in parsed.models.unwrap_or_default() {
+        let methods = m.supported_generation_methods.unwrap_or_default();
+        if !methods.iter().any(|x| x == "generateContent") {
+            continue;
+        }
+        let id = m.name.strip_prefix("models/").unwrap_or(&m.name).to_string();
+        if !is_viable_gemini_chat_model(&id) {
+            continue;
+        }
+        let lower = id.to_ascii_lowercase();
+        let supports_thinking = lower.contains("thinking")
+            || lower.contains("gemini-3-flash")
+            || lower.contains("pro");
+        let supports_tools = !lower.starts_with("gemma");
+
+        let display_name = m.display_name.unwrap_or_else(|| id.clone());
+        candidates.push(ModelCatalogEntry {
+            id: id.clone(),
+            display_name: display_name.clone(),
+            provider: ProviderKind::GoogleGemini,
+            context_window: m.input_token_limit.unwrap_or(1_000_000),
+            supports_thinking,
+            supports_tools,
+            supports_vision: true,
+            tier_note: m
+                .description
+                .unwrap_or_else(|| "Verified via Google Gemini API".into()),
+            quota_limit: Some(ModelQuotaLimit {
+                rpm_limit: 500,
+                tpm_limit: 2_000_000,
+                rpd_limit: 5_000,
+                daily_token_limit: 15_000_000,
+            }),
+            reachable: true,
+            reachability_reason: "Verified reachable via live probe".into(),
+            antigravity_alias: Some(display_name),
+        });
+    }
+
+    let mut verified = Vec::new();
+    for chunk in candidates.chunks(6) {
+        let checks = futures_util::future::join_all(
+            chunk
+                .iter()
+                .map(|cand| probe_gemini_model_live(gate, api_key, &cand.id)),
+        )
+        .await;
+        for (cand, ok) in chunk.iter().zip(checks.into_iter()) {
+            if ok {
+                verified.push(cand.clone());
+            }
+        }
+    }
+
+    sort_gemini_models_by_priority(&mut verified);
+    Ok(verified)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderVerifyStatus {
+    pub provider: String,
+    pub configured: bool,
+    pub verified: bool,
+    pub model_count: usize,
+    pub message: String,
+}
+
+pub async fn verify_and_discover_provider_models(
+    gate: &NetworkGate,
+    store: &BumboStore,
+) -> anyhow::Result<Vec<ProviderVerifyStatus>> {
+    let snap = store.snapshot().await;
+    let keys = snap.settings.api_keys;
+    let mut statuses = Vec::new();
+    let mut verified_map = std::collections::HashMap::new();
+
+    // 1. Google Gemini
+    if keys.gemini_api_key.trim().is_empty() {
+        statuses.push(ProviderVerifyStatus {
+            provider: "google_gemini".into(),
+            configured: false,
+            verified: false,
+            model_count: 0,
+            message: "No API key set".into(),
+        });
+    } else {
+        match sync_google_models(gate, &keys.gemini_api_key).await {
+            Ok(list) => {
+                let count = list.len();
+                verified_map.insert("google_gemini".to_string(), list);
+                statuses.push(ProviderVerifyStatus {
+                    provider: "google_gemini".into(),
+                    configured: true,
+                    verified: true,
+                    model_count: count,
+                    message: format!("Verified · {count} models reachable"),
+                });
+            }
+            Err(e) => {
+                statuses.push(ProviderVerifyStatus {
+                    provider: "google_gemini".into(),
+                    configured: true,
+                    verified: false,
+                    model_count: 0,
+                    message: format!("Check failed: {e}"),
+                });
+            }
+        }
+    }
+
+    // 2. Anthropic
+    if keys.anthropic_api_key.trim().is_empty() {
+        statuses.push(ProviderVerifyStatus {
+            provider: "anthropic".into(),
+            configured: false,
+            verified: false,
+            model_count: 0,
+            message: "No API key set".into(),
+        });
+    } else {
+        match sync_anthropic_models(gate, &keys.anthropic_api_key).await {
+            Ok(list) => {
+                let count = list.len();
+                verified_map.insert("anthropic".to_string(), list);
+                statuses.push(ProviderVerifyStatus {
+                    provider: "anthropic".into(),
+                    configured: true,
+                    verified: true,
+                    model_count: count,
+                    message: format!("Verified · {count} models reachable"),
+                });
+            }
+            Err(e) => {
+                statuses.push(ProviderVerifyStatus {
+                    provider: "anthropic".into(),
+                    configured: true,
+                    verified: false,
+                    model_count: 0,
+                    message: format!("Check failed: {e}"),
+                });
+            }
+        }
+    }
+
+    // 3. OpenRouter
+    if keys.openrouter_api_key.trim().is_empty() {
+        statuses.push(ProviderVerifyStatus {
+            provider: "open_router".into(),
+            configured: false,
+            verified: false,
+            model_count: 0,
+            message: "No API key set".into(),
+        });
+    } else {
+        match sync_openrouter_models(gate, &keys.openrouter_api_key).await {
+            Ok(list) => {
+                let count = list.len();
+                verified_map.insert("open_router".to_string(), list);
+                statuses.push(ProviderVerifyStatus {
+                    provider: "open_router".into(),
+                    configured: true,
+                    verified: true,
+                    model_count: count,
+                    message: format!("Verified · {count} models reachable"),
+                });
+            }
+            Err(e) => {
+                statuses.push(ProviderVerifyStatus {
+                    provider: "open_router".into(),
+                    configured: true,
+                    verified: false,
+                    model_count: 0,
+                    message: format!("Check failed: {e}"),
+                });
+            }
+        }
+    }
+
+    // 4. Custom OpenAI-Compatible
+    if keys.openai_compat_base_url.trim().is_empty() {
+        statuses.push(ProviderVerifyStatus {
+            provider: "open_ai_compat".into(),
+            configured: false,
+            verified: false,
+            model_count: 0,
+            message: "No Base URL set".into(),
+        });
+    } else {
+        match sync_openai_compat_models(
+            gate,
+            &keys.openai_compat_base_url,
+            &keys.openai_compat_api_key,
+        )
+        .await
+        {
+            Ok(list) => {
+                let count = list.len();
+                verified_map.insert("open_ai_compat".to_string(), list);
+                statuses.push(ProviderVerifyStatus {
+                    provider: "open_ai_compat".into(),
+                    configured: true,
+                    verified: true,
+                    model_count: count,
+                    message: format!("Verified · {count} models reachable"),
+                });
+            }
+            Err(e) => {
+                statuses.push(ProviderVerifyStatus {
+                    provider: "open_ai_compat".into(),
+                    configured: true,
+                    verified: false,
+                    model_count: 0,
+                    message: format!("Check failed: {e}"),
+                });
+            }
+        }
+    }
+
+    store
+        .update(|s| {
+            for (k, v) in verified_map {
+                if k == "google_gemini" {
+                    s.blocked_models
+                        .retain(|id, _| !id.starts_with("gemini-") && !id.starts_with("gemma-"));
+                    s.synced_google_models = v.clone();
+                }
+                s.verified_provider_models.insert(k, v);
+            }
+            if !s.settings.active_model_id.starts_with("local::") {
+                let (cat, _) = harness_store::compute_catalog_and_quotas(s);
+                let still_ok = cat
+                    .iter()
+                    .any(|c| c.id == s.settings.active_model_id && c.reachable);
+                if !still_ok {
+                    if let Some(first_reachable) = cat.iter().find(|c| c.reachable) {
+                        s.settings.active_model_id = first_reachable.id.clone();
+                    }
+                }
+            }
+        })
+        .await?;
+
+    Ok(statuses)
+}
+
+async fn sync_anthropic_models(
+    gate: &NetworkGate,
+    api_key: &str,
+) -> anyhow::Result<Vec<ModelCatalogEntry>> {
+    let resp = gate
+        .request(
+            Method::GET,
+            "https://api.anthropic.com/v1/models",
+            "anthropic_model_verify",
+        )?
+        .header("x-api-key", api_key.trim())
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Anthropic HTTP {status}: {text}");
+    }
+    let val: Value = resp.json().await?;
+    let mut out = Vec::new();
+    for item in val["data"].as_array().cloned().unwrap_or_default() {
+        if let Some(id) = item["id"].as_str() {
+            let display = item["display_name"]
+                .as_str()
+                .unwrap_or(id)
+                .to_string();
+            out.push(ModelCatalogEntry {
+                id: id.to_string(),
+                display_name: display.clone(),
+                provider: ProviderKind::Anthropic,
+                context_window: 200_000,
+                supports_thinking: true,
+                supports_tools: true,
+                supports_vision: true,
+                tier_note: "Verified via Anthropic API".into(),
+                quota_limit: Some(ModelQuotaLimit {
+                    rpm_limit: 50,
+                    tpm_limit: 400_000,
+                    rpd_limit: 2_000,
+                    daily_token_limit: 10_000_000,
+                }),
+                reachable: true,
+                reachability_reason: "Verified reachable via live API".into(),
+                antigravity_alias: Some(display),
+            });
+        }
+    }
+    Ok(out)
+}
+
+async fn sync_openrouter_models(
+    gate: &NetworkGate,
+    api_key: &str,
+) -> anyhow::Result<Vec<ModelCatalogEntry>> {
+    let auth_resp = gate
+        .request(
+            Method::GET,
+            "https://openrouter.ai/api/v1/auth/key",
+            "openrouter_key_verify",
+        )?
+        .bearer_auth(api_key.trim())
+        .send()
+        .await?;
+    if !auth_resp.status().is_success() {
+        anyhow::bail!("OpenRouter key rejected (HTTP {})", auth_resp.status());
+    }
+
+    let list_resp = gate
+        .request(
+            Method::GET,
+            "https://openrouter.ai/api/v1/models",
+            "openrouter_models_list",
+        )?
+        .bearer_auth(api_key.trim())
+        .send()
+        .await?;
+    let val: Value = list_resp.json().await?;
+    let mut out = vec![ModelCatalogEntry {
+        id: "openrouter/auto".into(),
+        display_name: "OpenRouter Auto".into(),
+        provider: ProviderKind::OpenRouter,
+        context_window: 200_000,
+        supports_thinking: false,
+        supports_tools: true,
+        supports_vision: false,
+        tier_note: "Verified via OpenRouter".into(),
+        quota_limit: Some(ModelQuotaLimit {
+            rpm_limit: 200,
+            tpm_limit: 1_000_000,
+            rpd_limit: 5_000,
+            daily_token_limit: 20_000_000,
+        }),
+        reachable: true,
+        reachability_reason: "Verified reachable via live API".into(),
+        antigravity_alias: Some("OpenRouter Auto".into()),
+    }];
+
+    for item in val["data"].as_array().cloned().unwrap_or_default().into_iter().take(25) {
+        if let Some(id) = item["id"].as_str() {
+            if id == "openrouter/auto" {
+                continue;
+            }
+            let name = item["name"].as_str().unwrap_or(id).to_string();
+            let ctx = item["context_length"].as_u64().unwrap_or(128_000);
+            out.push(ModelCatalogEntry {
+                id: id.to_string(),
+                display_name: name.clone(),
+                provider: ProviderKind::OpenRouter,
+                context_window: ctx,
+                supports_thinking: id.contains("thinking") || id.contains("r1"),
+                supports_tools: true,
+                supports_vision: false,
+                tier_note: "Verified via OpenRouter".into(),
+                quota_limit: Some(ModelQuotaLimit {
+                    rpm_limit: 200,
+                    tpm_limit: 1_000_000,
+                    rpd_limit: 5_000,
+                    daily_token_limit: 20_000_000,
+                }),
+                reachable: true,
+                reachability_reason: "Verified reachable via live API".into(),
+                antigravity_alias: Some(name),
+            });
+        }
+    }
+    Ok(out)
+}
+
+async fn sync_openai_compat_models(
+    gate: &NetworkGate,
+    base_url: &str,
+    api_key: &str,
+) -> anyhow::Result<Vec<ModelCatalogEntry>> {
+    let url = format!("{}/models", base_url.trim().trim_end_matches('/'));
+    let mut req = gate.request(Method::GET, &url, "openai_compat_verify")?;
+    if !api_key.trim().is_empty() {
+        req = req.bearer_auth(api_key.trim());
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Endpoint HTTP {}", resp.status());
+    }
+    let val: Value = resp.json().await?;
+    let mut out = Vec::new();
+    for item in val["data"].as_array().cloned().unwrap_or_default().into_iter().take(30) {
+        if let Some(id) = item["id"].as_str() {
+            out.push(ModelCatalogEntry {
+                id: id.to_string(),
+                display_name: id.to_string(),
+                provider: ProviderKind::OpenAiCompat,
+                context_window: 128_000,
+                supports_thinking: false,
+                supports_tools: true,
+                supports_vision: false,
+                tier_note: "Verified via custom OpenAI endpoint".into(),
+                quota_limit: None,
+                reachable: true,
+                reachability_reason: "Verified reachable via live API".into(),
+                antigravity_alias: Some(id.to_string()),
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn collect_root_defs(schema: &Value) -> serde_json::Map<String, Value> {
+    let mut defs = serde_json::Map::new();
+    for key in ["$defs", "definitions"] {
+        if let Some(obj) = schema.get(key).and_then(|v| v.as_object()) {
+            for (k, v) in obj {
+                defs.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    defs
+}
+
+fn map_json_type_to_gemini(t: &str) -> Option<&'static str> {
+    match t.trim().to_ascii_lowercase().as_str() {
+        "string" => Some("STRING"),
+        "integer" => Some("INTEGER"),
+        "number" => Some("NUMBER"),
+        "boolean" => Some("BOOLEAN"),
+        "array" => Some("ARRAY"),
+        "object" => Some("OBJECT"),
+        _ => None,
+    }
+}
+
+fn is_null_schema_variant(v: &Value) -> bool {
+    if let Some(t) = v.get("type") {
+        if t.as_str()
+            .map(|s| s.eq_ignore_ascii_case("null"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if let Some(arr) = t.as_array() {
+            if !arr.is_empty()
+                && arr
+                    .iter()
+                    .all(|x| x.as_str().map(|s| s.eq_ignore_ascii_case("null")).unwrap_or(false))
+            {
+                return true;
+            }
+        }
+    }
+    v.get("const").map(|c| c.is_null()).unwrap_or(false)
+}
+
+fn clean_schema_for_gemini(schema: &Value) -> Value {
+    let root_defs = collect_root_defs(schema);
+    clean_schema_for_gemini_inner(schema, &root_defs, 0)
+}
+
+fn clean_schema_for_gemini_inner(
+    schema: &Value,
+    root_defs: &serde_json::Map<String, Value>,
+    depth: usize,
+) -> Value {
+    if depth > 8 {
+        return json!({ "type": "STRING" });
+    }
+    let Some(map) = schema.as_object() else {
+        return json!({ "type": "STRING" });
+    };
+
+    let outer_desc = map
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut nullable = map
+        .get("nullable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Inline `#/$defs/...` or `#/definitions/...` JSON Schema refs
+    if let Some(ref_str) = map.get("$ref").and_then(|v| v.as_str()) {
+        let def_name = ref_str
+            .strip_prefix("#/$defs/")
+            .or_else(|| ref_str.strip_prefix("#/definitions/"))
+            .or_else(|| ref_str.rsplit('/').next())
+            .unwrap_or("");
+        let mut resolved = root_defs
+            .get(def_name)
+            .map(|target| clean_schema_for_gemini_inner(target, root_defs, depth + 1))
+            .unwrap_or_else(|| json!({ "type": "STRING" }));
+        if let Value::Object(ref mut out) = resolved {
+            if !out.contains_key("description") {
+                if let Some(desc) = outer_desc {
+                    out.insert("description".into(), Value::String(desc));
+                }
+            }
+            if nullable {
+                out.insert("nullable".into(), Value::Bool(true));
+            }
+        }
+        return resolved;
+    }
+
+    // Flatten `anyOf` / `oneOf` (e.g. Pydantic Optional[T] / union schemas) into one Gemini schema + `nullable`
+    if let Some(Value::Array(variants)) = map.get("anyOf").or_else(|| map.get("oneOf")) {
+        if variants.iter().any(is_null_schema_variant) {
+            nullable = true;
+        }
+        let chosen = variants
+            .iter()
+            .find(|v| !is_null_schema_variant(v))
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "STRING" }));
+        let mut resolved = clean_schema_for_gemini_inner(&chosen, root_defs, depth + 1);
+        if let Value::Object(ref mut out) = resolved {
+            if !out.contains_key("description") {
+                if let Some(desc) = outer_desc {
+                    out.insert("description".into(), Value::String(desc));
+                }
+            }
+            if nullable {
+                out.insert("nullable".into(), Value::Bool(true));
+            }
+        }
+        return resolved;
+    }
+
+    let parsed_type = match map.get("type") {
+        Some(Value::String(s)) => {
+            if s.eq_ignore_ascii_case("null") {
+                nullable = true;
+                None
+            } else {
+                map_json_type_to_gemini(s)
+            }
+        }
+        Some(Value::Array(arr)) => {
+            let mut found = None;
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    if s.eq_ignore_ascii_case("null") {
+                        nullable = true;
+                    } else if found.is_none() {
+                        found = map_json_type_to_gemini(s);
+                    }
+                }
+            }
+            found
+        }
+        _ => {
+            if map.get("properties").and_then(|v| v.as_object()).is_some() {
+                Some("OBJECT")
+            } else if map.get("items").is_some() {
+                Some("ARRAY")
+            } else if map.get("enum").is_some() {
+                Some("STRING")
+            } else {
+                None
+            }
+        }
+    };
+
+    let mut clean = serde_json::Map::new();
+    let mut gemini_type = parsed_type.unwrap_or("STRING");
+
+    if let Some(desc) = outer_desc {
+        clean.insert("description".into(), Value::String(desc));
+    }
+
+    if let Some(Value::Array(vals)) = map.get("enum") {
+        let mut enum_strs = Vec::new();
+        for v in vals {
+            if v.is_null() {
+                nullable = true;
+            } else if let Some(s) = v.as_str() {
+                enum_strs.push(Value::String(s.to_string()));
+            } else {
+                enum_strs.push(Value::String(v.to_string()));
+            }
+        }
+        if !enum_strs.is_empty() {
+            gemini_type = "STRING";
+            clean.insert("enum".into(), Value::Array(enum_strs));
+        }
+    }
+
+    clean.insert("type".into(), Value::String(gemini_type.to_string()));
+    if nullable {
+        clean.insert("nullable".into(), Value::Bool(true));
+    }
+
+    if gemini_type == "ARRAY" {
+        let items_schema = match map.get("items") {
+            Some(Value::Array(tuple_items)) => tuple_items
+                .first()
+                .map(|first| clean_schema_for_gemini_inner(first, root_defs, depth + 1))
+                .unwrap_or_else(|| json!({ "type": "STRING" })),
+            Some(item_obj @ Value::Object(_)) => {
+                clean_schema_for_gemini_inner(item_obj, root_defs, depth + 1)
+            }
+            _ => json!({ "type": "STRING" }),
+        };
+        clean.insert("items".into(), items_schema);
+    } else if gemini_type == "OBJECT" {
+        let mut clean_props = serde_json::Map::new();
+        if let Some(props) = map.get("properties").and_then(|v| v.as_object()) {
+            for (k, v) in props {
+                clean_props.insert(k.clone(), clean_schema_for_gemini_inner(v, root_defs, depth + 1));
+            }
+        }
+        if !clean_props.is_empty() {
+            if let Some(Value::Array(req_arr)) = map.get("required") {
+                let clean_req: Vec<Value> = req_arr
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|k| clean_props.contains_key(*k))
+                    .map(|k| Value::String(k.to_string()))
+                    .collect();
+                if !clean_req.is_empty() {
+                    clean.insert("required".into(), Value::Array(clean_req));
+                }
+            }
+            clean.insert("properties".into(), Value::Object(clean_props));
+        } else if depth > 0 {
+            // Gemini v1beta rejects nested OBJECT properties with empty `properties`.
+            clean.insert("type".into(), Value::String("STRING".into()));
+        }
+    }
+
+    Value::Object(clean)
+}
+
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return None;
+    }
+    h.windows(n.len()).position(|w| {
+        w.iter()
+            .zip(n.iter())
+            .all(|(&a, &b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+    })
+}
+
+pub fn extract_think_tags(raw: &str) -> (String, Option<String>) {
+    const TAG_PAIRS: &[(&str, &str)] = &[
+        ("<think>", "</think>"),
+        ("<thinking>", "</thinking>"),
+        ("<thought>", "</thought>"),
+        ("<|thought|>", "</|thought|>"),
+        ("<|channel|>thought", "<|message|>"),
+    ];
+
+    let mut working = raw.to_string();
+    let mut thoughts: Vec<String> = Vec::new();
+
+    // 1. Extract all closed or unclosed opening-tag thought blocks.
+    loop {
+        let mut earliest: Option<(usize, usize, &str)> = None;
+        for &(open, close) in TAG_PAIRS {
+            if let Some(pos) = find_ascii_ci(&working, open) {
+                if earliest.map(|(e, _, _)| pos < e).unwrap_or(true) {
+                    earliest = Some((pos, open.len(), close));
+                }
+            }
+        }
+        let Some((start, open_len, close_tag)) = earliest else {
+            break;
+        };
+        let after_open = start + open_len;
+        if let Some(rel_end) = find_ascii_ci(&working[after_open..], close_tag) {
+            let end = after_open + rel_end;
+            let th = working[after_open..end].trim().to_string();
+            if !th.is_empty() {
+                thoughts.push(th);
+            }
+            let before = working[..start].trim_end();
+            let after = working[end + close_tag.len()..].trim_start();
+            working = match (before.is_empty(), after.is_empty()) {
+                (true, true) => String::new(),
+                (true, false) => after.to_string(),
+                (false, true) => before.to_string(),
+                (false, false) => format!("{before}\n\n{after}"),
+            };
+        } else {
+            let unclosed = working[after_open..].trim().to_string();
+            if !unclosed.is_empty() {
+                thoughts.push(unclosed);
+            }
+            working = working[..start].trim().to_string();
+            break;
+        }
+    }
+
+    // 2. Handle orphan closing tags (e.g. llama.cpp / Ollama templates that prefill <think>).
+    loop {
+        let mut earliest_close: Option<(usize, usize)> = None;
+        for &(_, close) in TAG_PAIRS {
+            if let Some(pos) = find_ascii_ci(&working, close) {
+                if earliest_close.map(|(e, _)| pos < e).unwrap_or(true) {
+                    earliest_close = Some((pos, close.len()));
+                }
+            }
+        }
+        let Some((pos, close_len)) = earliest_close else {
+            break;
+        };
+        let leaked = working[..pos].trim().to_string();
+        if !leaked.is_empty() {
+            thoughts.push(leaked);
+        }
+        working = working[pos + close_len..].trim_start().to_string();
+    }
+
+    // 3. Strip leading echoed `[Step N · ...]` lines if present.
+    let mut kept_lines: Vec<&str> = Vec::new();
+    let mut at_head = true;
+    for line in working.lines() {
+        let lt = line.trim();
+        if at_head && lt.starts_with("[Step ") && lt.ends_with(']') {
+            thoughts.push(lt[1..lt.len() - 1].to_string());
+            continue;
+        }
+        if !lt.is_empty() {
+            at_head = false;
+        }
+        kept_lines.push(line);
+    }
+    let clean = kept_lines.join("\n").trim().to_string();
+
+    (
+        clean,
+        if thoughts.is_empty() {
+            None
+        } else {
+            Some(thoughts.join("\n\n"))
+        },
+    )
+}
+
+pub fn extract_think_tags_streaming(raw: &str) -> (String, Option<String>) {
+    extract_think_tags(raw)
+}
+
+fn extract_fallback_tool_calls(text: &str) -> Vec<ToolCallRequest> {
+    let mut calls = Vec::new();
+    let re = regex::Regex::new(r"(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>").unwrap();
+    for cap in re.captures_iter(text) {
+        if let Ok(val) = serde_json::from_str::<Value>(&cap[1]) {
+            if let Some(name) = val["name"].as_str() {
+                calls.push(ToolCallRequest {
+                    id: Uuid::new_v4().to_string(),
+                    name: name.to_string(),
+                    arguments: val.get("arguments").cloned().unwrap_or_else(|| json!({})),
+                    thought_signature: None,
+                });
+            }
+        }
+    }
+    calls
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_think_tags_cleanly() {
+        let (clean, thought) =
+            extract_think_tags("<think>step 1\nstep 2</think>\nFinal answer here.");
+        assert_eq!(clean, "Final answer here.");
+        assert_eq!(thought.as_deref(), Some("step 1\nstep 2"));
+
+        let (partial_clean, partial_thought) =
+            extract_think_tags_streaming("<think>reasoning in progress");
+        assert_eq!(partial_clean, "");
+        assert_eq!(partial_thought.as_deref(), Some("reasoning in progress"));
+
+        let (orphan_clean, orphan_thought) =
+            extract_think_tags("Checking workspace files now.\n</think>\n### Summary\nDone.");
+        assert_eq!(orphan_clean, "### Summary\nDone.");
+        assert_eq!(
+            orphan_thought.as_deref(),
+            Some("Checking workspace files now.")
+        );
+
+        let (multi_clean, multi_thought) = extract_think_tags(
+            "<thinking>first check</thinking>\n\n<thought>second check</thought>\nFinal result.",
+        );
+        assert_eq!(multi_clean, "Final result.");
+        assert_eq!(
+            multi_thought.as_deref(),
+            Some("first check\n\nsecond check")
+        );
+    }
+
+    #[test]
+    fn classifies_auto_switch_errors_across_providers() {
+        let (sw, blk, _) = classify_provider_error("Gemini API HTTP 429: limit: 0 RESOURCE_EXHAUSTED");
+        assert!(sw && blk);
+
+        let (sw2, blk2, _) = classify_provider_error("Anthropic API HTTP 529: Overloaded");
+        assert!(sw2 && !blk2);
+
+        let (sw3, blk3, _) = classify_provider_error("Endpoint returned HTTP 429 Too Many Requests");
+        assert!(sw3 && !blk3);
+
+        let (sw4, blk4, _) = classify_provider_error("Gemini API HTTP 400: invalid argument");
+        assert!(!sw4 && !blk4);
+
+        let (sw5, blk5, _) =
+            classify_provider_error("Gemini API request timed out after 12s for model 'gemini-3.7-flash'");
+        assert!(sw5 && !blk5);
+
+        let (sw6, blk6, _) =
+            classify_provider_error("error sending request for url: connection closed before message completed");
+        assert!(sw6 && !blk6);
+    }
+
+    #[test]
+    fn builds_cross_provider_and_optional_local_fallbacks() {
+        use harness_models::{FitTier, LocalModelSource, VramFitAssessment};
+        let cat = vec![
+            ModelCatalogEntry {
+                id: "gemini-3-flash-preview".into(),
+                display_name: "Gemini 3 Flash".into(),
+                provider: ProviderKind::GoogleGemini,
+                context_window: 1_000_000,
+                supports_thinking: true,
+                supports_tools: true,
+                supports_vision: true,
+                tier_note: String::new(),
+                quota_limit: None,
+                reachable: true,
+                reachability_reason: String::new(),
+                antigravity_alias: None,
+            },
+            ModelCatalogEntry {
+                id: "claude-sonnet-4-5".into(),
+                display_name: "Claude".into(),
+                provider: ProviderKind::Anthropic,
+                context_window: 200_000,
+                supports_thinking: true,
+                supports_tools: true,
+                supports_vision: true,
+                tier_note: String::new(),
+                quota_limit: None,
+                reachable: true,
+                reachability_reason: String::new(),
+                antigravity_alias: None,
+            },
+        ];
+        let locals = vec![LocalModelEntry {
+            id: "local::qwen3.5:9b".into(),
+            name: "qwen3.5:9b".into(),
+            source: LocalModelSource::VaultGguf,
+            gguf_path: "qwen.gguf".into(),
+            ollama_tag: None,
+            mmproj_path: None,
+            size_bytes: 5_000_000_000,
+            quant: "Q4_K_M".into(),
+            is_embedding: false,
+            is_valid_gguf: true,
+            vram_fit: VramFitAssessment {
+                tier: FitTier::FitsInVram,
+                label: "Full GPU".into(),
+                weights_mb: 5000,
+                kv_cache_mb: 512,
+                compute_buffer_mb: 512,
+                estimated_total_mb: 6024,
+                recommended_ngl: 99,
+            },
+        }];
+
+        let cloud_only = build_fallback_candidates(
+            "gemini-3-flash-preview",
+            ProviderKind::GoogleGemini,
+            &cat,
+            &locals,
+            false,
+        );
+        assert_eq!(cloud_only, vec!["claude-sonnet-4-5"]);
+
+        let with_local = build_fallback_candidates(
+            "gemini-3-flash-preview",
+            ProviderKind::GoogleGemini,
+            &cat,
+            &locals,
+            true,
+        );
+        assert_eq!(with_local, vec!["claude-sonnet-4-5", "local::qwen3.5:9b"]);
+    }
+
+    #[test]
+    fn clean_schema_for_gemini_normalizes_mcp_union_types_anyof_defs_and_empty_objects() {
+        let mcp_schema = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "$defs": {
+                "RefItem": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "label": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["label", "missing_field"]
+                }
+            },
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "title": "Repo Path",
+                    "description": "Path to repo"
+                },
+                "max_count": {
+                    "anyOf": [{ "type": "integer", "exclusiveMinimum": 0 }, { "type": "null" }],
+                    "default": null,
+                    "description": "Optional limit"
+                },
+                "revision": {
+                    "type": ["string", "null"],
+                    "default": null,
+                    "description": "Nullable union type list"
+                },
+                "tags": {
+                    "type": "array"
+                },
+                "item": {
+                    "$ref": "#/$defs/RefItem"
+                }
+            },
+            "required": ["repo_path", "nonexistent"]
+        });
+
+        let cleaned = clean_schema_for_gemini(&mcp_schema);
+        assert_eq!(cleaned["type"], "OBJECT");
+        assert!(cleaned.get("$schema").is_none());
+        assert!(cleaned.get("$defs").is_none());
+        assert!(cleaned.get("additionalProperties").is_none());
+        assert_eq!(cleaned["required"], json!(["repo_path"]));
+
+        // Scalar union `["string", "null"]` must become scalar `"STRING"` + `nullable: true`
+        let rev = &cleaned["properties"]["revision"];
+        assert_eq!(rev["type"], "STRING");
+        assert_eq!(rev["nullable"], true);
+        assert!(rev.get("default").is_none());
+
+        // Pydantic `anyOf: [{type: integer}, {type: null}]` -> `"INTEGER"` + `nullable: true`
+        let mc = &cleaned["properties"]["max_count"];
+        assert_eq!(mc["type"], "INTEGER");
+        assert_eq!(mc["nullable"], true);
+        assert_eq!(mc["description"], "Optional limit");
+        assert!(mc.get("exclusiveMinimum").is_none());
+
+        // Array missing `items` gets default `{"type": "STRING"}`
+        assert_eq!(cleaned["properties"]["tags"]["type"], "ARRAY");
+        assert_eq!(
+            cleaned["properties"]["tags"]["items"],
+            json!({ "type": "STRING" })
+        );
+
+        // `$ref` resolved & `required` filtered to existing properties
+        let item = &cleaned["properties"]["item"];
+        assert_eq!(item["type"], "OBJECT");
+        assert_eq!(item["required"], json!(["label"]));
+        assert!(item["properties"]["label"].get("minLength").is_none());
+
+        // Empty-property object loses `"properties"` so declaration builder can omit `parameters`
+        let empty_obj = clean_schema_for_gemini(&json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }));
+        assert_eq!(empty_obj["type"], "OBJECT");
+        assert!(empty_obj.get("properties").is_none());
+    }
+
+    #[test]
+    fn gemini_and_anthropic_merge_parallel_tool_responses_and_coerce_null_args() {
+        let msgs = vec![
+            ProviderMessage {
+                role: "user".into(),
+                content: "Inspect repo".into(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                images: Vec::new(),
+            },
+            ProviderMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: vec![
+                    ToolCallRequest {
+                        id: "c1".into(),
+                        name: "git_status".into(),
+                        arguments: Value::Null,
+                        thought_signature: Some("sig1".into()),
+                    },
+                    ToolCallRequest {
+                        id: "c2".into(),
+                        name: "list_dir".into(),
+                        arguments: json!({ "path": "src" }),
+                        thought_signature: None,
+                    },
+                ],
+                images: Vec::new(),
+            },
+            ProviderMessage {
+                role: "tool".into(),
+                content: "clean".into(),
+                tool_call_id: Some("c1".into()),
+                tool_name: Some("git_status".into()),
+                tool_calls: Vec::new(),
+                images: Vec::new(),
+            },
+            ProviderMessage {
+                role: "tool".into(),
+                content: "lib.rs".into(),
+                tool_call_id: Some("c2".into()),
+                tool_name: Some("list_dir".into()),
+                tool_calls: Vec::new(),
+                images: Vec::new(),
+            },
+        ];
+
+        let gem = build_gemini_contents(&msgs);
+        assert_eq!(gem.len(), 3, "parallel tool responses must merge into 1 user turn");
+        assert_eq!(gem[1]["parts"][0]["functionCall"]["args"], json!({}));
+        assert_eq!(gem[2]["role"], "user");
+        let gem_parts = gem[2]["parts"].as_array().unwrap();
+        assert_eq!(gem_parts.len(), 2);
+        assert_eq!(gem_parts[0]["functionResponse"]["name"], "git_status");
+        assert_eq!(gem_parts[1]["functionResponse"]["name"], "list_dir");
+
+        let ant = build_anthropic_messages(&msgs);
+        assert_eq!(ant.len(), 3, "parallel tool_results must merge into 1 user turn");
+        assert_eq!(ant[1]["content"][0]["input"], json!({}));
+        assert_eq!(ant[2]["role"], "user");
+        let ant_blocks = ant[2]["content"].as_array().unwrap();
+        assert_eq!(ant_blocks.len(), 2);
+        assert_eq!(ant_blocks[0]["type"], "tool_result");
+        assert_eq!(ant_blocks[0]["tool_use_id"], "c1");
+        assert_eq!(ant_blocks[1]["tool_use_id"], "c2");
+    }
+}

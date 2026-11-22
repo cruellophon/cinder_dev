@@ -1,0 +1,36 @@
+# Build outputs & local release binaries (publish binaries via GitHub Releases)
+/target/
+/release/
+*.exe
+*.pdb
+*.dll
+*.so
+*.dylib
+
+# Local Cinder / Bumbo runtime state, caches & API keys
+.bumbo/
+.cinder/
+state.json
+knowledge_index.json
+*.gguf
+*.safetensors
+*.bin
+
+# Secrets & environment files
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.*
+credentials.*
+
+# OS & editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.tmp

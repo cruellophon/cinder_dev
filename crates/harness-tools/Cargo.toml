@@ -1,0 +1,24 @@
+[package]
+name = "harness-tools"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+futures-util.workspace = true
+harness-net = { path = "../harness-net" }
+harness-providers = { path = "../harness-providers" }
+harness-store = { path = "../harness-store" }
+lopdf.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+zip.workspace = true

@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cinder | Native Rust Local Agentic IDE & Model Forge</title>
+    <link rel="icon" type="image/x-icon" href="assets/cinder.ico">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="bg-main">
+    <!-- Top Navigation Bar -->
+    <nav class="top-nav">
+        <div class="nav-content">
+            <div class="nav-links">
+                <a href="#features">Features</a>
+                <a href="#architecture">Architecture</a>
+                <a href="#shortcuts">Shortcuts</a>
+                <a href="#download" class="nav-cta">Download</a>
+            </div>
+            <div class="nav-brand">
+                <img src="assets/cinder.ico" alt="Cinder Logo" class="nav-logo">
+                <span class="brand-name">CINDER</span>
+                <span class="version-pill">v5.5</span>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container">
+        <!-- Hero Section -->
+        <header class="hero">
+            <div class="hero-glow"></div>
+            <div class="hero-content">
+                <img src="assets/cinder.ico" alt="Cinder Glowing Orb Logo" class="logo">
+                <div class="badge-row">
+                    <span class="badge accent-badge">100% Pure Rust</span>
+                    <span class="badge">Zero WebView / Edge</span>
+                    <span class="badge">Native GPU Accelerated</span>
+                </div>
+                <h1 class="hero-title">Forge Intelligence<br><span class="gradient-text">Locally & Autonomously</span></h1>
+                <p class="tagline">
+                    A local-first, blazing-fast desktop agentic IDE and GGUF model forge built with <code>eframe</code> and <code>egui</code>. Zero bloat, instant launch, and absolute data privacy.
+                </p>
+
+                <div class="hero-actions" id="download">
+                    <a href="https://github.com/cruellophon/cinder_dev/releases/latest" class="btn btn-primary">
+                        <svg class="btn-icon" viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                        Download cinder.exe <span class="btn-sub">Single Standalone Binary</span>
+                    </a>
+                    <a href="https://github.com/cruellophon/cinder_dev" class="btn btn-secondary">
+                        View on GitHub
+                    </a>
+                </div>
+
+                <div class="quick-terminal-preview">
+                    <div class="terminal-bar">
+                        <span class="dot red"></span>
+                        <span class="dot amber"></span>
+                        <span class="dot green"></span>
+                        <span class="terminal-title">cinder — release/cinder.exe</span>
+                    </div>
+                    <pre><code class="terminal-code">
+<span class="prompt">$</span> cargo build --release --bin cinder
+<span class="output">   Compiling cinder-gui v5.5 (C:\Projects\Cinder)</span>
+<span class="success">    Finished</span> release [optimized] target in 2.41s
+<span class="prompt">$</span> .\release\cinder.exe --port 17770</code></pre>
+                </div>
+            </div>
+        </header>
+
+        <!-- Core Features Grid -->
+        <section id="features" class="section">
+            <div class="section-header">
+                <h2 class="section-title">Engineered for Absolute Performance</h2>
+                <p class="section-subtitle">Cinder bypasses web wrappers entirely to deliver an uncompromising desktop experience.</p>
+            </div>
+
+            <div class="features-grid">
+                <div class="card">
+                    <div class="card-icon gpu-icon">⚡</div>
+                    <h3 class="card-title">Native GPU Frontend</h3>
+                    <p class="card-desc">Powered by <code>eframe</code> and <code>egui</code> for buttery 60+ FPS rendering directly on your GPU. No Electron memory bloat, no WebView security sandboxing friction.</p>
+                </div>
+                <div class="card">
+                    <div class="card-icon agent-icon">🤖</div>
+                    <h3 class="card-title">Agentic Workspace Forge</h3>
+                    <p class="card-desc">Autonomous coding agents integrated directly into your workspace. Execute multi-file edits, run background checks, and forge local GGUF models seamlessly.</p>
+                </div>
+                <div class="card">
+                    <div class="card-icon binary-icon">📦</div>
+                    <h3 class="card-title">Single Standalone Executable</h3>
+                    <p class="card-desc">Ships as a single binary with icons, fonts, and assets embedded directly. No external DLLs, no complex installers or environment setups required.</p>
+                </div>
+                <div class="card">
+                    <div class="card-icon privacy-icon">🔒</div>
+                    <h3 class="card-title">100% Local-First Privacy</h3>
+                    <p class="card-desc">Your code, state, and model weights never leave your machine. Fully portable data directory with zero telemetry or cloud dependency.</p>
+                </div>
+                <div class="card">
+                    <div class="card-icon server-icon">🌐</div>
+                    <h3 class="card-title">Headless & GUI Modes</h3>
+                    <p class="card-desc">Run the gorgeous native GUI or launch with <code>--headless</code> to expose a lightning-fast local API server on <code>127.0.0.1:17770</code>.</p>
+                </div>
+                <div class="card">
+                    <div class="card-icon memory-icon">🧠</div>
+                    <h3 class="card-title">Intelligent Memory Store</h3>
+                    <p class="card-desc">Built-in knowledge graph memory, semantic chunking, and local vector indexing keeping your codebase fully indexed for instant context retrieval.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Architecture / Crate Ecosystem Section -->
+        <section id="architecture" class="section">
+            <div class="section-header">
+                <h2 class="section-title">The Crate Ecosystem</h2>
+                <p class="section-subtitle">Modular Rust architecture built from the ground up for high-concurrency AI agent workflows.</p>
+            </div>
+
+            <div class="architecture-grid">
+                <div class="arch-card">
+                    <code class="arch-code">crates/cinder-gui</code>
+                    <p class="arch-desc">GPU-accelerated eframe/egui interface with split panels, markdown rendering, chat threads, and live process inspection.</p>
+                </div>
+                <div class="arch-card">
+                    <code class="arch-code">crates/harness-core</code>
+                    <p class="arch-desc">Core orchestration engine managing autonomous agent loops, tool dispatching, and safety guardrails.</p>
+                </div>
+                <div class="arch-card">
+                    <code class="arch-code">crates/harness-models</code>
+                    <p class="arch-desc">Local GGUF model loader, prompt template management, and context window optimization routines.</p>
+                </div>
+                <div class="arch-card">
+                    <code class="arch-code">crates/harness-tools</code>
+                    <p class="arch-desc">Secure sandboxed system tools for file editing, bash execution, regex searching, and test verification.</p>
+                </div>
+                <div class="arch-card">
+                    <code class="arch-code">crates/harness-net</code>
+                    <p class="arch-desc">Async HTTP server and client adapters enabling headless API mode and external provider integrations.</p>
+                </div>
+                <div class="arch-card">
+                    <code class="arch-code">crates/harness-store</code>
+                    <p class="arch-desc">High-performance local key-value store and knowledge graph state manager.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Keyboard Shortcuts Section -->
+        <section id="shortcuts" class="section">
+            <div class="section-header">
+                <h2 class="section-title">Lightning Keyboard Workflow</h2>
+                <p class="section-subtitle">Designed for power users who never want to leave the keyboard.</p>
+            </div>
+
+            <div class="shortcuts-table">
+                <div class="shortcut-row">
+                    <span class="shortcut-desc">Open Agent Command Palette</span>
+                    <span class="kbd-group"><kbd>Ctrl</kbd> + <kbd>K</kbd></span>
+                </div>
+                <div class="shortcut-row">
+                    <span class="shortcut-desc">Toggle Chat / Code Split View</span>
+                    <span class="kbd-group"><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>C</kbd></span>
+                </div>
+                <div class="shortcut-row">
+                    <span class="shortcut-desc">Trigger Autonomous Forge Run</span>
+                    <span class="kbd-group"><kbd>Ctrl</kbd> + <kbd>Enter</kbd></span>
+                </div>
+                <div class="shortcut-row">
+                    <span class="shortcut-desc">Quick File Search & Index</span>
+                    <span class="kbd-group"><kbd>Ctrl</kbd> + <kbd>P</kbd></span>
+                </div>
+                <div class="shortcut-row">
+                    <span class="shortcut-desc">Clear Session & Reset Context</span>
+                    <span class="kbd-group"><kbd>Ctrl</kbd> + <kbd>L</kbd></span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Footer Call to Action -->
+        <footer class="footer-cta" id="download">
+            <div class="footer-glow"></div>
+            <h2 class="footer-title">Ready to Forge Without Limits?</h2>
+            <p class="footer-subtitle">Experience the speed and absolute privacy of 100% native Rust intelligence.</p>
+            <div class="hero-actions">
+                <a href="https://github.com/cruellophon/cinder_dev/releases/latest" class="btn btn-primary">
+                    Download cinder.exe (v5.5)
+                </a>
+            </div>
+            <div class="footer-info">
+                <span>MIT Licensed</span> • 
+                <span>Built for Windows & Linux</span> • 
+                <span>Zero Cloud Dependency</span>
+            </div>
+        </footer>
+    </div>
+</body>
+</html>
