@@ -29,8 +29,30 @@ pub fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
     p
 }
 
+#[cfg(windows)]
+fn strip_prefix_case_insensitive_win(root: &Path, entry: &Path) -> Option<String> {
+    let r_str = root
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    let e_str = entry.to_string_lossy().replace('\\', "/");
+    if e_str.eq_ignore_ascii_case(&r_str) {
+        return Some(String::new());
+    }
+    let r_prefix = format!("{r_str}/");
+    if e_str.len() > r_prefix.len()
+        && e_str.is_char_boundary(r_prefix.len())
+        && e_str[..r_prefix.len()].eq_ignore_ascii_case(&r_prefix)
+    {
+        return Some(e_str[r_prefix.len()..].to_string());
+    }
+    None
+}
+
 /// Compute `entry_path` relative to `workspace_root` using forward slashes,
-/// tolerating Windows `\\?\` verbatim mismatches and drive/case differences.
+/// tolerating Windows `\\?\` verbatim mismatches, symlinks (e.g. macOS `/var` -> `/private/var`),
+/// short 8.3 paths, uncreated descendant paths, and Windows drive/case differences.
 pub fn relative_to_workspace(workspace_root: &Path, entry_path: &Path) -> Option<String> {
     if let Ok(rel) = entry_path.strip_prefix(workspace_root) {
         return Some(rel.to_string_lossy().replace('\\', "/"));
@@ -42,34 +64,54 @@ pub fn relative_to_workspace(workspace_root: &Path, entry_path: &Path) -> Option
         return Some(rel.to_string_lossy().replace('\\', "/"));
     }
 
-    if let (Ok(cr), Ok(ce)) = (
-        std::fs::canonicalize(workspace_root),
-        std::fs::canonicalize(entry_path),
-    ) {
-        let cr_clean = strip_verbatim_prefix(cr);
-        let ce_clean = strip_verbatim_prefix(ce);
-        if let Ok(rel) = ce_clean.strip_prefix(&cr_clean) {
+    let cr_clean_opt = std::fs::canonicalize(workspace_root)
+        .ok()
+        .map(strip_verbatim_prefix);
+    if let Some(ref cr_clean) = cr_clean_opt {
+        if let Ok(rel) = clean_entry.strip_prefix(cr_clean) {
             return Some(rel.to_string_lossy().replace('\\', "/"));
+        }
+        if let Ok(ce) = std::fs::canonicalize(entry_path) {
+            let ce_clean = strip_verbatim_prefix(ce);
+            if let Ok(rel) = ce_clean.strip_prefix(cr_clean) {
+                return Some(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        // Uncreated descendant under an uncanonicalized root symlink or 8.3 short path:
+        // canonicalize the nearest existing ancestor and re-attach remaining components.
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut cur: Option<&Path> = Some(clean_entry.as_path());
+        while let Some(probe) = cur {
+            if probe.exists() {
+                if let Ok(canon_anc) = std::fs::canonicalize(probe) {
+                    let mut reconstructed = strip_verbatim_prefix(canon_anc);
+                    for part in tail.iter().rev() {
+                        reconstructed.push(part);
+                    }
+                    if let Ok(rel) = reconstructed.strip_prefix(cr_clean) {
+                        return Some(rel.to_string_lossy().replace('\\', "/"));
+                    }
+                }
+                break;
+            }
+            if let Some(name) = probe.file_name() {
+                tail.push(name.to_os_string());
+                cur = probe.parent();
+            } else {
+                break;
+            }
         }
     }
 
     #[cfg(windows)]
     {
-        let r_str = clean_root
-            .to_string_lossy()
-            .replace('\\', "/")
-            .trim_end_matches('/')
-            .to_string();
-        let e_str = clean_entry.to_string_lossy().replace('\\', "/");
-        if e_str.eq_ignore_ascii_case(&r_str) {
-            return Some(String::new());
+        if let Some(rel) = strip_prefix_case_insensitive_win(&clean_root, &clean_entry) {
+            return Some(rel);
         }
-        let r_prefix = format!("{r_str}/");
-        if e_str.len() > r_prefix.len()
-            && e_str.is_char_boundary(r_prefix.len())
-            && e_str[..r_prefix.len()].eq_ignore_ascii_case(&r_prefix)
-        {
-            return Some(e_str[r_prefix.len()..].to_string());
+        if let Some(ref cr_clean) = cr_clean_opt {
+            if let Some(rel) = strip_prefix_case_insensitive_win(cr_clean, &clean_entry) {
+                return Some(rel);
+            }
         }
     }
 
@@ -325,21 +367,57 @@ pub fn resolve_workspace_path(workspace_root: &Path, user_path: &str) -> anyhow:
         }
     }
 
-    let normalized_rel;
-    let candidate = {
+    let candidate_buf: PathBuf = {
         let p = Path::new(candidate_raw.as_str());
         if !p.is_absolute()
             && !candidate_raw.starts_with(r"\\")
             && !candidate_raw.starts_with("//")
         {
-            normalized_rel = candidate_raw
-                .trim_start_matches(['/', '\\'])
-                .replace('\\', "/");
-            Path::new(&normalized_rel)
+            PathBuf::from(
+                candidate_raw
+                    .trim_start_matches(['/', '\\'])
+                    .replace('\\', "/"),
+            )
         } else {
-            p
+            #[cfg(not(windows))]
+            let mapped = if p.is_absolute()
+                && !candidate_raw.starts_with("//")
+                && !p.starts_with(&clean_canon_root)
+                && !p.starts_with(workspace_root)
+                && !p.starts_with(&strip_verbatim_prefix(workspace_root.to_path_buf()))
+            {
+                let rel = candidate_raw.trim_start_matches('/').replace('\\', "/");
+                if !rel.is_empty()
+                    && !Path::new(&rel)
+                        .components()
+                        .any(|c| matches!(c, Component::ParentDir))
+                    && !p.exists()
+                {
+                    let ws_probe = clean_canon_root.join(&rel);
+                    let os_parent_exists = p
+                        .parent()
+                        .is_some_and(|pp| pp != Path::new("/") && pp.exists());
+                    let ws_parent_exists = ws_probe
+                        .parent()
+                        .is_some_and(|wp| wp != clean_canon_root && wp.exists());
+                    if ws_probe.exists() || (!os_parent_exists && ws_parent_exists) {
+                        Some(PathBuf::from(rel))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            #[cfg(windows)]
+            let mapped: Option<PathBuf> = None;
+
+            mapped.unwrap_or_else(|| p.to_path_buf())
         }
     };
+    let candidate = candidate_buf.as_path();
 
     if candidate_raw.is_empty()
         || candidate_raw == "."
@@ -700,6 +778,10 @@ mod tests {
         // Outside-workspace path must still be blocked
         let outside = std::env::temp_dir().join("outside_secret_file.txt");
         assert!(resolve_workspace_path(&root, &outside.to_string_lossy()).is_err());
+        #[cfg(not(windows))]
+        {
+            assert!(resolve_workspace_path(&root, "/etc/hosts").is_err());
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
