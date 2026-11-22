@@ -16,7 +16,6 @@ harness-providers = { path = "../harness-providers" }
 harness-store = { path = "../harness-store" }
 harness-tools = { path = "../harness-tools" }
 image.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -654,39 +654,6 @@ pub fn is_copied_recently(ctx: &egui::Context, key: egui::Id) -> bool {
     })
 }
 
-pub fn ghost_toggle(
-    ui: &mut egui::Ui,
-    p: &CinderPalette,
-    active: bool,
-    text: impl Into<egui::WidgetText>,
-) -> egui::Response {
-    let widget_text: egui::WidgetText = text.into();
-    let fill = if active {
-        p.bg_card
-    } else {
-        Color32::TRANSPARENT
-    };
-    let fg = if active { p.accent_hot } else { p.muted };
-    ui.scope(|ui| {
-        let vis = &mut ui.style_mut().visuals;
-        vis.widgets.inactive.weak_bg_fill = fill;
-        vis.widgets.inactive.bg_fill = fill;
-        vis.widgets.inactive.bg_stroke = Stroke::NONE;
-        vis.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, fg);
-        vis.widgets.hovered.weak_bg_fill = p.bg_hover;
-        vis.widgets.hovered.bg_fill = p.bg_hover;
-        vis.widgets.hovered.bg_stroke = Stroke::NONE;
-        vis.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, p.text);
-        ui.add(
-            egui::Button::new(widget_text)
-                .fill(fill)
-                .stroke(Stroke::NONE)
-                .corner_radius(CornerRadius::same(7)),
-        )
-    })
-    .inner
-}
-
 pub fn underline_tab(
     ui: &mut egui::Ui,
     p: &CinderPalette,

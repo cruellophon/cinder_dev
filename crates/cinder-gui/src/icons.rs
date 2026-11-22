@@ -5,14 +5,12 @@ use std::f32::consts::TAU;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
     Sidebar,
-    ChevronLeft,
     ChevronRight,
     ChevronDown,
     Search,
     Filter,
     Plus,
     Close,
-    MoreHorizontal,
     Folder,
     FolderOpen,
     File,
@@ -37,7 +35,6 @@ pub enum Icon {
     Stop,
     NewFile,
     NewFolder,
-    Check,
     Clock,
     Briefcase,
     Download,
@@ -72,10 +69,6 @@ pub fn draw_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 stroke,
             );
         }
-        Icon::ChevronLeft => {
-            painter.line_segment([p(0.14, -0.26), p(-0.14, 0.0)], stroke);
-            painter.line_segment([p(-0.14, 0.0), p(0.14, 0.26)], stroke);
-        }
         Icon::ChevronRight => {
             painter.line_segment([p(-0.14, -0.26), p(0.14, 0.0)], stroke);
             painter.line_segment([p(0.14, 0.0), p(-0.14, 0.26)], stroke);
@@ -101,12 +94,6 @@ pub fn draw_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Close => {
             painter.line_segment([p(-0.24, -0.24), p(0.24, 0.24)], stroke);
             painter.line_segment([p(0.24, -0.24), p(-0.24, 0.24)], stroke);
-        }
-        Icon::MoreHorizontal => {
-            let r = (s * 0.065).max(1.1);
-            painter.circle_filled(p(-0.25, 0.0), r, color);
-            painter.circle_filled(p(0.0, 0.0), r, color);
-            painter.circle_filled(p(0.25, 0.0), r, color);
         }
         Icon::Folder => {
             let pts = vec![
@@ -352,10 +339,6 @@ pub fn draw_icon(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.add(egui::Shape::closed_line(pts, stroke));
             painter.line_segment([p(-0.12, 0.06), p(0.12, 0.06)], stroke);
             painter.line_segment([p(0.0, -0.06), p(0.0, 0.18)], stroke);
-        }
-        Icon::Check => {
-            painter.line_segment([p(-0.28, 0.02), p(-0.06, 0.24)], stroke);
-            painter.line_segment([p(-0.06, 0.24), p(0.30, -0.22)], stroke);
         }
         Icon::Clock => {
             painter.circle_stroke(c, s * 0.34, stroke);

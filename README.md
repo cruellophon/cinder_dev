@@ -33,7 +33,7 @@ Repository: <https://github.com/cruellophon/cinder_dev>
 
 | Crate / Binary | Responsibility |
 | :--- | :--- |
-| [`bins/bumbo-app`](bins/bumbo-app) | Desktop & optional `--headless` HTTP server entry point (`cinder` / `bumbo-app`), embedded assets, Axum routes |
+| [`bins/bumbo-app`](bins/bumbo-app) | Native desktop entry point (`cinder`) and Windows PE icon/resource embedding |
 | [`crates/cinder-gui`](crates/cinder-gui) | Native GPU `eframe` / `egui` frontend (`chat`, `markdown`, `inspector`, `editor`, `explorer`, `forge`, `settings`, `sidebar`, `modals`, `plugins`, `customizations`, `theme`) |
 | [`crates/harness-core`](crates/harness-core) | Multi-step agent loop, Orchestrator Planner/Executor routing, Vision & Research sub-agents, checkpoints, slash skills |
 | [`crates/harness-tools`](crates/harness-tools) | Workspace-sandboxed file/dir tools, diff generator, `lopdf` PDF extractor, offline RAG index, MCP stdio client, `web_search`, safe OS URL opener |
@@ -89,8 +89,6 @@ cargo build --release --bin cinder
 - **Linux archive:** `bash scripts/package-linux.sh target/release/cinder dist 0.5.5`
 
 ### Runtime Flags & Environment Variables
-- `--headless` — start the embedded Axum web UI & API server (`http://127.0.0.1:17770`) instead of opening the native GUI
-- `--port <PORT>` — bind `--headless` to a custom loopback port
 - `--open-stage` / `--open-settings` / `--open-forge` / `--open-customizations` — open directly into a specific panel
 - `CINDER_DATA_DIR=<PATH>` — override the runtime data directory where Cinder stores `state.json`, plugins, skills, and portable toolchains
 

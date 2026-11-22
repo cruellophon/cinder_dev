@@ -49,30 +49,6 @@ pub fn load_cinder_icon_data() -> Option<egui::IconData> {
     })
 }
 
-pub fn run_native_cinder() -> anyhow::Result<()> {
-    run_native_cinder_with_launch(CinderLaunchOptions::default())
-}
-
-pub fn run_native_cinder_with_screenshot(screenshot_out: Option<PathBuf>) -> anyhow::Result<()> {
-    run_native_cinder_with_launch(CinderLaunchOptions {
-        screenshot_out,
-        ..Default::default()
-    })
-}
-
-pub fn run_native_cinder_with_options(
-    screenshot_out: Option<PathBuf>,
-    open_stage: bool,
-    open_settings: bool,
-) -> anyhow::Result<()> {
-    run_native_cinder_with_launch(CinderLaunchOptions {
-        screenshot_out,
-        open_stage,
-        open_settings,
-        ..Default::default()
-    })
-}
-
 pub fn run_native_cinder_with_launch(opts: CinderLaunchOptions) -> anyhow::Result<()> {
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([1560.0, 960.0])

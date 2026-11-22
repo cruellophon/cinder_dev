@@ -8,24 +8,7 @@ default-run = "cinder"
 name = "cinder"
 path = "src/main.rs"
 
-[[bin]]
-name = "bumbo-app"
-path = "src/bin/bumbo-app.rs"
-
 [dependencies]
 anyhow.workspace = true
-axum.workspace = true
-chrono.workspace = true
 cinder-gui = { path = "../../crates/cinder-gui" }
-harness-core = { path = "../../crates/harness-core" }
-harness-models = { path = "../../crates/harness-models" }
-harness-net = { path = "../../crates/harness-net" }
-harness-providers = { path = "../../crates/harness-providers" }
-harness-store = { path = "../../crates/harness-store" }
-harness-tools = { path = "../../crates/harness-tools" }
-serde.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true
-uuid.workspace = true

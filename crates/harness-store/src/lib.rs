@@ -228,11 +228,6 @@ impl BumboStore {
         &self.paths
     }
 
-    pub fn save_sync(&self) -> anyhow::Result<()> {
-        let guard = self.state.blocking_read();
-        self.write_atomic(&*guard)
-    }
-
     pub async fn save(&self) -> anyhow::Result<()> {
         let guard = self.state.read().await;
         self.write_atomic(&*guard)

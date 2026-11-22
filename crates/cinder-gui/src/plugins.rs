@@ -181,10 +181,7 @@ pub fn render_plugins_body(
                                                     )
                                                     .clicked()
                                                     {
-                                                        backend.install_plugin_with_auto_hybrid(
-                                                            pid.clone(),
-                                                            false,
-                                                        );
+                                                        backend.install_plugin(pid.clone());
                                                     }
                                                 }
                                             }
@@ -307,10 +304,8 @@ pub fn render_plugins_body(
                                         backend.probe_mcp(mcp_id.clone());
                                     }
                                 }
-                            } else {
-                                if primary_button(ui, p, "Install (1-Click)").clicked() {
-                                    backend.install_plugin_with_auto_hybrid(e.id.clone(), false);
-                                }
+                            } else if primary_button(ui, p, "Install (1-Click)").clicked() {
+                                backend.install_plugin(e.id.clone());
                             }
                         });
                     });
@@ -446,11 +441,7 @@ pub fn render_plugins_body(
                 {
                     let pkg = state.custom_dep_input.trim().to_string();
                     state.custom_dep_input.clear();
-                    backend.install_custom_dependency_with_auto_hybrid(
-                        cur_mgr.into(),
-                        pkg,
-                        false,
-                    );
+                    backend.install_custom_dependency(cur_mgr.into(), pkg);
                 }
             });
             ui.add_space(6.0);
@@ -549,18 +540,10 @@ pub fn render_plugins_body(
                                     backend.uninstall_dependency(d.manager.clone(), d.name.clone());
                                 }
                                 if secondary_button(ui, p, "Update").clicked() {
-                                    backend.install_dependency_with_auto_hybrid(
-                                        d.manager.clone(),
-                                        d.name.clone(),
-                                        false,
-                                    );
+                                    backend.install_dependency(d.manager.clone(), d.name.clone());
                                 }
                             } else if primary_button(ui, p, "+ Install").clicked() {
-                                backend.install_dependency_with_auto_hybrid(
-                                    d.manager.clone(),
-                                    d.name.clone(),
-                                    false,
-                                );
+                                backend.install_dependency(d.manager.clone(), d.name.clone());
                             }
                         });
                     });

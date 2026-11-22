@@ -259,10 +259,6 @@ impl BackendHandle {
         Ok((handle, rx))
     }
 
-    pub fn data_paths(&self) -> &BumboPaths {
-        self.store.paths()
-    }
-
     fn send(&self, ev: BackendEvent) {
         let _ = self.tx.send(ev);
         self.ctx.request_repaint();
@@ -1363,14 +1359,6 @@ impl BackendHandle {
     // ---- Plugins, Dependencies & Antigravity Sync ----
 
     pub fn install_plugin(self: &Arc<Self>, plugin_id: String) {
-        self.install_plugin_with_auto_hybrid(plugin_id, false);
-    }
-
-    pub fn install_plugin_with_auto_hybrid(
-        self: &Arc<Self>,
-        plugin_id: String,
-        _auto_hybrid: bool,
-    ) {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
             let catalog = list_plugin_catalog_with_status(h.store.paths(), &[]);
@@ -1459,15 +1447,6 @@ impl BackendHandle {
     }
 
     pub fn install_dependency(self: &Arc<Self>, manager: String, package: String) {
-        self.install_dependency_with_auto_hybrid(manager, package, false);
-    }
-
-    pub fn install_dependency_with_auto_hybrid(
-        self: &Arc<Self>,
-        manager: String,
-        package: String,
-        _auto_hybrid: bool,
-    ) {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
             if is_dependency_allowlisted(&manager, &package).is_none() {
@@ -1528,12 +1507,7 @@ impl BackendHandle {
         });
     }
 
-    pub fn install_custom_dependency_with_auto_hybrid(
-        self: &Arc<Self>,
-        manager: String,
-        package: String,
-        _auto_hybrid: bool,
-    ) {
+    pub fn install_custom_dependency(self: &Arc<Self>, manager: String, package: String) {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
             let entry = match validate_custom_package_name(&manager, &package) {

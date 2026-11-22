@@ -232,7 +232,6 @@ pub struct GuiState {
     pub show_explorer: bool,
     pub sidebar_width: f32,
     pub explorer_width: f32,
-    pub workbench_fraction: f32,
     pub show_terminal: bool,
     pub terminal_height: f32,
 
@@ -271,7 +270,6 @@ pub struct GuiState {
     pub question_custom_text: String,
     pub model_search: String,
     pub model_cat: String, // "all" | "local" | "google" | "cloud"
-    pub show_attach_ws_picker: bool,
     pub attach_ws_filter: String,
     pub is_generating: bool,
 
@@ -365,7 +363,6 @@ impl GuiState {
             show_explorer: false,
             sidebar_width: 242.0,
             explorer_width: 256.0,
-            workbench_fraction: 0.48,
             show_terminal: false,
             terminal_height: 190.0,
             main_view: MainView::Chat,
@@ -396,7 +393,6 @@ impl GuiState {
             question_custom_text: String::new(),
             model_search: String::new(),
             model_cat: "all".into(),
-            show_attach_ws_picker: false,
             attach_ws_filter: String::new(),
             is_generating: false,
             editor_tabs: Vec::new(),
