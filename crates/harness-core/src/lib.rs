@@ -83,7 +83,7 @@ pub(crate) fn active_tools_for_context(
         specs.retain(|t| {
             matches!(
                 t.name.as_str(),
-                "delegate_vision" | "write_artifact" | "ask_user" | "web_search"
+                "delegate_vision" | "write_artifact" | "ask_user" | "web_search" | "fetch_url"
             ) || (allow_web && t.name == "delegate_research")
         });
     }

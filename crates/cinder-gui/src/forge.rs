@@ -604,35 +604,19 @@ fn render_hub_tab(
         p.card_frame().show(ui, |ui| {
             let w = ui.available_width();
             ui.set_width(w);
-            ui.allocate_ui_with_layout(
-                egui::vec2(w, 26.0),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    if primary_button(ui, p, "Switch to Hybrid Mode").clicked() {
-                        backend.set_privacy(harness_net::PrivacyMode::Hybrid);
-                    }
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width().max(40.0), 22.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.set_clip_rect(
-                                ui.available_rect_before_wrap().intersect(ui.clip_rect()),
-                            );
-                            badge(ui, "Strict Local", p.green, p.bg_card);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(
-                                        "Search & downloads automatically switch to Hybrid Mode when requested.",
-                                    )
-                                    .small()
-                                    .color(p.text),
-                                )
-                                .truncate(),
-                            );
-                        },
-                    );
-                },
-            );
+            ui.horizontal(|ui| {
+                badge(ui, "Strict Local", p.green, p.bg_card);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "Hugging Face search & downloads are blocked in Strict Local Mode. Use the bottom-left System & Forge Telemetry popover → Allow Hybrid to enable them.",
+                        )
+                        .small()
+                        .color(p.text),
+                    )
+                    .truncate(),
+                );
+            });
         });
         ui.add_space(12.0);
     }

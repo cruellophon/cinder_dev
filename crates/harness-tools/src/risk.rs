@@ -43,7 +43,7 @@ pub fn classify_tool_risk(tool_name: &str, args: &Value) -> (RiskTier, String) {
     match tool_name {
         "list_dir" | "read_file" | "search_files" | "extract_pdf_text" | "propose_edit"
         | "search_knowledge" | "delegate_research" | "delegate_vision" | "submit_plan"
-        | "ask_user" | "web_search" | "switch_mode" | "write_artifact" => (
+        | "ask_user" | "web_search" | "fetch_url" | "switch_mode" | "write_artifact" => (
             RiskTier::SafeReadOnly,
             "Read-only / planning operation".into(),
         ),

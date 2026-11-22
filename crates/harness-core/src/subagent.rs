@@ -6,7 +6,7 @@ use harness_tools::{execute_tool, resolve_workspace_path};
 use serde_json::json;
 use std::path::Path;
 
-const MAX_SUBAGENT_STEPS: usize = 3;
+const MAX_SUBAGENT_STEPS: usize = 5;
 
 fn is_known_vision_model_id(id: &str) -> bool {
     let lower = id.to_ascii_lowercase();
@@ -367,6 +367,7 @@ pub async fn run_research_subagent(
         ]);
     }
     if allow_web {
+        subagent_specs.push(harness_tools::fetch_url_spec());
         subagent_specs.push(ToolSpec {
             name: "web_search".into(),
             description: "Search the live web and Wikipedia for verified articles and URLs.".into(),
@@ -392,7 +393,7 @@ pub async fn run_research_subagent(
         "Standalone session (no local workspace attached).".to_string()
     };
     let web_rule = if allow_web {
-        "When asked about online facts, Wikipedia, or sources/URLs, ALWAYS call `web_search` and cite ONLY exact verified URLs returned by `web_search`. Never invent links or claim a web search ran if it failed or was skipped."
+        "When given a direct `http://` or `https://` URL (such as a GitHub release, repo, or docs link), ALWAYS call `fetch_url` on that exact URL first. Use `web_search` for keyword queries. Cite ONLY exact verified URLs and content returned by your tools."
     } else {
         "You are in Strict Local Mode (offline only). Inspect local workspace files strictly."
     };
@@ -424,6 +425,10 @@ pub async fn run_research_subagent(
 
     let mut final_summary = String::new();
     let mut actual_model = target_model.clone();
+    let mut tool_findings: Vec<String> = Vec::new();
+    let mut last_thinking = String::new();
+    let mut did_no_tools_pass = false;
+
     for step in 0..MAX_SUBAGENT_STEPS {
         ctx.store
             .set_activity(
@@ -438,23 +443,32 @@ pub async fn run_research_subagent(
             )
             .await;
 
+        let expose_tools = step < MAX_SUBAGENT_STEPS - 1 && !subagent_specs.is_empty();
+        if !expose_tools {
+            did_no_tools_pass = true;
+        }
         let req = CompletionRequest {
             model_id: target_model.clone(),
             system_prompt: sys_prompt.clone(),
             messages: history.clone(),
-            tools: if step == MAX_SUBAGENT_STEPS - 1 || subagent_specs.is_empty() {
-                Vec::new()
-            } else {
+            tools: if expose_tools {
                 subagent_specs.clone()
+            } else {
+                Vec::new()
             },
             enable_thinking: false,
-            max_tokens: 2048,
+            max_tokens: 4096,
             temperature: 0.2,
         };
 
         let resp = complete(ctx.gate, ctx.store, ctx.server_mgr, ctx.local_models, req).await?;
         if !resp.actual_model_id.trim().is_empty() {
             actual_model = resp.actual_model_id.clone();
+        }
+        if let Some(ref th) = resp.thinking {
+            if !th.trim().is_empty() {
+                last_thinking = th.trim().to_string();
+            }
         }
         if resp.tool_calls.is_empty() || step == MAX_SUBAGENT_STEPS - 1 {
             final_summary = resp.content;
@@ -471,7 +485,12 @@ pub async fn run_research_subagent(
         });
 
         for tc in resp.tool_calls {
-            let res = execute_tool(workspace_root, ctx.gate, &brave_key, &tc.name, &tc.arguments).await;
+            let res =
+                execute_tool(workspace_root, ctx.gate, &brave_key, &tc.name, &tc.arguments).await;
+            let trimmed_out = res.output.trim();
+            if !trimmed_out.is_empty() {
+                tool_findings.push(format!("[{}] {}", tc.name, trimmed_out));
+            }
             history.push(ProviderMessage {
                 role: "tool".into(),
                 content: res.output,
@@ -483,8 +502,48 @@ pub async fn run_research_subagent(
         }
     }
 
+    if final_summary.trim().is_empty() && !tool_findings.is_empty() && !did_no_tools_pass {
+        history.push(ProviderMessage {
+            role: "user".into(),
+            content: "Synthesize your verified findings concisely based strictly on the tool outputs above.".into(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            images: Vec::new(),
+        });
+        let synth_req = CompletionRequest {
+            model_id: actual_model.clone(),
+            system_prompt: sys_prompt.clone(),
+            messages: history,
+            tools: Vec::new(),
+            enable_thinking: false,
+            max_tokens: 4096,
+            temperature: 0.2,
+        };
+        if let Ok(synth_resp) =
+            complete(ctx.gate, ctx.store, ctx.server_mgr, ctx.local_models, synth_req).await
+        {
+            if !synth_resp.actual_model_id.trim().is_empty() {
+                actual_model = synth_resp.actual_model_id.clone();
+            }
+            if !synth_resp.content.trim().is_empty() {
+                final_summary = synth_resp.content;
+            } else if let Some(ref th) = synth_resp.thinking {
+                if !th.trim().is_empty() {
+                    last_thinking = th.trim().to_string();
+                }
+            }
+        }
+    }
+
     if final_summary.trim().is_empty() {
-        final_summary = "Subagent completed inspection with no additional text.".into();
+        if !last_thinking.trim().is_empty() {
+            final_summary = last_thinking;
+        } else if !tool_findings.is_empty() {
+            final_summary = tool_findings.join("\n\n---\n\n");
+        } else {
+            final_summary = "Subagent completed inspection with no additional text.".into();
+        }
     }
 
     Ok((

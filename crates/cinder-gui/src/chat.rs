@@ -2561,6 +2561,22 @@ pub(crate) fn format_antigravity_tool_step(
                 is_error,
             }
         }
+        "fetch_url" => {
+            let url = json_arg_str(&args, &["url", "query", "href"]).unwrap_or("URL");
+            FormattedToolStep {
+                verb: if is_error {
+                    "Fetch failed"
+                } else {
+                    "Fetched URL"
+                },
+                badge_label: Some("WEB"),
+                badge_color: p.accent,
+                subject: url.to_string(),
+                suffix: String::new(),
+                rel_path_to_open: None,
+                is_error,
+            }
+        }
         "switch_mode" => {
             let target = json_arg_str(&args, &["target_mode"]).unwrap_or("next");
             let reason = json_arg_str(&args, &["reason"]).unwrap_or("");

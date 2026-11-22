@@ -416,27 +416,6 @@ impl BackendHandle {
         self.send(BackendEvent::FullSnapshot(Box::new(snap)));
     }
 
-    async fn ensure_hybrid_for_cloud(&self) -> bool {
-        let was_local = self.gate.mode() == PrivacyMode::StrictLocal;
-        if was_local {
-            self.gate.set_mode(PrivacyMode::Hybrid);
-        }
-        let mut store_changed = false;
-        let _ = self
-            .store
-            .update(|s| {
-                if s.settings.privacy_mode == PrivacyMode::StrictLocal {
-                    s.settings.privacy_mode = PrivacyMode::Hybrid;
-                    store_changed = true;
-                }
-            })
-            .await;
-        if was_local || store_changed {
-            self.emit_snapshot(false).await;
-        }
-        was_local
-    }
-
     pub fn refresh_state(self: &Arc<Self>, probe_live_server: bool) {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
@@ -1384,13 +1363,13 @@ impl BackendHandle {
     // ---- Plugins, Dependencies & Antigravity Sync ----
 
     pub fn install_plugin(self: &Arc<Self>, plugin_id: String) {
-        self.install_plugin_with_auto_hybrid(plugin_id, true);
+        self.install_plugin_with_auto_hybrid(plugin_id, false);
     }
 
     pub fn install_plugin_with_auto_hybrid(
         self: &Arc<Self>,
         plugin_id: String,
-        auto_hybrid: bool,
+        _auto_hybrid: bool,
     ) {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
@@ -1400,18 +1379,14 @@ impl BackendHandle {
                 return;
             };
             if item.entry.kind != "skill_pack" && h.gate.mode() == PrivacyMode::StrictLocal {
-                if auto_hybrid {
-                    let _ = h.ensure_hybrid_for_cloud().await;
-                } else {
-                    h.toast(
-                        format!(
-                            "Strict Local Mode blocked outbound install of '{}'. Switch to Hybrid Mode first.",
-                            item.entry.name
-                        ),
-                        true,
-                    );
-                    return;
-                }
+                h.toast(
+                    format!(
+                        "Strict Local Mode blocked outbound install of '{}'. Enable Hybrid Mode in the bottom-left System & Forge Telemetry popover first.",
+                        item.entry.name
+                    ),
+                    true,
+                );
+                return;
             }
             let job = h.install_jobs.start_job("plugin", &plugin_id).await;
             let job_id = job.id.clone();
@@ -1484,14 +1459,14 @@ impl BackendHandle {
     }
 
     pub fn install_dependency(self: &Arc<Self>, manager: String, package: String) {
-        self.install_dependency_with_auto_hybrid(manager, package, true);
+        self.install_dependency_with_auto_hybrid(manager, package, false);
     }
 
     pub fn install_dependency_with_auto_hybrid(
         self: &Arc<Self>,
         manager: String,
         package: String,
-        auto_hybrid: bool,
+        _auto_hybrid: bool,
     ) {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
@@ -1503,17 +1478,13 @@ impl BackendHandle {
                 return;
             }
             if h.gate.mode() == PrivacyMode::StrictLocal {
-                if auto_hybrid {
-                    let _ = h.ensure_hybrid_for_cloud().await;
-                } else {
-                    h.toast(
-                        format!(
-                            "Strict Local Mode blocked installing '{package}'. Switch to Hybrid Mode first."
-                        ),
-                        true,
-                    );
-                    return;
-                }
+                h.toast(
+                    format!(
+                        "Strict Local Mode blocked installing '{package}'. Enable Hybrid Mode in the bottom-left System & Forge Telemetry popover first."
+                    ),
+                    true,
+                );
+                return;
             }
             let ws = h.store.snapshot().await.settings.active_workspace_path;
             let job = h
@@ -1561,7 +1532,7 @@ impl BackendHandle {
         self: &Arc<Self>,
         manager: String,
         package: String,
-        auto_hybrid: bool,
+        _auto_hybrid: bool,
     ) {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
@@ -1573,18 +1544,14 @@ impl BackendHandle {
                 }
             };
             if h.gate.mode() == PrivacyMode::StrictLocal {
-                if auto_hybrid {
-                    let _ = h.ensure_hybrid_for_cloud().await;
-                } else {
-                    h.toast(
-                        format!(
-                            "Strict Local Mode blocked installing '{}'. Switch to Hybrid Mode first.",
-                            entry.name
-                        ),
-                        true,
-                    );
-                    return;
-                }
+                h.toast(
+                    format!(
+                        "Strict Local Mode blocked installing '{}'. Enable Hybrid Mode in the bottom-left System & Forge Telemetry popover first.",
+                        entry.name
+                    ),
+                    true,
+                );
+                return;
             }
             let ws = h.store.snapshot().await.settings.active_workspace_path;
             let job = h
@@ -1860,7 +1827,11 @@ impl BackendHandle {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
             if h.gate.mode() == PrivacyMode::StrictLocal {
-                h.ensure_hybrid_for_cloud().await;
+                h.toast(
+                    "Strict Local Mode blocked engine download. Enable Hybrid Mode in the bottom-left System & Forge Telemetry popover first.",
+                    true,
+                );
+                return;
             }
             h.toast(format!("Installing llama-server ({backend})..."), false);
             match h
@@ -1906,7 +1877,11 @@ impl BackendHandle {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
             if h.gate.mode() == PrivacyMode::StrictLocal {
-                h.ensure_hybrid_for_cloud().await;
+                h.toast(
+                    "Strict Local Mode blocked Hugging Face network access. Enable Hybrid Mode in the bottom-left System & Forge Telemetry popover first.",
+                    true,
+                );
+                return;
             }
             let tok = h.store.snapshot().await.settings.api_keys.huggingface_token;
             match search_hf_gguf(&h.gate, &query, &tok).await {
@@ -1920,7 +1895,11 @@ impl BackendHandle {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
             if h.gate.mode() == PrivacyMode::StrictLocal {
-                h.ensure_hybrid_for_cloud().await;
+                h.toast(
+                    "Strict Local Mode blocked Hugging Face network access. Enable Hybrid Mode in the bottom-left System & Forge Telemetry popover first.",
+                    true,
+                );
+                return;
             }
             let snap = h.store.snapshot().await;
             let hw = h.hardware_snapshot(false).await;
@@ -1949,7 +1928,11 @@ impl BackendHandle {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
             if h.gate.mode() == PrivacyMode::StrictLocal {
-                h.ensure_hybrid_for_cloud().await;
+                h.toast(
+                    "Strict Local Mode blocked Hugging Face network access. Enable Hybrid Mode in the bottom-left System & Forge Telemetry popover first.",
+                    true,
+                );
+                return;
             }
             let snap = h.store.snapshot().await;
             match h
@@ -1986,7 +1969,11 @@ impl BackendHandle {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
             if h.gate.mode() == PrivacyMode::StrictLocal {
-                h.ensure_hybrid_for_cloud().await;
+                h.toast(
+                    "Strict Local Mode blocked Hugging Face network access. Enable Hybrid Mode in the bottom-left System & Forge Telemetry popover first.",
+                    true,
+                );
+                return;
             }
             let tok = h.store.snapshot().await.settings.api_keys.huggingface_token;
             if let Err(e) = h
@@ -2074,22 +2061,20 @@ impl BackendHandle {
                 })
                 .await;
 
-            let updated_keys = h.store.snapshot().await.settings.api_keys;
-            let any_cloud_key = !updated_keys.gemini_api_key.trim().is_empty()
-                || !updated_keys.anthropic_api_key.trim().is_empty()
-                || !updated_keys.openrouter_api_key.trim().is_empty()
-                || !updated_keys.openai_compat_base_url.trim().is_empty();
-            if verify_live || any_cloud_key {
-                h.ensure_hybrid_for_cloud().await;
-            }
-
             if verify_live {
-                match verify_and_discover_provider_models(&h.gate, &h.store).await {
-                    Ok(statuses) => {
-                        h.send(BackendEvent::ProviderVerifyResults(statuses));
-                        h.toast("Live-probed and updated reachable models.", false);
+                if h.gate.mode() == PrivacyMode::StrictLocal {
+                    h.toast(
+                        "API keys saved locally. Enable Hybrid Mode in the bottom-left System & Forge Telemetry popover to verify online.",
+                        true,
+                    );
+                } else {
+                    match verify_and_discover_provider_models(&h.gate, &h.store).await {
+                        Ok(statuses) => {
+                            h.send(BackendEvent::ProviderVerifyResults(statuses));
+                            h.toast("Live-probed and updated reachable models.", false);
+                        }
+                        Err(e) => h.toast(e.to_string(), true),
                     }
-                    Err(e) => h.toast(e.to_string(), true),
                 }
             } else {
                 h.toast("API keys updated locally.", false);
@@ -2101,7 +2086,13 @@ impl BackendHandle {
     pub fn sync_google(self: &Arc<Self>) {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
-            h.ensure_hybrid_for_cloud().await;
+            if h.gate.mode() == PrivacyMode::StrictLocal {
+                h.toast(
+                    "Strict Local Mode blocked Google model sync. Enable Hybrid Mode in the bottom-left System & Forge Telemetry popover first.",
+                    true,
+                );
+                return;
+            }
             let key = h.store.snapshot().await.settings.api_keys.gemini_api_key;
             match sync_google_models(&h.gate, &key).await {
                 Ok(discovered) => {
@@ -2258,11 +2249,6 @@ impl BackendHandle {
                 })
                 .await
                 .unwrap_or_default();
-            if now_model != prev && !now_model.starts_with("local::") {
-                if h.ensure_hybrid_for_cloud().await {
-                    h.toast("Switched to Hybrid Mode for cloud model.", false);
-                }
-            }
             if prev.starts_with("local::") && !now_model.starts_with("local::") {
                 let _ = h.server_mgr.stop_all_local_models(&h.gate).await;
             }

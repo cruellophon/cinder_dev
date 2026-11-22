@@ -11,12 +11,6 @@ use egui::{Color32, CornerRadius, Stroke};
 use harness_net::{AuditOutcome, PrivacyMode};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NetPosture {
-    Local,
-    Hybrid,
-}
-
 pub fn render_settings_rail(ui: &mut egui::Ui, state: &mut GuiState, p: &CinderPalette) {
     // Exact 40px aligned pane header matching CentralPanel
     pane_header(ui, p, |ui| {
@@ -1143,33 +1137,20 @@ fn render_agent_section(
         "Network Posture & Tool Approvals",
         "Control outbound sockets and workspace confirmation prompts.",
         |ui| {
-            let cur_net = if snap.settings.privacy_mode == PrivacyMode::Hybrid {
-                NetPosture::Hybrid
-            } else {
-                NetPosture::Local
-            };
+            let is_hybrid = snap.settings.privacy_mode == PrivacyMode::Hybrid;
             setting_row_item(
                 ui,
                 p,
                 "Network Mode",
-                "Strict Local blocks all non-loopback sockets; Hybrid enables cloud APIs and downloads.",
+                "Read-only status. Switch between Strict Local and Hybrid exclusively via the bottom-left System & Forge Telemetry popover.",
                 true,
                 |ui| {
-                    if let Some(next_net) = segmented_control(
+                    badge(
                         ui,
-                        p,
-                        "settings_net_mode_seg",
-                        cur_net,
-                        &[
-                            (NetPosture::Local, "Strict Local"),
-                            (NetPosture::Hybrid, "Hybrid"),
-                        ],
-                    ) {
-                        backend.set_privacy(match next_net {
-                            NetPosture::Local => PrivacyMode::StrictLocal,
-                            NetPosture::Hybrid => PrivacyMode::Hybrid,
-                        });
-                    }
+                        if is_hybrid { "Hybrid" } else { "Strict Local" },
+                        if is_hybrid { p.amber } else { p.green },
+                        p.bg_card,
+                    );
                 },
             );
 

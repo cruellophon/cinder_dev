@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
-use harness_net::{NetworkGate, PrivacyMode};
+use harness_net::NetworkGate;
 use harness_store::{probe_storage_drives, DriveInfo};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -1909,8 +1909,6 @@ impl ServerManager {
         gpu_layers: i32,
         expose_local_api: bool,
     ) -> anyhow::Result<ServerStatus> {
-        // Guarantee zero calling home whenever serving local models.
-        gate.set_mode(PrivacyMode::StrictLocal);
         self.stop_server().await?;
 
         let bin = self.llama_server_binary();
@@ -2849,6 +2847,38 @@ Graphics/Displays:
             DownloadStatus::Completed
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn start_local_model_preserves_hybrid_privacy_mode() {
+        use harness_net::PrivacyMode;
+
+        let dir = std::env::temp_dir().join(format!(
+            "cinder_models_privacy_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = ServerManager::new(dir.clone());
+        let gate = NetworkGate::new(PrivacyMode::Hybrid).unwrap();
+        let model = LocalModelEntry {
+            id: "local::nonexistent-privacy-check".into(),
+            name: "Nonexistent Check".into(),
+            source: LocalModelSource::VaultGguf,
+            gguf_path: dir.join("missing.gguf").to_string_lossy().to_string(),
+            ollama_tag: None,
+            mmproj_path: None,
+            size_bytes: 0,
+            quant: "Q4_K_M".into(),
+            is_embedding: false,
+            is_valid_gguf: false,
+            vram_fit: assess_vram_fit(0, 4096, 0),
+        };
+
+        let _ = mgr
+            .start_local_model(&gate, &model, 18099, 4096, 0, false)
+            .await;
+        assert_eq!(gate.mode(), PrivacyMode::Hybrid);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

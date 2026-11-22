@@ -20,7 +20,7 @@ pub fn render_plugins_body(
     };
     let is_strict_local = snap.settings.privacy_mode == PrivacyMode::StrictLocal;
 
-    // 0. Strict Local Network Guard Notice (1-click switch to Hybrid Mode)
+    // 0. Strict Local Network Guard Notice (controlled exclusively from Telemetry popover)
     if is_strict_local {
         p.card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -28,16 +28,11 @@ pub fn render_plugins_body(
                 badge(ui, "Strict Local", p.green, p.bg_card);
                 ui.label(
                     egui::RichText::new(
-                        "Outbound PyPI, npm, crates.io & runtime downloads are blocked until Hybrid Mode is enabled (offline SKILL.md packs still install locally).",
+                        "Outbound PyPI, npm, crates.io & runtime downloads are blocked in Strict Local Mode. Enable Hybrid Mode via the bottom-left System & Forge Telemetry popover → Allow Hybrid (offline SKILL.md packs still install locally).",
                     )
                     .small()
                     .color(p.text),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if primary_button(ui, p, "Switch to Hybrid Mode").clicked() {
-                        backend.set_privacy(PrivacyMode::Hybrid);
-                    }
-                });
             });
         });
         ui.add_space(12.0);
@@ -179,15 +174,16 @@ pub fn render_plugins_body(
                                                 ui.spinner();
                                             } else if !tc.installed {
                                                 if let Some(ref pid) = tc.installable_plugin_id {
-                                                    let btn_lbl = if is_strict_local {
-                                                        "Hybrid + Install Node.js"
-                                                    } else {
-                                                        "Install Portable Node.js"
-                                                    };
-                                                    if primary_button(ui, p, btn_lbl).clicked() {
+                                                    if primary_button(
+                                                        ui,
+                                                        p,
+                                                        "Install Portable Node.js",
+                                                    )
+                                                    .clicked()
+                                                    {
                                                         backend.install_plugin_with_auto_hybrid(
                                                             pid.clone(),
-                                                            is_strict_local,
+                                                            false,
                                                         );
                                                     }
                                                 }
@@ -312,18 +308,8 @@ pub fn render_plugins_body(
                                     }
                                 }
                             } else {
-                                let needs_net_for_install =
-                                    is_strict_local && e.kind != "skill_pack";
-                                let lbl = if needs_net_for_install {
-                                    "Hybrid + Install"
-                                } else {
-                                    "Install (1-Click)"
-                                };
-                                if primary_button(ui, p, lbl).clicked() {
-                                    backend.install_plugin_with_auto_hybrid(
-                                        e.id.clone(),
-                                        needs_net_for_install,
-                                    );
+                                if primary_button(ui, p, "Install (1-Click)").clicked() {
+                                    backend.install_plugin_with_auto_hybrid(e.id.clone(), false);
                                 }
                             }
                         });
@@ -455,12 +441,7 @@ pub fn render_plugins_body(
                         enter_submit = true;
                     }
                 });
-                let custom_lbl = if is_strict_local {
-                    "Hybrid + Stage & Install"
-                } else {
-                    "+ Stage & Install"
-                };
-                if (enter_submit || primary_button(ui, p, custom_lbl).clicked())
+                if (enter_submit || primary_button(ui, p, "+ Stage & Install").clicked())
                     && !state.custom_dep_input.trim().is_empty()
                 {
                     let pkg = state.custom_dep_input.trim().to_string();
@@ -468,7 +449,7 @@ pub fn render_plugins_body(
                     backend.install_custom_dependency_with_auto_hybrid(
                         cur_mgr.into(),
                         pkg,
-                        is_strict_local,
+                        false,
                     );
                 }
             });
@@ -567,31 +548,19 @@ pub fn render_plugins_body(
                                 if danger_button(ui, p, "Remove").clicked() {
                                     backend.uninstall_dependency(d.manager.clone(), d.name.clone());
                                 }
-                                let upd_lbl = if is_strict_local {
-                                    "Hybrid + Update"
-                                } else {
-                                    "Update"
-                                };
-                                if secondary_button(ui, p, upd_lbl).clicked() {
+                                if secondary_button(ui, p, "Update").clicked() {
                                     backend.install_dependency_with_auto_hybrid(
                                         d.manager.clone(),
                                         d.name.clone(),
-                                        is_strict_local,
+                                        false,
                                     );
                                 }
-                            } else {
-                                let inst_lbl = if is_strict_local {
-                                    "Hybrid + Install"
-                                } else {
-                                    "+ Install"
-                                };
-                                if primary_button(ui, p, inst_lbl).clicked() {
-                                    backend.install_dependency_with_auto_hybrid(
-                                        d.manager.clone(),
-                                        d.name.clone(),
-                                        is_strict_local,
-                                    );
-                                }
+                            } else if primary_button(ui, p, "+ Install").clicked() {
+                                backend.install_dependency_with_auto_hybrid(
+                                    d.manager.clone(),
+                                    d.name.clone(),
+                                    false,
+                                );
                             }
                         });
                     });

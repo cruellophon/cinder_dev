@@ -7,7 +7,6 @@ use crate::theme::{
     CinderPalette,
 };
 use egui::{CornerRadius, Frame, Margin, Stroke};
-use harness_net::PrivacyMode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -159,7 +158,6 @@ fn render_command_palette(
                 ("Action", "Open Project Folder..."),
                 ("Action", "New Conversation"),
                 ("Action", "New One-Off Conversation"),
-                ("Action", "Toggle Privacy Mode (Strict Local / Hybrid)"),
                 ("Action", "Quench Local Models (Free VRAM)"),
                 ("Action", "Sync Antigravity MCP & Skills (~/.gemini)"),
                 ("Action", "Compact Chat Context (/compact)"),
@@ -282,14 +280,6 @@ fn render_command_palette(
                         "New One-Off Conversation" => {
                             backend.create_standalone_session(None);
                             state.switch_main_view(MainView::Chat, true);
-                        }
-                        "Toggle Privacy Mode (Strict Local / Hybrid)" => {
-                            let next = if snap.settings.privacy_mode == PrivacyMode::Hybrid {
-                                PrivacyMode::StrictLocal
-                            } else {
-                                PrivacyMode::Hybrid
-                            };
-                            backend.set_privacy(next);
                         }
                         "Quench Local Models (Free VRAM)" => backend.stop_all_local_models(),
                         "Sync Antigravity MCP & Skills (~/.gemini)" => backend.sync_antigravity(),

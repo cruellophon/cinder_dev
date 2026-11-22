@@ -123,13 +123,27 @@ fn delegate_research_spec() -> ToolSpec {
 fn web_search_spec() -> ToolSpec {
     ToolSpec {
         name: "web_search".into(),
-        description: "Search the live web and Wikipedia for verifiable articles and URLs (only available in Hybrid Mode).".into(),
+        description: "Search the live web and Wikipedia for verifiable articles and URLs (only available in Hybrid Mode; for direct URLs, prefer `fetch_url`).".into(),
         parameters_schema: json!({
             "type": "object",
             "properties": {
                 "query": { "type": "string" }
             },
             "required": ["query"]
+        }),
+    }
+}
+
+pub fn fetch_url_spec() -> ToolSpec {
+    ToolSpec {
+        name: "fetch_url".into(),
+        description: "Fetch and extract readable text/Markdown from a direct public http:// or https:// webpage or GitHub URL (such as a release page, repository, or documentation link). Only available in Hybrid Mode.".into(),
+        parameters_schema: json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "Direct public http:// or https:// URL to read." }
+            },
+            "required": ["url"]
         }),
     }
 }
@@ -143,6 +157,7 @@ pub fn tool_specs(mode: AgentMode, allow_web: bool) -> Vec<ToolSpec> {
         if allow_web {
             chat_specs.push(delegate_research_spec());
             chat_specs.push(web_search_spec());
+            chat_specs.push(fetch_url_spec());
         }
         return chat_specs;
     }
@@ -345,6 +360,7 @@ pub fn tool_specs(mode: AgentMode, allow_web: bool) -> Vec<ToolSpec> {
 
     if allow_web {
         specs.push(web_search_spec());
+        specs.push(fetch_url_spec());
     }
 
     specs
@@ -362,7 +378,7 @@ pub fn filter_tools_by_modules(specs: Vec<ToolSpec>, enabled_modules: &[String])
             "run_command" | "verify_workspace" => has("shell"),
             "search_knowledge" => has("rag"),
             "delegate_research" | "delegate_vision" => has("subagents"),
-            "web_search" => has("web"),
+            "web_search" | "fetch_url" => has("web"),
             _ => true,
         })
         .collect()
@@ -608,6 +624,7 @@ pub async fn execute_tool(
         },
         "run_command" | "verify_workspace" => run_shell_command(workspace_root, args).await,
         "web_search" => run_web_search(gate, brave_key, args).await,
+        "fetch_url" => run_fetch_url(gate, args).await,
         other => Err(anyhow::anyhow!("Unknown tool '{other}'")),
     };
 
@@ -1410,6 +1427,390 @@ fn format_web_search_hits(provider: &str, hits: &[(String, String, String)]) -> 
     )
 }
 
+fn validate_public_fetch_url(raw_url: &str) -> anyhow::Result<url::Url> {
+    let cleaned = raw_url
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`' || c == '<' || c == '>');
+    let parsed = url::Url::parse(cleaned)
+        .map_err(|e| anyhow::anyhow!("Invalid URL '{raw_url}': {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!(
+            "Unsupported URL scheme '{}' (only http:// and https:// are allowed).",
+            parsed.scheme()
+        );
+    }
+
+    match parsed.host() {
+        None => anyhow::bail!("URL has no host: '{raw_url}'"),
+        Some(url::Host::Ipv4(ipv4)) => {
+            if ipv4.is_loopback()
+                || ipv4.is_private()
+                || ipv4.is_link_local()
+                || ipv4.is_unspecified()
+                || ipv4.is_multicast()
+            {
+                anyhow::bail!("Private, loopback, or link-local IPv4 targets are blocked: '{raw_url}'");
+            }
+        }
+        Some(url::Host::Ipv6(ipv6)) => {
+            let segs = ipv6.segments();
+            let is_unique_local = (segs[0] & 0xfe00) == 0xfc00;
+            let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
+            let mapped_blocked = ipv6.to_ipv4_mapped().is_some_and(|v4| {
+                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            });
+            if ipv6.is_loopback()
+                || ipv6.is_unspecified()
+                || ipv6.is_multicast()
+                || is_unique_local
+                || is_link_local
+                || mapped_blocked
+            {
+                anyhow::bail!("Private, loopback, or link-local IPv6 targets are blocked: '{raw_url}'");
+            }
+        }
+        Some(url::Host::Domain(domain)) => {
+            let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            if d == "localhost"
+                || d.ends_with(".localhost")
+                || d.ends_with(".local")
+                || d.ends_with(".internal")
+            {
+                anyhow::bail!("Local or internal domain targets are blocked: '{raw_url}'");
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn github_api_fast_path(url: &url::Url) -> Option<(&'static str, String)> {
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if host != "github.com" && host != "www.github.com" {
+        return None;
+    }
+    let segs: Vec<&str> = url
+        .path_segments()?
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    match segs.as_slice() {
+        [owner, repo, "releases", "tag", tag] => Some((
+            "github_release",
+            format!("https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"),
+        )),
+        [owner, repo, "releases"] | [owner, repo, "releases", "latest"] => Some((
+            "github_releases_list",
+            format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=5"),
+        )),
+        [owner, repo] => Some((
+            "github_readme",
+            format!("https://api.github.com/repos/{owner}/{repo}/readme"),
+        )),
+        _ => None,
+    }
+}
+
+fn decode_entities_preserving_lines(raw: &str) -> String {
+    raw.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#039;", "'")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+}
+
+fn html_to_readable_text(html: &str) -> (Option<String>, String) {
+    let title_re = RegexBuilder::new(r"(?is)<title[^>]*>(.*?)</title>")
+        .build()
+        .expect("valid title regex");
+    let title = title_re
+        .captures(html)
+        .map(|c| decode_basic_html_entities(&c[1]))
+        .filter(|s| !s.is_empty());
+
+    let strip_blocks_re = RegexBuilder::new(
+        r"(?is)<(script|style|noscript|svg)[^>]*>.*?</(script|style|noscript|svg)>",
+    )
+    .build()
+    .expect("valid strip blocks regex");
+    let no_blocks = strip_blocks_re.replace_all(html, " ");
+
+    let line_break_re = RegexBuilder::new(
+        r"(?is)</?(?:p|div|section|article|header|footer|aside|main|li|tr|h[1-6]|blockquote|pre)[^>]*>|<br\s*/?>|<hr\s*/?>",
+    )
+    .build()
+    .expect("valid block tag regex");
+    let with_breaks = line_break_re.replace_all(&no_blocks, "\n");
+
+    let tag_re = Regex::new(r"<[^>]+>").expect("valid tag regex");
+    let no_tags = tag_re.replace_all(&with_breaks, " ");
+    let decoded = decode_entities_preserving_lines(&no_tags);
+
+    let mut clean_lines: Vec<String> = Vec::new();
+    let mut prev_empty = false;
+    for line in decoded.lines() {
+        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            if !prev_empty && !clean_lines.is_empty() {
+                clean_lines.push(String::new());
+            }
+            prev_empty = true;
+        } else {
+            clean_lines.push(collapsed);
+            prev_empty = false;
+        }
+    }
+    while clean_lines.last().is_some_and(|l| l.is_empty()) {
+        clean_lines.pop();
+    }
+
+    (title, clean_lines.join("\n"))
+}
+
+fn truncate_chars_boundary(s: &str, max_chars: usize) -> String {
+    let total_chars = s.chars().count();
+    if total_chars <= max_chars {
+        return s.to_string();
+    }
+    let byte_end = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    format!("{}\n\n... [content truncated]", &s[..byte_end])
+}
+
+async fn read_response_bytes_capped(
+    resp: reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk_res) = stream.next().await {
+        let bytes = chunk_res?;
+        let remaining = max_bytes.saturating_sub(buf.len());
+        if remaining == 0 {
+            break;
+        }
+        if bytes.len() <= remaining {
+            buf.extend_from_slice(&bytes);
+        } else {
+            buf.extend_from_slice(&bytes[..remaining]);
+            break;
+        }
+    }
+    Ok(buf)
+}
+
+fn format_github_release_json(rel: &Value) -> String {
+    let name = rel["name"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| rel["tag_name"].as_str())
+        .unwrap_or("Release");
+    let tag = rel["tag_name"].as_str().unwrap_or("");
+    let html_url = rel["html_url"].as_str().unwrap_or("");
+    let published = rel["published_at"].as_str().unwrap_or("");
+    let body = rel["body"].as_str().unwrap_or("").trim();
+
+    let mut out = if tag.is_empty() || name == tag {
+        format!("# {name}\n")
+    } else {
+        format!("# {name} ({tag})\n")
+    };
+    if !html_url.is_empty() {
+        out.push_str(&format!("URL: {html_url}\n"));
+    }
+    if !published.is_empty() {
+        out.push_str(&format!("Published: {published}\n"));
+    }
+    if !body.is_empty() {
+        out.push('\n');
+        out.push_str(body);
+        out.push('\n');
+    }
+    if let Some(assets) = rel["assets"].as_array() {
+        if !assets.is_empty() {
+            out.push_str("\nAssets:\n");
+            for a in assets {
+                let aname = a["name"].as_str().unwrap_or("asset");
+                let size = a["size"].as_u64().unwrap_or(0);
+                out.push_str(&format!("- {aname} ({size} bytes)\n"));
+            }
+        }
+    }
+    out
+}
+
+async fn try_fetch_github_api(
+    gate: &NetworkGate,
+    kind: &str,
+    api_url: &str,
+    source_url: &str,
+) -> Option<String> {
+    let accept = if kind == "github_readme" {
+        "application/vnd.github.raw+json"
+    } else {
+        "application/vnd.github+json"
+    };
+    let req = gate
+        .request(Method::GET, api_url, "fetch_url_github_api")
+        .ok()?
+        .header("User-Agent", "cinder-ide")
+        .header("Accept", accept);
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(15), req.send())
+        .await
+        .ok()?
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = read_response_bytes_capped(resp, 512 * 1024).await.ok()?;
+    let raw_text = String::from_utf8_lossy(&bytes).to_string();
+
+    if kind == "github_readme" {
+        return Some(format!(
+            "[Fetched GitHub README via API · {source_url}]\n\n{}",
+            truncate_chars_boundary(&raw_text, 12_000)
+        ));
+    }
+
+    let val: Value = serde_json::from_str(&raw_text).ok()?;
+    let formatted = if kind == "github_release" {
+        format_github_release_json(&val)
+    } else {
+        let arr = val.as_array()?;
+        if arr.is_empty() {
+            "No published releases found.".to_string()
+        } else {
+            arr.iter()
+                .take(5)
+                .map(format_github_release_json)
+                .collect::<Vec<_>>()
+                .join("\n---\n\n")
+        }
+    };
+
+    Some(format!(
+        "[Fetched GitHub Releases via API · {source_url}]\n\n{}",
+        truncate_chars_boundary(&formatted, 12_000)
+    ))
+}
+
+fn extract_direct_url_from_query(query: &str) -> Option<String> {
+    let trimmed = query
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`' || c == '<' || c == '>');
+    if !trimmed.contains(char::is_whitespace)
+        && (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+        && validate_public_fetch_url(trimmed).is_ok()
+    {
+        return Some(trimmed.to_string());
+    }
+
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    if tokens.is_empty() || tokens.len() > 5 {
+        return None;
+    }
+    let mut url_found: Option<String> = None;
+    for tok in tokens {
+        let clean_tok = tok.trim_matches(|c| {
+            c == '"' || c == '\'' || c == '`' || c == '<' || c == '>' || c == ',' || c == '.'
+        });
+        if (clean_tok.starts_with("http://") || clean_tok.starts_with("https://"))
+            && validate_public_fetch_url(clean_tok).is_ok()
+        {
+            if url_found.is_some() {
+                return None;
+            }
+            url_found = Some(clean_tok.to_string());
+        } else {
+            let lower = clean_tok.to_ascii_lowercase();
+            if !matches!(
+                lower.as_str(),
+                "go" | "to" | "open" | "read" | "fetch" | "check" | "visit" | "from" | "see"
+            ) {
+                return None;
+            }
+        }
+    }
+    url_found
+}
+
+async fn run_fetch_url(gate: &NetworkGate, args: &Value) -> anyhow::Result<ToolExecutionResult> {
+    if gate.mode() == PrivacyMode::StrictLocal {
+        anyhow::bail!(
+            "fetch_url is disabled in Strict Local Mode. Inform the user that they can enable Hybrid Mode in the bottom-left System & Forge Telemetry popover if they want web access; models cannot switch privacy mode."
+        );
+    }
+
+    let raw_url = arg_str(args, &["url", "query", "href"])
+        .ok_or_else(|| anyhow::anyhow!("Missing 'url' argument"))?;
+    let parsed = validate_public_fetch_url(raw_url)?;
+    let target_url = parsed.to_string();
+
+    if let Some((kind, api_url)) = github_api_fast_path(&parsed) {
+        if let Some(formatted) = try_fetch_github_api(gate, kind, &api_url, &target_url).await {
+            return Ok(ToolExecutionResult {
+                output: formatted,
+                diff: None,
+                file_path: None,
+                is_error: false,
+            });
+        }
+    }
+
+    let req = gate
+        .request(Method::GET, &target_url, "fetch_url")?
+        .header("User-Agent", "cinder-ide")
+        .header(
+            "Accept",
+            "text/html,text/plain,text/markdown,application/json;q=0.9",
+        );
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(15), req.send())
+        .await
+        .map_err(|_| anyhow::anyhow!("Fetching '{target_url}' timed out after 15s"))??;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("Fetching '{target_url}' returned HTTP {status}");
+    }
+
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let bytes = read_response_bytes_capped(resp, 512 * 1024).await?;
+    let raw_text = String::from_utf8_lossy(&bytes).to_string();
+
+    let (title_opt, body) = if content_type.contains("html")
+        || raw_text.trim_start().starts_with('<')
+    {
+        html_to_readable_text(&raw_text)
+    } else {
+        (None, raw_text)
+    };
+
+    let body_trimmed = truncate_chars_boundary(body.trim(), 12_000);
+    let mut out = format!("[Fetched URL: {target_url}]\n");
+    if let Some(title) = title_opt {
+        out.push_str(&format!("Title: {title}\n"));
+    }
+    out.push('\n');
+    out.push_str(&body_trimmed);
+
+    Ok(ToolExecutionResult {
+        output: out,
+        diff: None,
+        file_path: None,
+        is_error: false,
+    })
+}
+
 async fn run_web_search(
     gate: &NetworkGate,
     brave_key: &str,
@@ -1417,12 +1818,16 @@ async fn run_web_search(
 ) -> anyhow::Result<ToolExecutionResult> {
     if gate.mode() == PrivacyMode::StrictLocal {
         anyhow::bail!(
-            "web_search is disabled in Strict Local Mode. Inform the user that they can enable Hybrid Mode in the lower-left sidebar if they want web search; models cannot switch privacy mode."
+            "web_search is disabled in Strict Local Mode. Inform the user that they can enable Hybrid Mode in the bottom-left System & Forge Telemetry popover if they want web search; models cannot switch privacy mode."
         );
     }
     let query = args["query"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing 'query'"))?;
+
+    if let Some(direct_url) = extract_direct_url_from_query(query) {
+        return run_fetch_url(gate, &json!({ "url": direct_url })).await;
+    }
 
     if !brave_key.trim().is_empty() {
         let encoded: String = url::form_urlencoded::Serializer::new(String::new())
@@ -1836,7 +2241,116 @@ mod upload_tests {
 
         let on = tool_specs(AgentMode::Chat, true);
         assert!(on.iter().any(|t| t.name == "web_search"));
+        assert!(on.iter().any(|t| t.name == "fetch_url"));
         assert!(on.iter().any(|t| t.name == "delegate_research"));
+
+        let web_off = filter_tools_by_modules(on.clone(), &["fs_read".into()]);
+        assert!(!web_off.iter().any(|t| t.name == "fetch_url"));
+        let web_on = filter_tools_by_modules(on, &["web".into()]);
+        assert!(web_on.iter().any(|t| t.name == "fetch_url"));
+    }
+
+    #[tokio::test]
+    async fn fetch_url_is_blocked_in_strict_local() {
+        let gate = harness_net::NetworkGate::new(PrivacyMode::StrictLocal).unwrap();
+        let res = execute_tool(
+            Path::new(""),
+            &gate,
+            "",
+            "fetch_url",
+            &json!({ "url": "https://github.com/cruellophon/cinder_dev/releases/tag/v0.5.6-beta" }),
+        )
+        .await;
+        assert!(res.is_error);
+        assert!(
+            res.output.contains("models cannot switch privacy mode"),
+            "unexpected output: {}",
+            res.output
+        );
+    }
+
+    #[test]
+    fn validate_public_fetch_url_blocks_private_and_loopback_and_allows_public() {
+        for blocked in [
+            "http://127.0.0.1:8080/secret",
+            "http://localhost:11434/api/tags",
+            "http://192.168.1.1/admin",
+            "http://10.0.0.1/status",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]:8080/",
+            "http://[::ffff:127.0.0.1]/",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                validate_public_fetch_url(blocked).is_err(),
+                "expected SSRF block for {blocked}"
+            );
+        }
+
+        let ok = validate_public_fetch_url(
+            "https://github.com/cruellophon/cinder_dev/releases/tag/v0.5.6-beta",
+        )
+        .unwrap();
+        assert_eq!(ok.host_str(), Some("github.com"));
+    }
+
+    #[test]
+    fn github_api_fast_path_maps_release_and_repo_urls() {
+        let tag_u = url::Url::parse(
+            "https://github.com/cruellophon/cinder_dev/releases/tag/v0.5.6-beta",
+        )
+        .unwrap();
+        assert_eq!(
+            github_api_fast_path(&tag_u),
+            Some((
+                "github_release",
+                "https://api.github.com/repos/cruellophon/cinder_dev/releases/tags/v0.5.6-beta"
+                    .to_string()
+            ))
+        );
+
+        let list_u =
+            url::Url::parse("https://github.com/cruellophon/cinder_dev/releases").unwrap();
+        assert_eq!(
+            github_api_fast_path(&list_u),
+            Some((
+                "github_releases_list",
+                "https://api.github.com/repos/cruellophon/cinder_dev/releases?per_page=5"
+                    .to_string()
+            ))
+        );
+
+        let repo_u = url::Url::parse("https://github.com/cruellophon/cinder_dev").unwrap();
+        assert_eq!(
+            github_api_fast_path(&repo_u),
+            Some((
+                "github_readme",
+                "https://api.github.com/repos/cruellophon/cinder_dev/readme".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn html_to_readable_text_strips_scripts_styles_and_extracts_title() {
+        let html = r#"
+        <html>
+          <head>
+            <title>Cinder &amp; Release Notes</title>
+            <style>body { color: red; }</style>
+          </head>
+          <body>
+            <script>console.log("ignore");</script>
+            <h1>v0.5.6-beta</h1>
+            <p>Added macOS Intel &amp; Apple Silicon support.</p>
+          </body>
+        </html>
+        "#;
+        let (title, body) = html_to_readable_text(html);
+        assert_eq!(title.as_deref(), Some("Cinder & Release Notes"));
+        assert!(!body.contains("color: red"));
+        assert!(!body.contains("console.log"));
+        assert!(body.contains("v0.5.6-beta"));
+        assert!(body.contains("Added macOS Intel & Apple Silicon support."));
     }
 
     #[test]
