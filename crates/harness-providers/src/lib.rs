@@ -5,7 +5,7 @@ use harness_store::{
     is_viable_gemini_chat_model, sort_gemini_models_by_priority, BumboStore, ModelCatalogEntry,
     ModelQuotaLimit, ProviderKind,
 };
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, CONNECTION};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -128,7 +128,7 @@ async fn complete_single(
 
         let mut resp = match backend {
             ActiveServerBackend::LlamaServer => {
-                complete_openai_compat(
+                match complete_openai_compat(
                     gate,
                     &format!("{endpoint}/v1/chat/completions"),
                     token.as_deref(),
@@ -136,7 +136,47 @@ async fn complete_single(
                     effective_req,
                     "local_inference",
                 )
-                .await?
+                .await
+                {
+                    Ok(ok) => ok,
+                    Err(first_err) if is_local_transport_error(&first_err.to_string()) => {
+                        let st = server_mgr.server_status().await;
+                        if !st.running {
+                            server_mgr
+                                .start_local_model(
+                                    gate,
+                                    target_local,
+                                    settings.local_server_port,
+                                    settings.local_ctx_size,
+                                    settings.local_gpu_layers,
+                                    settings.expose_local_api,
+                                )
+                                .await?;
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                        let (next_backend, next_endpoint, next_token, next_model_name) =
+                            server_mgr
+                                .active_endpoint_and_token()
+                                .await
+                                .ok_or(first_err)?;
+                        if next_backend != ActiveServerBackend::LlamaServer {
+                            anyhow::bail!(
+                                "Local model backend changed unexpectedly during recovery."
+                            );
+                        }
+                        complete_openai_compat(
+                            gate,
+                            &format!("{next_endpoint}/v1/chat/completions"),
+                            next_token.as_deref(),
+                            &next_model_name,
+                            effective_req,
+                            "local_inference",
+                        )
+                        .await?
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             ActiveServerBackend::OllamaLoopback => {
                 complete_ollama_loopback(gate, store, &endpoint, &model_name, effective_req)
@@ -427,6 +467,16 @@ pub async fn complete(
     Ok(resp)
 }
 
+pub fn is_local_transport_error(err_str: &str) -> bool {
+    let lower = err_str.to_ascii_lowercase();
+    lower.contains("connection")
+        || lower.contains("error sending request")
+        || lower.contains("channel closed")
+        || lower.contains("eof")
+        || lower.contains("broken pipe")
+        || lower.contains("reset")
+}
+
 pub fn classify_provider_error(err_str: &str) -> (bool, bool, &'static str) {
     let lower = err_str.to_ascii_lowercase();
     if lower.contains("context length")
@@ -466,11 +516,7 @@ pub fn classify_provider_error(err_str: &str) -> (bool, bool, &'static str) {
     if lower.contains("timed out") || lower.contains("timeout") {
         return (true, false, "request timed out");
     }
-    if lower.contains("connection")
-        || lower.contains("error sending request")
-        || lower.contains("channel closed")
-        || lower.contains("eof")
-    {
+    if is_local_transport_error(err_str) {
         return (true, false, "connection dropped / reset");
     }
     if err_str.contains("HTTP 500")
@@ -988,6 +1034,9 @@ async fn complete_openai_compat_with_headers(
     }
 
     let mut http_req = gate.request(Method::POST, url, purpose)?.json(&body);
+    if purpose == "local_inference" {
+        http_req = http_req.header(CONNECTION, "close");
+    }
     if let Some(tok) = bearer_token {
         http_req = http_req.bearer_auth(tok);
     }
@@ -1129,7 +1178,11 @@ fn build_gemini_contents(messages: &[ProviderMessage]) -> Vec<Value> {
             if !m.content.trim().is_empty() {
                 parts.push(json!({ "text": m.content }));
             }
-            for tc in &m.tool_calls {
+            let turn_has_real_sig = m
+                .tool_calls
+                .iter()
+                .any(|tc| tc.thought_signature.as_deref().is_some_and(|s| !s.trim().is_empty()));
+            for (idx, tc) in m.tool_calls.iter().enumerate() {
                 let args = if tc.arguments.is_object() {
                     tc.arguments.clone()
                 } else {
@@ -1142,7 +1195,12 @@ fn build_gemini_contents(messages: &[ProviderMessage]) -> Vec<Value> {
                     }
                 });
                 if let Some(ref sig) = tc.thought_signature {
-                    part["thoughtSignature"] = Value::String(sig.clone());
+                    if !sig.trim().is_empty() {
+                        part["thoughtSignature"] = Value::String(sig.clone());
+                    }
+                } else if !turn_has_real_sig && idx == 0 {
+                    part["thoughtSignature"] =
+                        Value::String("skip_thought_signature_validator".into());
                 }
                 parts.push(part);
             }
@@ -2986,5 +3044,71 @@ mod tests {
         assert_eq!(ant_blocks[0]["type"], "tool_result");
         assert_eq!(ant_blocks[0]["tool_use_id"], "c1");
         assert_eq!(ant_blocks[1]["tool_use_id"], "c2");
+    }
+
+    #[test]
+    fn build_gemini_contents_injects_skip_thought_signature_validator_for_cross_provider_calls() {
+        let no_sig_msgs = vec![ProviderMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: vec![
+                ToolCallRequest {
+                    id: "l1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({ "path": "Cargo.toml" }),
+                    thought_signature: None,
+                },
+                ToolCallRequest {
+                    id: "l2".into(),
+                    name: "list_dir".into(),
+                    arguments: json!({ "path": "." }),
+                    thought_signature: None,
+                },
+            ],
+            images: Vec::new(),
+        }];
+        let gem_fallback = build_gemini_contents(&no_sig_msgs);
+        assert_eq!(
+            gem_fallback[0]["parts"][0]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        assert!(gem_fallback[0]["parts"][1].get("thoughtSignature").is_none());
+
+        let with_sig_msgs = vec![ProviderMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: vec![
+                ToolCallRequest {
+                    id: "g1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({ "path": "Cargo.toml" }),
+                    thought_signature: Some("sig_real".into()),
+                },
+                ToolCallRequest {
+                    id: "g2".into(),
+                    name: "list_dir".into(),
+                    arguments: json!({ "path": "." }),
+                    thought_signature: None,
+                },
+            ],
+            images: Vec::new(),
+        }];
+        let gem_real = build_gemini_contents(&with_sig_msgs);
+        assert_eq!(gem_real[0]["parts"][0]["thoughtSignature"], "sig_real");
+        assert!(gem_real[0]["parts"][1].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn local_transport_error_detector_matches_connection_resets_only() {
+        assert!(is_local_transport_error(
+            "error sending request for url (http://127.0.0.1:55997/v1/chat/completions)"
+        ));
+        assert!(is_local_transport_error("connection reset by peer"));
+        assert!(!is_local_transport_error("HTTP 400 Bad Request"));
+        assert!(!is_local_transport_error("context length exceeded"));
     }
 }
