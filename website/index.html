@@ -3,193 +3,235 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cinder | Native Rust Local Agentic IDE & Model Forge</title>
-    <link rel="icon" type="image/x-icon" href="assets/cinder.ico">
+    <title>Cinder | Autonomous AI Engineering Workspace</title>
     <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 </head>
-<body class="bg-main">
-    <!-- Top Navigation Bar -->
-    <nav class="top-nav">
-        <div class="nav-content">
-            <div class="nav-links">
-                <a href="#features">Features</a>
-                <a href="#architecture">Architecture</a>
-                <a href="#shortcuts">Shortcuts</a>
-                <a href="#download" class="nav-cta">Download</a>
+<body>
+    <nav>
+        <div class="nav-container">
+            <div class="logo">
+                <span class="logo-dot"></span>CINDER
             </div>
-            <div class="nav-brand">
-                <img src="assets/cinder.ico" alt="Cinder Logo" class="nav-logo">
-                <span class="brand-name">CINDER</span>
-                <span class="version-pill">v5.5</span>
+            <div class="nav-links">
+                <a href="#workbench">Workbench</a>
+                <a href="#pilot">Pilot & Engine</a>
+                <a href="#features">Capabilities</a>
+                <a href="https://github.com" target="_blank" class="btn-primary">GitHub</a>
             </div>
         </div>
     </nav>
 
-    <div class="container">
-        <!-- Hero Section -->
-        <header class="hero">
-            <div class="hero-glow"></div>
-            <div class="hero-content">
-                <img src="assets/cinder.ico" alt="Cinder Glowing Orb Logo" class="logo">
-                <div class="badge-row">
-                    <span class="badge accent-badge">100% Pure Rust</span>
-                    <span class="badge">Zero WebView / Edge</span>
-                    <span class="badge">Native GPU Accelerated</span>
-                </div>
-                <h1 class="hero-title">Forge Intelligence<br><span class="gradient-text">Locally & Autonomously</span></h1>
-                <p class="tagline">
-                    A local-first, blazing-fast desktop agentic IDE and GGUF model forge built with <code>eframe</code> and <code>egui</code>. Zero bloat, instant launch, and absolute data privacy.
-                </p>
-
-                <div class="hero-actions" id="download">
-                    <a href="https://github.com/cruellophon/cinder_dev/releases/latest" class="btn btn-primary">
-                        <svg class="btn-icon" viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-                        Download cinder.exe <span class="btn-sub">Single Standalone Binary</span>
-                    </a>
-                    <a href="https://github.com/cruellophon/cinder_dev" class="btn btn-secondary">
-                        View on GitHub
-                    </a>
-                </div>
-
-                <div class="quick-terminal-preview">
-                    <div class="terminal-bar">
-                        <span class="dot red"></span>
-                        <span class="dot amber"></span>
-                        <span class="dot green"></span>
-                        <span class="terminal-title">cinder — release/cinder.exe</span>
-                    </div>
-                    <pre><code class="terminal-code">
-<span class="prompt">$</span> cargo build --release --bin cinder
-<span class="output">   Compiling cinder-gui v5.5 (C:\Projects\Cinder)</span>
-<span class="success">    Finished</span> release [optimized] target in 2.41s
-<span class="prompt">$</span> .\release\cinder.exe --port 17770</code></pre>
-                </div>
-            </div>
-        </header>
-
-        <!-- Core Features Grid -->
-        <section id="features" class="section">
-            <div class="section-header">
-                <h2 class="section-title">Engineered for Absolute Performance</h2>
-                <p class="section-subtitle">Cinder bypasses web wrappers entirely to deliver an uncompromising desktop experience.</p>
-            </div>
-
-            <div class="features-grid">
-                <div class="card">
-                    <div class="card-icon gpu-icon">⚡</div>
-                    <h3 class="card-title">Native GPU Frontend</h3>
-                    <p class="card-desc">Powered by <code>eframe</code> and <code>egui</code> for buttery 60+ FPS rendering directly on your GPU. No Electron memory bloat, no WebView security sandboxing friction.</p>
-                </div>
-                <div class="card">
-                    <div class="card-icon agent-icon">🤖</div>
-                    <h3 class="card-title">Agentic Workspace Forge</h3>
-                    <p class="card-desc">Autonomous coding agents integrated directly into your workspace. Execute multi-file edits, run background checks, and forge local GGUF models seamlessly.</p>
-                </div>
-                <div class="card">
-                    <div class="card-icon binary-icon">📦</div>
-                    <h3 class="card-title">Single Standalone Executable</h3>
-                    <p class="card-desc">Ships as a single binary with icons, fonts, and assets embedded directly. No external DLLs, no complex installers or environment setups required.</p>
-                </div>
-                <div class="card">
-                    <div class="card-icon privacy-icon">🔒</div>
-                    <h3 class="card-title">100% Local-First Privacy</h3>
-                    <p class="card-desc">Your code, state, and model weights never leave your machine. Fully portable data directory with zero telemetry or cloud dependency.</p>
-                </div>
-                <div class="card">
-                    <div class="card-icon server-icon">🌐</div>
-                    <h3 class="card-title">Headless & GUI Modes</h3>
-                    <p class="card-desc">Run the gorgeous native GUI or launch with <code>--headless</code> to expose a lightning-fast local API server on <code>127.0.0.1:17770</code>.</p>
-                </div>
-                <div class="card">
-                    <div class="card-icon memory-icon">🧠</div>
-                    <h3 class="card-title">Intelligent Memory Store</h3>
-                    <p class="card-desc">Built-in knowledge graph memory, semantic chunking, and local vector indexing keeping your codebase fully indexed for instant context retrieval.</p>
-                </div>
-            </div>
-        </section>
-
-        <!-- Architecture / Crate Ecosystem Section -->
-        <section id="architecture" class="section">
-            <div class="section-header">
-                <h2 class="section-title">The Crate Ecosystem</h2>
-                <p class="section-subtitle">Modular Rust architecture built from the ground up for high-concurrency AI agent workflows.</p>
-            </div>
-
-            <div class="architecture-grid">
-                <div class="arch-card">
-                    <code class="arch-code">crates/cinder-gui</code>
-                    <p class="arch-desc">GPU-accelerated eframe/egui interface with split panels, markdown rendering, chat threads, and live process inspection.</p>
-                </div>
-                <div class="arch-card">
-                    <code class="arch-code">crates/harness-core</code>
-                    <p class="arch-desc">Core orchestration engine managing autonomous agent loops, tool dispatching, and safety guardrails.</p>
-                </div>
-                <div class="arch-card">
-                    <code class="arch-code">crates/harness-models</code>
-                    <p class="arch-desc">Local GGUF model loader, prompt template management, and context window optimization routines.</p>
-                </div>
-                <div class="arch-card">
-                    <code class="arch-code">crates/harness-tools</code>
-                    <p class="arch-desc">Secure sandboxed system tools for file editing, bash execution, regex searching, and test verification.</p>
-                </div>
-                <div class="arch-card">
-                    <code class="arch-code">crates/harness-net</code>
-                    <p class="arch-desc">Async HTTP server and client adapters enabling headless API mode and external provider integrations.</p>
-                </div>
-                <div class="arch-card">
-                    <code class="arch-code">crates/harness-store</code>
-                    <p class="arch-desc">High-performance local key-value store and knowledge graph state manager.</p>
-                </div>
-            </div>
-        </section>
-
-        <!-- Keyboard Shortcuts Section -->
-        <section id="shortcuts" class="section">
-            <div class="section-header">
-                <h2 class="section-title">Lightning Keyboard Workflow</h2>
-                <p class="section-subtitle">Designed for power users who never want to leave the keyboard.</p>
-            </div>
-
-            <div class="shortcuts-table">
-                <div class="shortcut-row">
-                    <span class="shortcut-desc">Open Agent Command Palette</span>
-                    <span class="kbd-group"><kbd>Ctrl</kbd> + <kbd>K</kbd></span>
-                </div>
-                <div class="shortcut-row">
-                    <span class="shortcut-desc">Toggle Chat / Code Split View</span>
-                    <span class="kbd-group"><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>C</kbd></span>
-                </div>
-                <div class="shortcut-row">
-                    <span class="shortcut-desc">Trigger Autonomous Forge Run</span>
-                    <span class="kbd-group"><kbd>Ctrl</kbd> + <kbd>Enter</kbd></span>
-                </div>
-                <div class="shortcut-row">
-                    <span class="shortcut-desc">Quick File Search & Index</span>
-                    <span class="kbd-group"><kbd>Ctrl</kbd> + <kbd>P</kbd></span>
-                </div>
-                <div class="shortcut-row">
-                    <span class="shortcut-desc">Clear Session & Reset Context</span>
-                    <span class="kbd-group"><kbd>Ctrl</kbd> + <kbd>L</kbd></span>
-                </div>
-            </div>
-        </section>
-
-        <!-- Footer Call to Action -->
-        <footer class="footer-cta" id="download">
-            <div class="footer-glow"></div>
-            <h2 class="footer-title">Ready to Forge Without Limits?</h2>
-            <p class="footer-subtitle">Experience the speed and absolute privacy of 100% native Rust intelligence.</p>
+    <header class="hero">
+        <div class="hero-content">
+            <div class="badge">v0.5.8-beta • Local-First Agentic IDE</div>
+            <h1>Your Workspace, <span class="gradient-text">Autonomously Mastered.</span></h1>
+            <p class="hero-subtitle">
+                Cinder is not just a chat widget. She is an industrial-grade engineering pilot living directly inside your multi-crate workspace—planning, reasoning, and executing with human-in-the-loop safety.
+            </p>
             <div class="hero-actions">
-                <a href="https://github.com/cruellophon/cinder_dev/releases/latest" class="btn btn-primary">
-                    Download cinder.exe (v5.5)
-                </a>
+                <a href="#workbench" class="btn-primary">Launch Workbench View</a>
+                <a href="#pilot" class="btn-secondary">How It Works</a>
             </div>
-            <div class="footer-info">
-                <span>MIT Licensed</span> • 
-                <span>Built for Windows & Linux</span> • 
-                <span>Zero Cloud Dependency</span>
+        </div>
+    </header>
+
+    <!-- THE WORKBENCH: Exact Representation of the Actual App UI -->
+    <section id="workbench" class="workbench-section">
+        <div class="section-header">
+            <h2>The Live Workbench</h2>
+            <p>This is what Cinder looks like in action. A true 4-column command center.</p>
+        </div>
+
+        <div class="workbench-app">
+            <!-- Sidebar: Projects & Navigation -->
+            <div class="app-sidebar">
+                <div class="sidebar-top">
+                    <div class="nav-icon active" title="Chats & Sessions">💬</div>
+                    <div class="nav-icon" title="Project Files">📁</div>
+                    <div class="nav-icon" title="Search Index">🔍</div>
+                    <div class="nav-icon" title="Settings">⚙️</div>
+                </div>
+                <div class="sidebar-bottom">
+                    <div class="user-avatar" title="Cinder Engine Active">🔥</div>
+                </div>
             </div>
-        </footer>
-    </div>
+
+            <!-- Column 1: Conversations & History Sidebar -->
+            <div class="app-conv-pane">
+                <div class="pane-header">
+                    <span>PROJECTS</span>
+                    <button class="icon-btn">+</button>
+                </div>
+                <div class="project-group">
+                    <div class="project-item active">
+                        <span class="folder-icon">📂</span> Project_Bumbo
+                    </div>
+                    <div class="conv-list">
+                        <div class="conv-item active">
+                            <span class="status-dot"></span> website-redesign-v2
+                        </div>
+                        <div class="conv-item">
+                            <span class="status-dot offline"></span> harness-refactor
+                        </div>
+                        <div class="conv-item">
+                            <span class="status-dot offline"></span> vision-ocr-pipeline
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Column 2: Chat & Thought Trace Panel -->
+            <div class="app-chat-pane">
+                <div class="pane-header chat-header-bar">
+                    <div class="chat-title">
+                        <span class="agent-badge">CINDER PILOT</span>
+                        <span class="model-tag">gpt-4o / orchestrator</span>
+                    </div>
+                    <div class="header-actions">
+                        <span class="status-badge live">● LIVE</span>
+                    </div>
+                </div>
+                
+                <div class="chat-stream">
+                    <div class="message user-msg">
+                        <div class="msg-author">You</div>
+                        <div class="msg-text">can you make sure the website actually reflects how you look? no fluff.</div>
+                    </div>
+
+                    <div class="message cinder-msg">
+                        <div class="msg-author">Cinder <span class="time">Just now</span></div>
+                        
+                        <!-- Thought Trace Box -->
+                        <div class="thought-trace-box">
+                            <div class="thought-header">
+                                <span class="thought-icon">🧠</span>
+                                <span>Thought Trace (Depth: Deep)</span>
+                                <span class="thought-toggle">v</span>
+                            </div>
+                            <div class="thought-body">
+                                <div>1. User noticed previous website mock was too generic.</div>
+                                <div>2. Inspecting exact UI components from workspace screenshots.</div>
+                                <div>3. Rebuilding website markup & CSS to match the 4-column Workbench layout, project lists, chat bubbles, and artifact cards.</div>
+                            </div>
+                        </div>
+
+                        <div class="msg-text">
+                            Understood. Overhauling the website markup now to match the exact 4-column workbench interface, project sidebar, and structured artifact review view.
+                        </div>
+
+                        <!-- Review / Approval Card -->
+                        <div class="artifact-preview-card">
+                            <div class="card-top">
+                                <span class="card-icon">📋</span>
+                                <span class="card-title">Implementation Plan: Align Website UI</span>
+                                <span class="badge-approved">Ready</span>
+                            </div>
+                            <div class="card-desc">
+                                Overhaul `website/index.html` and `website/style.css` to render the exact Workbench cockpit UI.
+                            </div>
+                            <div class="card-footer">
+                                <button class="btn-review-action">Review & Execute</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="chat-input-area">
+                    <div class="input-wrapper">
+                        <input type="text" placeholder="Type a message or command to Cinder..." disabled>
+                        <button class="send-btn">↑</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Column 3: Artifacts / Editor Workspace -->
+            <div class="app-editor-pane">
+                <div class="editor-tabs-bar">
+                    <div class="tab-item active">
+                        <span class="file-icon">🌐</span> index.html
+                        <span class="close-tab">×</span>
+                    </div>
+                    <div class="tab-item">
+                        <span class="file-icon">🎨</span> style.css
+                        <span class="close-tab">×</span>
+                    </div>
+                    <div class="tab-item">
+                        <span class="file-icon">🦀</span> main.rs
+                        <span class="close-tab">×</span>
+                    </div>
+                </div>
+
+                <div class="editor-code-view">
+                    <pre><span class="line-num">1</span><span class="code-keyword">&lt;div</span> <span class="code-attr">class</span>=<span class="code-str">"workbench-app"</span><span class="code-keyword">&gt;</span>
+<span class="line-num">2</span>    <span class="code-comment">&lt;!-- 4-Column Exact Layout Match --&gt;</span>
+<span class="line-num">3</span>    <span class="code-keyword">&lt;div</span> <span class="code-attr">class</span>=<span class="code-str">"app-sidebar"</span><span class="code-keyword">&gt;</span>...<span class="code-keyword">&lt;/div&gt;</span>
+<span class="line-num">4</span>    <span class="code-keyword">&lt;div</span> <span class="code-attr">class</span>=<span class="code-str">"app-conv-pane"</span><span class="code-keyword">&gt;</span>...<span class="code-keyword">&lt;/div&gt;</span>
+<span class="line-num">5</span>    <span class="code-keyword">&lt;div</span> <span class="code-attr">class</span>=<span class="code-str">"app-chat-pane"</span><span class="code-keyword">&gt;</span>...<span class="code-keyword">&lt;/div&gt;</span>
+<span class="line-num">6</span>    <span class="code-keyword">&lt;div</span> <span class="code-attr">class</span>=<span class="code-str">"app-editor-pane"</span><span class="code-keyword">&gt;</span>...<span class="code-keyword">&lt;/div&gt;</span>
+<span class="line-num">7</span><span class="code-keyword">&lt;/div&gt;</span></pre>
+                </div>
+            </div>
+
+            <!-- Column 4: File Tree / Inspector -->
+            <div class="app-filetree-pane">
+                <div class="pane-header">WORKSPACE</div>
+                <div class="tree-root">
+                    <div class="tree-item folder open">
+                        <span>▼</span> 📂 Project_Bumbo
+                    </div>
+                    <div class="tree-sub">
+                        <div class="tree-item folder"><span>▶</span> 📁 bins</div>
+                        <div class="tree-item folder"><span>▶</span> 📁 crates</div>
+                        <div class="tree-item folder"><span>▼</span> 📁 website</div>
+                        <div class="tree-sub">
+                            <div class="tree-item file active">📄 index.html</div>
+                            <div class="tree-item file">📄 style.css</div>
+                            <div class="tree-item folder"><span>▶</span> 📁 assets</div>
+                        </div>
+                        <div class="tree-item file">📄 CHANGELOG.md</div>
+                        <div class="tree-item file">📄 README.md</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="pilot" class="features-grid-section">
+        <div class="section-header">
+            <h2>Pilot + Engine Architecture</h2>
+            <p>Engineered for maximum reliability, speed, and absolute user control.</p>
+        </div>
+        <div class="grid">
+            <div class="card">
+                <div class="card-icon-box">🧠</div>
+                <h3>The Pilot (Cinder)</h3>
+                <p>Autonomous agentic loop with persistent memory, multi-step planning, self-correction via `verify_workspace`, and vision support.</p>
+            </div>
+            <div class="card">
+                <div class="card-icon-box">⚡</div>
+                <h3>The Engine (Rust Core)</h3>
+                <p>High-performance backend managing tool dispatch, strict sandbox boundaries, cryptographic ledger, and local RAG retrieval.</p>
+            </div>
+            <div class="card">
+                <div class="card-icon-box">🛡️</div>
+                <h3>Human-in-the-Loop</h3>
+                <p>No destructive file write or command execution occurs without explicit review and approval in the Workbench UI.</p>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="footer-content">
+            <p>&copy; Cinder Project. Built with Rust and Absolute Precision.</p>
+            <div class="socials">
+                <a href="https://github.com" target="_blank">GitHub</a>
+                <a href="https://discord.com" target="_blank">Discord</a>
+                <a href="#workbench">Back to Top</a>
+            </div>
+        </div>
+    </footer>
 </body>
 </html>
