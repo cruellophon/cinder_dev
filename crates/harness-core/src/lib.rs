@@ -1961,6 +1961,15 @@ pub async fn resolve_pending_approval(
     let mut history: Vec<ProviderMessage> =
         serde_json::from_str(&pending.agent_history_json).unwrap_or_default();
 
+    ctx.store
+        .update(|s| {
+            if let Some(sx) = s.sessions.iter_mut().find(|x| x.id == session_id) {
+                sx.pending_approval = None;
+                sx.updated_at = Utc::now();
+            }
+        })
+        .await?;
+
     let args: Value = serde_json::from_str(&pending.arguments_json).unwrap_or_else(|_| Value::Null);
     let checkpoint_id = Uuid::new_v4().to_string();
 
@@ -2012,15 +2021,6 @@ pub async fn resolve_pending_approval(
         tool_calls: Vec::new(),
         images: Vec::new(),
     });
-
-    ctx.store
-        .update(|s| {
-            if let Some(sx) = s.sessions.iter_mut().find(|x| x.id == session_id) {
-                sx.pending_approval = None;
-                sx.updated_at = Utc::now();
-            }
-        })
-        .await?;
 
     let allow_web = ctx.gate.mode() == PrivacyMode::Hybrid;
     let configured_steps = snapshot

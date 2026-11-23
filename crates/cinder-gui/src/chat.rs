@@ -202,6 +202,8 @@ pub fn render_chat_column(
 
     let (changed_files, added_lines, removed_lines) = summarize_checkpoints(&sess);
     let has_changes_bar = changed_files > 0;
+    let mut clear_pending_question = false;
+    let mut clear_pending_approval = false;
 
     egui::TopBottomPanel::bottom(egui::Id::new(("chat_bottom_dock", &sess.id)))
         .frame(Frame::NONE)
@@ -235,6 +237,7 @@ pub fn render_chat_column(
                                             let note = std::mem::take(&mut state.question_custom_text);
                                             state.selected_question_opts.clear();
                                             state.is_generating = true;
+                                            clear_pending_question = true;
                                             backend.answer_question(
                                                 sess.id.clone(),
                                                 vec![opt.clone()],
@@ -247,8 +250,8 @@ pub fn render_chat_column(
                                             egui::TextEdit::singleline(
                                                 &mut state.question_custom_text,
                                             )
-                                            .hint_text("Optional steering note or step count...")
-                                            .desired_width(210.0)
+                                            .hint_text("Steering note or step count...")
+                                            .desired_width(230.0)
                                             .frame(false),
                                         );
                                     });
@@ -258,6 +261,7 @@ pub fn render_chat_column(
                                         let txt = std::mem::take(&mut state.question_custom_text);
                                         state.selected_question_opts.clear();
                                         state.is_generating = true;
+                                        clear_pending_question = true;
                                         backend.answer_question(sess.id.clone(), Vec::new(), txt);
                                     }
                                 });
@@ -311,6 +315,7 @@ pub fn render_chat_column(
                                         state.selected_question_opts.clear();
                                         state.question_custom_text.clear();
                                         state.is_generating = true;
+                                        clear_pending_question = true;
                                         backend.answer_question(sess.id.clone(), opts, txt);
                                     }
                                 });
@@ -337,10 +342,12 @@ pub fn render_chat_column(
                                     |ui| {
                                         if danger_button(ui, p, "Reject").clicked() {
                                             state.is_generating = true;
+                                            clear_pending_approval = true;
                                             backend.approve_tool(sess.id.clone(), false);
                                         }
                                         if primary_button(ui, p, "Approve & Continue").clicked() {
                                             state.is_generating = true;
+                                            clear_pending_approval = true;
                                             backend.approve_tool(sess.id.clone(), true);
                                         }
                                     },
@@ -436,6 +443,22 @@ pub fn render_chat_column(
                 ui.add_space(10.0);
             });
         });
+
+    if clear_pending_question || clear_pending_approval {
+        if let Some(ref mut snap_mut) = state.snap {
+            if let Some(ref mut active_sess) = snap_mut.active_session {
+                if active_sess.id == sess.id {
+                    if clear_pending_question {
+                        active_sess.pending_question = None;
+                    }
+                    if clear_pending_approval {
+                        active_sess.pending_approval = None;
+                    }
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
 
     let stream_max_h = ui.available_height().max(120.0);
 

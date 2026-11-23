@@ -36,6 +36,7 @@ All notable changes to **Cinder** are documented in this file.
 ### Fixed
 - **Nested Backticks Inside Bold Markdown (`cinder-gui/src/markdown.rs`):** Fixed `**bold (`code`)**` inline spans rendering literal backticks instead of styled monospace pills.
 - **Shell Command Risk Classifier Hardening (`harness-tools/src/risk.rs`):** Replaced prefix-based safe command matching (which previously allowed prefix collisions such as `dir`/`dirty-script` and `ls`/`lsof`) with exact parsed-token allowlisting (`tokenize_shell_command`), closed metacharacter/chaining gaps (`|`, `&`, `\n`, `\r`, `<`, `${`), and expanded `HighRiskDestructive` coverage for PowerShell/.NET calls (`iex`, `Invoke-Expression`, `[IO.Directory]::Delete`, etc.).
+- **Immediate Dismissal of Step Contingent & Tool Approval Boxes (`cinder-gui/src/chat.rs`, `harness-core/src/lib.rs`):** Cleared `pending_question` and `pending_approval` immediately upon option/approval selection in both UI snapshot state and persistent store before resuming execution so prompts disappear instantaneously instead of lingering during the continued turn.
 - **Security & Documentation Consistency (`SECURITY.md`, `README.md`):** Aligned OS state paths (`%LOCALAPPDATA%\Project_Bumbo\state.json`), version headings, and shell execution scope notes.
 
 ---
