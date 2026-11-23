@@ -333,10 +333,22 @@ impl CinderApp {
                     exit_code,
                     output,
                     duration_ms,
+                    cwd,
                 } => {
+                    if !cwd.trim().is_empty() {
+                        self.state.terminal_cwd = cwd;
+                    }
                     self.state.terminal_output = format!(
                         "$ {cmd}\n\n{output}\n\n[exit {exit_code} in {duration_ms}ms]"
                     );
+                }
+                BackendEvent::GitDiffLoaded(entries) => {
+                    self.state.git_diff_entries = entries;
+                    self.state.git_diff_loading = false;
+                    if let Some(ref snap) = self.state.snap {
+                        self.state.git_diff_loaded_for_ws =
+                            snap.settings.active_workspace_path.clone();
+                    }
                 }
                 BackendEvent::McpProbed(probe) => {
                     self.state.mcp_probes.insert(probe.server_id.clone(), probe);
@@ -385,6 +397,10 @@ impl CinderApp {
                     }
                 }
             }
+            if cmd && i.modifiers.shift && i.key_pressed(egui::Key::F) {
+                self.state.show_sidebar = true;
+                self.state.show_session_filter = true;
+            }
             if cmd && i.key_pressed(egui::Key::K) {
                 self.state.show_cmd_palette = !self.state.show_cmd_palette;
                 if self.state.show_cmd_palette {
@@ -414,7 +430,7 @@ impl CinderApp {
                 && self.state.show_workbench
                 && self.state.stage_tab == StageTab::Editor
             {
-                if cmd && i.key_pressed(egui::Key::F) {
+                if cmd && !i.modifiers.shift && i.key_pressed(egui::Key::F) {
                     self.state.editor_find_open = !self.state.editor_find_open;
                 }
                 if cmd && i.key_pressed(egui::Key::W) {

@@ -1,12 +1,13 @@
-use crate::app_state::{GuiState, PromptModal, StageTab};
+use crate::app_state::{DiffsViewMode, GuiState, PromptModal, StageTab};
 use crate::backend::BackendHandle;
 use crate::icons::Icon;
 use crate::markdown::{render_diff, render_markdown, render_vertical_resize_handle};
 use crate::theme::{
-    badge, copy_to_clipboard, danger_button, empty_state_block, input_frame, primary_button,
-    secondary_button, CinderPalette,
+    badge, copy_to_clipboard, danger_button, empty_state_block, ghost_button, input_frame,
+    primary_button, secondary_button, segmented_control, CinderPalette,
 };
 use harness_store::{FileChangeStatus, PlanStatus};
+use harness_tools::GitFileStatus;
 use std::sync::Arc;
 
 pub fn render_inspector_view(
@@ -183,88 +184,220 @@ pub fn render_inspector_view(
             }
 
             StageTab::Diffs => {
-                if sess.checkpoints.is_empty() {
-                    empty_state_block(
-                        ui,
-                        p,
-                        Icon::FileCode,
-                        "No workspace changes recorded yet",
-                        "File edits made by the agent create reviewable turn checkpoints here.",
-                        None,
-                    );
-                } else {
-                    for cp in sess.checkpoints.iter().rev() {
-                        p.card_frame().show(ui, |ui| {
-                            ui.set_width(ui.available_width());
+                if state.diffs_view_mode == DiffsViewMode::GitHead
+                    && !state.git_diff_loading
+                    && state.git_diff_loaded_for_ws != snap.settings.active_workspace_path
+                    && snap.git_status.is_repo
+                {
+                    state.git_diff_loading = true;
+                    state.git_diff_loaded_for_ws = snap.settings.active_workspace_path.clone();
+                    backend.load_git_diff(state.git_diff_filter.clone());
+                }
+
+                ui.horizontal(|ui| {
+                    let cp_label = format!("Turn Checkpoints ({})", sess.checkpoints.len());
+                    if snap.git_status.is_repo {
+                        let git_label =
+                            format!("Git vs HEAD ({})", snap.git_status.file_statuses.len());
+                        let items = [
+                            (DiffsViewMode::Checkpoints, cp_label.as_str()),
+                            (DiffsViewMode::GitHead, git_label.as_str()),
+                        ];
+                        if let Some(next_mode) = segmented_control(
+                            ui,
+                            p,
+                            "diffs_view_mode_seg",
+                            state.diffs_view_mode,
+                            &items,
+                        ) {
+                            state.diffs_view_mode = next_mode;
+                            if next_mode == DiffsViewMode::GitHead {
+                                state.git_diff_loading = true;
+                                state.git_diff_loaded_for_ws =
+                                    snap.settings.active_workspace_path.clone();
+                                backend.load_git_diff(state.git_diff_filter.clone());
+                            }
+                        }
+                    } else {
+                        state.diffs_view_mode = DiffsViewMode::Checkpoints;
+                        ui.label(egui::RichText::new(cp_label).small().strong().color(p.text));
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if state.diffs_view_mode == DiffsViewMode::GitHead && snap.git_status.is_repo
+                        {
+                            if secondary_button(ui, p, "Refresh").clicked() {
+                                state.git_diff_loading = true;
+                                state.git_diff_loaded_for_ws =
+                                    snap.settings.active_workspace_path.clone();
+                                backend.load_git_diff(state.git_diff_filter.clone());
+                            }
+                            if state.git_diff_filter.is_some()
+                                && ghost_button(ui, p, "Show All").clicked()
+                            {
+                                state.git_diff_filter = None;
+                                state.git_diff_loading = true;
+                                state.git_diff_loaded_for_ws =
+                                    snap.settings.active_workspace_path.clone();
+                                backend.load_git_diff(None);
+                            }
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+
+                match state.diffs_view_mode {
+                    DiffsViewMode::GitHead if snap.git_status.is_repo => {
+                        if state.git_diff_loading {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(&cp.title).strong());
-                                badge(
-                                    ui,
-                                    &format!("{} file(s)", cp.files.len()),
-                                    p.muted,
-                                    p.bg_card,
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if danger_button(ui, p, "Rollback Turn").clicked() {
-                                            backend.rollback_checkpoint(
-                                                sess.id.clone(),
-                                                cp.id.clone(),
-                                            );
-                                        }
-                                    },
+                                ui.spinner();
+                                ui.label(
+                                    egui::RichText::new("Computing git diff vs HEAD...")
+                                        .small()
+                                        .color(p.muted),
                                 );
                             });
-                            ui.separator();
-                            for f in &cp.files {
-                                let scol = match f.status {
-                                    FileChangeStatus::Accepted => p.green,
-                                    FileChangeStatus::Reverted => p.red,
-                                    FileChangeStatus::PendingReview => p.amber,
+                        } else if state.git_diff_entries.is_empty() {
+                            empty_state_block(
+                                ui,
+                                p,
+                                Icon::FileCode,
+                                "Working tree is clean",
+                                "No modified, added, or untracked files compared to HEAD.",
+                                None,
+                            );
+                        } else {
+                            for entry in &state.git_diff_entries {
+                                let scol = match entry.status {
+                                    GitFileStatus::Modified => p.amber,
+                                    GitFileStatus::Added | GitFileStatus::Untracked => p.green,
+                                    GitFileStatus::Deleted | GitFileStatus::Conflicted => p.red,
+                                    GitFileStatus::Renamed => p.purple,
                                 };
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(&f.rel_path).monospace().strong(),
-                                    );
-                                    badge(ui, &format!("{:?}", f.status), scol, p.bg_card);
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if f.status != FileChangeStatus::Reverted
-                                                && secondary_button(ui, p, "Revert").clicked()
-                                            {
-                                                backend.checkpoint_file_action(
-                                                    sess.id.clone(),
-                                                    cp.id.clone(),
-                                                    f.rel_path.clone(),
-                                                    true,
-                                                );
-                                            }
-                                            if f.status != FileChangeStatus::Accepted
-                                                && primary_button(ui, p, "Accept").clicked()
-                                            {
-                                                backend.checkpoint_file_action(
-                                                    sess.id.clone(),
-                                                    cp.id.clone(),
-                                                    f.rel_path.clone(),
-                                                    false,
-                                                );
-                                            }
-                                        },
-                                    );
+                                p.card_frame().show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&entry.rel_path)
+                                                .monospace()
+                                                .strong(),
+                                        );
+                                        badge(ui, entry.status.label(), scol, p.bg_card);
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if entry.status != GitFileStatus::Deleted
+                                                    && secondary_button(ui, p, "Open").clicked()
+                                                {
+                                                    backend.load_workspace_file(
+                                                        entry.rel_path.clone(),
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    });
+                                    if !entry.diff.trim().is_empty() {
+                                        ui.separator();
+                                        render_diff(
+                                            ui,
+                                            p,
+                                            &entry.diff,
+                                            &format!("git_head_{}", entry.rel_path),
+                                        );
+                                    }
                                 });
-                                if !f.diff.trim().is_empty() {
-                                    render_diff(
-                                        ui,
-                                        p,
-                                        &f.diff,
-                                        &format!("{}_{}", cp.id, f.rel_path),
-                                    );
-                                }
+                                ui.add_space(8.0);
                             }
-                        });
-                        ui.add_space(8.0);
+                        }
+                    }
+                    _ => {
+                        if sess.checkpoints.is_empty() {
+                            empty_state_block(
+                                ui,
+                                p,
+                                Icon::FileCode,
+                                "No workspace changes recorded yet",
+                                "File edits made by the agent create reviewable turn checkpoints here.",
+                                None,
+                            );
+                        } else {
+                            for cp in sess.checkpoints.iter().rev() {
+                                p.card_frame().show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(&cp.title).strong());
+                                        badge(
+                                            ui,
+                                            &format!("{} file(s)", cp.files.len()),
+                                            p.muted,
+                                            p.bg_card,
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if danger_button(ui, p, "Rollback Turn").clicked() {
+                                                    backend.rollback_checkpoint(
+                                                        sess.id.clone(),
+                                                        cp.id.clone(),
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.separator();
+                                    for f in &cp.files {
+                                        let scol = match f.status {
+                                            FileChangeStatus::Accepted => p.green,
+                                            FileChangeStatus::Reverted => p.red,
+                                            FileChangeStatus::PendingReview => p.amber,
+                                        };
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(&f.rel_path)
+                                                    .monospace()
+                                                    .strong(),
+                                            );
+                                            badge(ui, &format!("{:?}", f.status), scol, p.bg_card);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if f.status != FileChangeStatus::Reverted
+                                                        && secondary_button(ui, p, "Revert")
+                                                            .clicked()
+                                                    {
+                                                        backend.checkpoint_file_action(
+                                                            sess.id.clone(),
+                                                            cp.id.clone(),
+                                                            f.rel_path.clone(),
+                                                            true,
+                                                        );
+                                                    }
+                                                    if f.status != FileChangeStatus::Accepted
+                                                        && primary_button(ui, p, "Accept").clicked()
+                                                    {
+                                                        backend.checkpoint_file_action(
+                                                            sess.id.clone(),
+                                                            cp.id.clone(),
+                                                            f.rel_path.clone(),
+                                                            false,
+                                                        );
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        if !f.diff.trim().is_empty() {
+                                            render_diff(
+                                                ui,
+                                                p,
+                                                &f.diff,
+                                                &format!("{}_{}", cp.id, f.rel_path),
+                                            );
+                                        }
+                                    }
+                                });
+                                ui.add_space(8.0);
+                            }
+                        }
                     }
                 }
             }

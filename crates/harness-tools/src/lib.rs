@@ -1,3 +1,4 @@
+pub mod git;
 pub mod mcp;
 pub mod native_dialogs;
 pub mod packages;
@@ -5,6 +6,10 @@ pub mod rag;
 pub mod risk;
 pub mod sandbox;
 
+pub use git::{
+    find_git_root, inspect_git_diff_head, inspect_git_status, parse_git_status_porcelain_v1_branch,
+    GitDiffEntry, GitFileStatus, GitWorkspaceStatus,
+};
 pub use mcp::{
     call_mcp_tool, discover_enabled_mcp_tools, evict_mcp_server_session, mcp_tools_to_specs,
     namespaced_mcp_tool, probe_mcp_server, sanitize_mcp_slug, McpDiscoveredTool, McpProbeResult,
@@ -24,7 +29,10 @@ pub use packages::{
 pub use rag::{
     build_workspace_index, search_workspace_knowledge, IndexStats, KnowledgeSearchHit,
 };
-pub use risk::classify_tool_risk;
+pub use risk::{
+    classify_tool_risk, classify_tool_risk_with_context, extract_tool_secret_path,
+    is_sensitive_secret_path,
+};
 pub use sandbox::{
     clean_latex_pdf_text, create_workspace_dir, create_workspace_file, delete_workspace_entry,
     extract_pdf_file_text, list_workspace_tree, relative_to_workspace, rename_workspace_entry,
@@ -601,10 +609,21 @@ pub async fn execute_tool(
     name: &str,
     args: &Value,
 ) -> ToolExecutionResult {
+    execute_tool_with_policy(workspace_root, gate, brave_key, name, args, false).await
+}
+
+pub async fn execute_tool_with_policy(
+    workspace_root: &Path,
+    gate: &NetworkGate,
+    brave_key: &str,
+    name: &str,
+    args: &Value,
+    skip_secret_contents: bool,
+) -> ToolExecutionResult {
     let res = match name {
         "list_dir" => run_list_dir(workspace_root, args),
         "read_file" => run_read_file(workspace_root, args),
-        "search_files" => run_search_files(workspace_root, args),
+        "search_files" => run_search_files(workspace_root, args, skip_secret_contents),
         "extract_pdf_text" => run_extract_pdf_text(workspace_root, args),
         "search_knowledge" => run_search_knowledge(workspace_root, gate, args).await,
         "propose_edit" => match prepare_file_change(workspace_root, "edit_file", args) {
@@ -1028,7 +1047,11 @@ fn run_read_file(workspace_root: &Path, args: &Value) -> anyhow::Result<ToolExec
     })
 }
 
-fn run_search_files(workspace_root: &Path, args: &Value) -> anyhow::Result<ToolExecutionResult> {
+fn run_search_files(
+    workspace_root: &Path,
+    args: &Value,
+    skip_secret_contents: bool,
+) -> anyhow::Result<ToolExecutionResult> {
     let pattern = arg_str(args, &["pattern", "query", "regex", "text"])
         .ok_or_else(|| anyhow::anyhow!("Missing 'pattern'"))?;
     let sub = arg_str(args, &["sub_path", "path", "dir", "directory", "folder"]).unwrap_or(".");
@@ -1045,6 +1068,7 @@ fn run_search_files(workspace_root: &Path, args: &Value) -> anyhow::Result<ToolE
     let re = compile_search_regex(pattern);
 
     let mut hits = Vec::new();
+    let mut skipped_secrets = 0usize;
     let walker = WalkDir::new(&root)
         .sort_by_file_name()
         .into_iter()
@@ -1056,7 +1080,7 @@ fn run_search_files(workspace_root: &Path, args: &Value) -> anyhow::Result<ToolE
             )
         });
 
-    for entry in walker.flatten() {
+    'walk: for entry in walker.flatten() {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -1066,16 +1090,16 @@ fn run_search_files(workspace_root: &Path, args: &Value) -> anyhow::Result<ToolE
                 .replace('\\', "/")
         });
 
+        if skip_secret_contents && is_sensitive_secret_path(&rel) {
+            skipped_secrets += 1;
+            continue;
+        }
+
         if re.is_match(&rel) {
             hits.push(format!("[file] {rel}"));
             if hits.len() >= 100 {
                 hits.push("... (truncated at 100 matches)".into());
-                return Ok(ToolExecutionResult {
-                    output: hits.join("\n"),
-                    diff: None,
-                    file_path: None,
-                    is_error: false,
-                });
+                break 'walk;
             }
         }
 
@@ -1103,15 +1127,16 @@ fn run_search_files(workspace_root: &Path, args: &Value) -> anyhow::Result<ToolE
                 hits.push(format!("{rel}:{}: {}", i + 1, line.trim()));
                 if hits.len() >= 100 {
                     hits.push("... (truncated at 100 matches)".into());
-                    return Ok(ToolExecutionResult {
-                        output: hits.join("\n"),
-                        diff: None,
-                        file_path: None,
-                        is_error: false,
-                    });
+                    break 'walk;
                 }
             }
         }
+    }
+
+    if skipped_secrets > 0 {
+        hits.push(format!(
+            "[Cloud Secret Guard: skipped {skipped_secrets} sensitive file(s) during cloud search — inspect locally or approve explicit read_file]"
+        ));
     }
 
     Ok(ToolExecutionResult {
@@ -2123,7 +2148,7 @@ mod upload_tests {
         )
         .unwrap();
 
-        let md_hits = run_search_files(&root, &json!({ "pattern": "*.md" })).unwrap();
+        let md_hits = run_search_files(&root, &json!({ "pattern": "*.md" }), false).unwrap();
         assert!(md_hits.output.contains("[file] notes.md"), "got: {}", md_hits.output);
         assert!(
             md_hits.output.contains("[file] Seminar/blatt.md"),
@@ -2131,7 +2156,7 @@ mod upload_tests {
             md_hits.output
         );
 
-        let text_hits = run_search_files(&root, &json!({ "pattern": "Lösung" })).unwrap();
+        let text_hits = run_search_files(&root, &json!({ "pattern": "Lösung" }), false).unwrap();
         assert!(
             text_hits.output.contains("Seminar/blatt.md:1:"),
             "got: {}",
@@ -2270,7 +2295,7 @@ mod upload_tests {
         );
 
         let searched =
-            run_search_files(&root, &json!({ "pattern": "#ff6b2b", "sub_path": "website" }))
+            run_search_files(&root, &json!({ "pattern": "#ff6b2b", "sub_path": "website" }), false)
                 .unwrap();
         assert!(
             searched.output.contains("apps/website/style.css:1:"),
@@ -2281,6 +2306,7 @@ mod upload_tests {
         let missing = run_search_files(
             &root,
             &json!({ "pattern": "anything", "sub_path": "does_not_exist" }),
+            false,
         );
         assert!(missing.is_err());
 
@@ -2496,6 +2522,44 @@ mod upload_tests {
                 received.contains("streaming_hello_cinder"),
                 "expected streamed tail to include stdout, got: {received:?}"
             );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_files_skips_secret_contents_when_cloud_guard_enabled() {
+        let dir = std::env::temp_dir().join(format!("cinder_secret_guard_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "TOP_SECRET_TOKEN=sk-live-999999\n").unwrap();
+        std::fs::write(dir.join(".env.example"), "TOP_SECRET_TOKEN=replace-me\n").unwrap();
+
+        let gate = NetworkGate::new(PrivacyMode::Hybrid).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let cloud_res = execute_tool_with_policy(
+                &dir,
+                &gate,
+                "",
+                "search_files",
+                &serde_json::json!({ "pattern": "TOP_SECRET_TOKEN" }),
+                true,
+            )
+            .await;
+            assert!(!cloud_res.is_error);
+            assert!(!cloud_res.output.contains("sk-live-999999"));
+            assert!(cloud_res.output.contains(".env.example"));
+            assert!(cloud_res.output.contains("Cloud Secret Guard: skipped 1 sensitive file"));
+
+            let local_res = execute_tool_with_policy(
+                &dir,
+                &gate,
+                "",
+                "search_files",
+                &serde_json::json!({ "pattern": "TOP_SECRET_TOKEN" }),
+                false,
+            )
+            .await;
+            assert!(local_res.output.contains("sk-live-999999"));
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

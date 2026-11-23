@@ -2,7 +2,10 @@ use crate::{encode_base64, image_mime_for_ext, strip_data_url_prefix, HarnessCon
 use harness_models::LocalModelEntry;
 use harness_net::PrivacyMode;
 use harness_providers::{complete, CompletionRequest, ProviderMessage, ToolSpec};
-use harness_tools::{execute_tool, resolve_workspace_path};
+use harness_tools::{
+    execute_tool_with_policy, extract_tool_secret_path, resolve_workspace_path,
+    ToolExecutionResult,
+};
 use serde_json::json;
 use std::path::Path;
 
@@ -484,9 +487,40 @@ pub async fn run_research_subagent(
             images: Vec::new(),
         });
 
+        let is_cloud_model = !actual_model.starts_with("local::");
         for tc in resp.tool_calls {
-            let res =
-                execute_tool(workspace_root, ctx.gate, &brave_key, &tc.name, &tc.arguments).await;
+            let res = if is_cloud_model && tc.name != "search_files" {
+                if let Some(secret_path) = extract_tool_secret_path(&tc.name, &tc.arguments) {
+                    ToolExecutionResult {
+                        output: format!(
+                            "Cloud Secret Guard: blocked automatic read of sensitive file '{secret_path}' while using cloud research model."
+                        ),
+                        diff: None,
+                        file_path: Some(secret_path),
+                        is_error: true,
+                    }
+                } else {
+                    execute_tool_with_policy(
+                        workspace_root,
+                        ctx.gate,
+                        &brave_key,
+                        &tc.name,
+                        &tc.arguments,
+                        true,
+                    )
+                    .await
+                }
+            } else {
+                execute_tool_with_policy(
+                    workspace_root,
+                    ctx.gate,
+                    &brave_key,
+                    &tc.name,
+                    &tc.arguments,
+                    is_cloud_model,
+                )
+                .await
+            };
             let trimmed_out = res.output.trim();
             if !trimmed_out.is_empty() {
                 tool_findings.push(format!("[{}] {}", tc.name, trimmed_out));

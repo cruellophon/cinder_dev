@@ -1,9 +1,9 @@
-use crate::app_state::{fmt_bytes, FsTreeNode, GuiState, PromptModal};
+use crate::app_state::{fmt_bytes, DiffsViewMode, FsTreeNode, GuiState, PromptModal, StageTab};
 use crate::backend::{BackendHandle, FolderPickTarget};
 use crate::icons::{draw_icon, icon_button, Icon};
-use crate::theme::{copy_to_clipboard, input_frame, CinderPalette};
-use crate::theme::pane_header;
+use crate::theme::{badge, copy_to_clipboard, ghost_button, input_frame, pane_header, CinderPalette};
 use egui::{Color32, CornerRadius, Frame, Margin};
+use harness_tools::{GitFileStatus, GitWorkspaceStatus};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -57,6 +57,7 @@ pub fn render_explorer_panel(
     });
 
     let tree_nodes = snap.workspace_tree.clone();
+    let git_status = snap.git_status.clone();
     let filter_q = state.explorer_filter.trim().to_ascii_lowercase();
 
     Frame::new()
@@ -70,6 +71,35 @@ pub fn render_explorer_panel(
                         .frame(false),
                 );
             });
+            if git_status.is_repo {
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    let mut branch_lbl = git_status.branch.clone();
+                    if git_status.ahead > 0 {
+                        branch_lbl.push_str(&format!(" ↑{}", git_status.ahead));
+                    }
+                    if git_status.behind > 0 {
+                        branch_lbl.push_str(&format!(" ↓{}", git_status.behind));
+                    }
+                    badge(ui, &branch_lbl, p.accent_hot, p.bg_card);
+                    let dirty_cnt = git_status.file_statuses.len();
+                    if dirty_cnt > 0 {
+                        badge(ui, &format!("{dirty_cnt} changed"), p.amber, p.bg_card);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ghost_button(ui, p, egui::RichText::new("Diff").small()).clicked() {
+                                state.diffs_view_mode = DiffsViewMode::GitHead;
+                                state.git_diff_filter = None;
+                                state.git_diff_loading = true;
+                                state.open_stage_tab(StageTab::Diffs);
+                                backend.load_git_diff(None);
+                            }
+                        });
+                    } else {
+                        badge(ui, "clean", p.green, p.bg_card);
+                    }
+                });
+            }
             ui.add_space(6.0);
 
             egui::ScrollArea::vertical()
@@ -94,6 +124,7 @@ pub fn render_explorer_panel(
                                 backend,
                                 p,
                                 &ws_root,
+                                &git_status,
                                 &n.name,
                                 &n.rel_path,
                                 n.size_bytes,
@@ -109,7 +140,7 @@ pub fn render_explorer_panel(
                         ui.label(egui::RichText::new("Workspace folder is empty.").color(p.muted));
                     }
                     for node in &roots {
-                        render_tree_node(ui, state, backend, p, &ws_root, node, 0);
+                        render_tree_node(ui, state, backend, p, &ws_root, &git_status, node, 0);
                     }
 
                     // Fill remaining space inside scroll area for background right-click actions
@@ -154,17 +185,20 @@ pub fn render_explorer_panel(
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_tree_node(
     ui: &mut egui::Ui,
     state: &mut GuiState,
     backend: &Arc<BackendHandle>,
     p: &CinderPalette,
     ws_root: &PathBuf,
+    git_status: &GitWorkspaceStatus,
     node: &FsTreeNode,
     depth: usize,
 ) {
     if node.is_dir {
         let is_open = state.explorer_expanded.contains(&node.rel_path);
+        let dir_dirty = git_status.modified_dirs.contains(&node.rel_path);
         let indent = (depth as f32) * 14.0;
         let (rect, row_resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), 26.0),
@@ -207,10 +241,11 @@ fn render_tree_node(
                 },
                 p.accent_hot,
             );
+            let right_pad = if dir_dirty { 18.0 } else { 6.0 };
             let galley = egui::WidgetText::from(node.name.as_str()).into_galley(
                 ui,
                 Some(egui::TextWrapMode::Truncate),
-                (rect.right() - (x + 27.0) - 6.0).max(20.0),
+                (rect.right() - (x + 27.0) - right_pad).max(20.0),
                 egui::TextStyle::Button,
             );
             ui.painter().galley(
@@ -218,6 +253,13 @@ fn render_tree_node(
                 galley,
                 fg,
             );
+            if dir_dirty {
+                ui.painter().circle_filled(
+                    egui::pos2(rect.right() - 10.0, rect.center().y),
+                    2.8,
+                    p.amber,
+                );
+            }
         }
         if row_resp.drag_started() {
             state.dragging_explorer_item = Some((node.rel_path.clone(), true));
@@ -305,7 +347,16 @@ fn render_tree_node(
 
         if is_open {
             for child in node.sorted_children() {
-                render_tree_node(ui, state, backend, p, ws_root, child, depth + 1);
+                render_tree_node(
+                    ui,
+                    state,
+                    backend,
+                    p,
+                    ws_root,
+                    git_status,
+                    child,
+                    depth + 1,
+                );
             }
         }
     } else {
@@ -315,6 +366,7 @@ fn render_tree_node(
             backend,
             p,
             ws_root,
+            git_status,
             &node.name,
             &node.rel_path,
             node.size_bytes,
@@ -331,6 +383,7 @@ fn render_leaf_row(
     backend: &Arc<BackendHandle>,
     p: &CinderPalette,
     ws_root: &PathBuf,
+    git_status: &GitWorkspaceStatus,
     name: &str,
     rel_path: &str,
     size_bytes: u64,
@@ -338,6 +391,7 @@ fn render_leaf_row(
     depth: usize,
 ) {
     let is_active = state.active_tab_path.as_deref() == Some(rel_path);
+    let git_st = git_status.file_statuses.get(rel_path).copied();
     let icon = match ext {
         "rs" | "toml" | "py" | "js" | "ts" | "tsx" | "jsx" | "json" | "yaml" | "yml" | "sh"
         | "ps1" | "html" | "css" | "c" | "cpp" | "h" => Icon::FileCode,
@@ -387,10 +441,11 @@ fn render_leaf_row(
             icon,
             icon_col,
         );
+        let badge_pad = if git_st.is_some() { 20.0 } else { 6.0 };
         let galley = egui::WidgetText::from(name).into_galley(
             ui,
             Some(egui::TextWrapMode::Truncate),
-            (rect.right() - (x + 14.0) - 6.0).max(20.0),
+            (rect.right() - (x + 14.0) - badge_pad).max(20.0),
             egui::TextStyle::Button,
         );
         ui.painter().galley(
@@ -398,6 +453,21 @@ fn render_leaf_row(
             galley,
             fg,
         );
+        if let Some(st) = git_st {
+            let scol = match st {
+                GitFileStatus::Modified => p.amber,
+                GitFileStatus::Added | GitFileStatus::Untracked => p.green,
+                GitFileStatus::Deleted | GitFileStatus::Conflicted => p.red,
+                GitFileStatus::Renamed => p.purple,
+            };
+            ui.painter().text(
+                egui::pos2(rect.right() - 7.0, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                st.badge_letter(),
+                egui::FontId::monospace(10.5),
+                scol,
+            );
+        }
     }
     if resp.drag_started() {
         state.dragging_explorer_item = Some((rel_path.to_string(), false));
@@ -406,10 +476,15 @@ fn render_leaf_row(
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
-    let resp = resp.on_hover_text(format!(
-        "{rel_path} ({})\nRight-click for actions",
-        fmt_bytes(size_bytes)
-    ));
+    let hover_txt = match git_st {
+        Some(st) => format!(
+            "{rel_path} ({}) · Git: {}\nRight-click for actions",
+            fmt_bytes(size_bytes),
+            st.label()
+        ),
+        None => format!("{rel_path} ({})\nRight-click for actions", fmt_bytes(size_bytes)),
+    };
+    let resp = resp.on_hover_text(hover_txt);
 
     if resp.clicked() {
         backend.load_workspace_file(rel_path.to_string());
@@ -422,6 +497,14 @@ fn render_leaf_row(
     resp.context_menu(|ui| {
         if ui.button("Open in Editor").clicked() {
             backend.load_workspace_file(rel_clone.clone());
+            ui.close_menu();
+        }
+        if git_st.is_some() && ui.button("View Git Diff vs HEAD").clicked() {
+            state.git_diff_filter = Some(rel_clone.clone());
+            state.diffs_view_mode = DiffsViewMode::GitHead;
+            state.git_diff_loading = true;
+            state.open_stage_tab(StageTab::Diffs);
+            backend.load_git_diff(Some(rel_clone.clone()));
             ui.close_menu();
         }
         if ui.button("Attach to Chat").clicked() {

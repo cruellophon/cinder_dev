@@ -1,5 +1,6 @@
 use harness_store::RiskTier;
 use serde_json::Value;
+use std::path::Path;
 
 const HIGH_RISK_SUBSTRINGS: &[&str] = &[
     "rm -rf",
@@ -209,6 +210,123 @@ fn is_safe_readonly_command(cmd_raw: &str) -> bool {
     }
 }
 
+pub fn is_sensitive_secret_path(path: &str) -> bool {
+    let trimmed = path
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .replace('\\', "/");
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower_path = trimmed.to_ascii_lowercase();
+    let fname = Path::new(&lower_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(lower_path.as_str());
+
+    if matches!(
+        fname,
+        ".env.example"
+            | ".env.sample"
+            | ".env.template"
+            | ".env.dist"
+            | ".env.schema"
+            | "example.env"
+            | "sample.env"
+    ) || fname.contains(".example.")
+        || fname.contains(".sample.")
+        || fname.contains(".template.")
+    {
+        return false;
+    }
+
+    if fname == ".env" || fname.starts_with(".env.") {
+        return true;
+    }
+
+    if matches!(
+        fname,
+        "id_rsa"
+            | "id_ed25519"
+            | "id_ecdsa"
+            | "id_dsa"
+            | ".npmrc"
+            | ".netrc"
+            | ".pypirc"
+            | ".pgpass"
+            | ".htpasswd"
+            | ".dockercfg"
+            | "master.key"
+            | "credentials.json"
+            | "credentials.yaml"
+            | "credentials.yml"
+            | "credentials.toml"
+            | "credentials.ini"
+            | "secrets.json"
+            | "secrets.yaml"
+            | "secrets.yml"
+            | "secrets.toml"
+            | "secrets.ini"
+    ) {
+        return true;
+    }
+
+    if (fname.starts_with("service-account") || fname.starts_with("service_account"))
+        && fname.ends_with(".json")
+    {
+        return true;
+    }
+
+    matches!(
+        Path::new(fname).extension().and_then(|e| e.to_str()),
+        Some("key" | "pem" | "p12" | "pfx" | "jks" | "keystore" | "secret" | "kdbx")
+    )
+}
+
+pub fn extract_tool_secret_path(tool_name: &str, args: &Value) -> Option<String> {
+    if !matches!(
+        tool_name,
+        "read_file" | "edit_file" | "write_file" | "propose_edit" | "extract_pdf_text" | "search_files"
+    ) {
+        return None;
+    }
+    for key in [
+        "path",
+        "file_path",
+        "filepath",
+        "file",
+        "filename",
+        "target_file",
+        "sub_path",
+    ] {
+        if let Some(raw) = args.get(key).and_then(|v| v.as_str()) {
+            let t = raw.trim();
+            if !t.is_empty() && is_sensitive_secret_path(t) {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn classify_tool_risk_with_context(
+    tool_name: &str,
+    args: &Value,
+    is_cloud_model: bool,
+) -> (RiskTier, String) {
+    if is_cloud_model {
+        if let Some(secret_path) = extract_tool_secret_path(tool_name, args) {
+            return (
+                RiskTier::HighRiskDestructive,
+                format!(
+                    "Cloud Secret Guard: '{secret_path}' appears to contain secrets/credentials and would be sent to a cloud model"
+                ),
+            );
+        }
+    }
+    classify_tool_risk(tool_name, args)
+}
+
 pub fn classify_tool_risk(tool_name: &str, args: &Value) -> (RiskTier, String) {
     match tool_name {
         "list_dir" | "read_file" | "search_files" | "extract_pdf_text" | "propose_edit"
@@ -343,5 +461,44 @@ mod tests {
             let (tier, _) = classify_tool_risk("run_command", &json!({ "command": high_cmd }));
             assert_eq!(tier, RiskTier::HighRiskDestructive, "high_cmd={high_cmd}");
         }
+    }
+
+    #[test]
+    fn cloud_secret_guard_escalates_sensitive_files_only_for_cloud_models() {
+        for secret in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            "config/prod.pem",
+            "certs/server.key",
+            "secrets.json",
+            "credentials.yaml",
+            "keys/service-account-prod.json",
+            ".ssh/id_ed25519",
+        ] {
+            assert!(is_sensitive_secret_path(secret), "expected sensitive: {secret}");
+        }
+        for safe in [
+            ".env.example",
+            ".env.sample",
+            ".env.template",
+            "src/main.rs",
+            "README.md",
+            "config/settings.example.json",
+        ] {
+            assert!(!is_sensitive_secret_path(safe), "expected safe: {safe}");
+        }
+
+        let read_env = json!({ "path": ".env" });
+        let (local_tier, _) = classify_tool_risk_with_context("read_file", &read_env, false);
+        assert_eq!(local_tier, RiskTier::SafeReadOnly);
+
+        let (cloud_tier, reason) = classify_tool_risk_with_context("read_file", &read_env, true);
+        assert_eq!(cloud_tier, RiskTier::HighRiskDestructive);
+        assert!(reason.contains("Cloud Secret Guard"));
+
+        let (cloud_example, _) =
+            classify_tool_risk_with_context("read_file", &json!({ "path": ".env.example" }), true);
+        assert_eq!(cloud_example, RiskTier::SafeReadOnly);
     }
 }

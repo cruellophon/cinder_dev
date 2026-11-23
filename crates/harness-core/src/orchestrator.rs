@@ -12,7 +12,10 @@ use harness_store::{
     AgentMode, AppSettings, ChatMessage, OrchestratorPhaseRecord, PendingToolApproval, PlanArtifact,
     PlanStatus, RiskTier, Session, ToolCallRecord,
 };
-use harness_tools::classify_tool_risk;
+use harness_tools::{
+    classify_tool_risk_with_context, execute_tool_with_policy, extract_tool_secret_path,
+    ToolExecutionResult,
+};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -447,14 +450,39 @@ pub async fn run_orchestrator_turn(
                 continue;
             }
 
-            let res = harness_tools::execute_tool(
-                workspace_root,
-                ctx.gate,
-                &snapshot.settings.api_keys.brave_search_api_key,
-                &tc.name,
-                &tc.arguments,
-            )
-            .await;
+            let planner_is_cloud = !planner_model.starts_with("local::");
+            let res = if planner_is_cloud && tc.name != "search_files" {
+                if let Some(secret_path) = extract_tool_secret_path(&tc.name, &tc.arguments) {
+                    ToolExecutionResult {
+                        output: format!(
+                            "Cloud Secret Guard: blocked automatic read of sensitive file '{secret_path}' during cloud planning. Ask the user directly or execute a read explicitly in Agent Mode where it can be approved."
+                        ),
+                        diff: None,
+                        file_path: Some(secret_path),
+                        is_error: true,
+                    }
+                } else {
+                    execute_tool_with_policy(
+                        workspace_root,
+                        ctx.gate,
+                        &snapshot.settings.api_keys.brave_search_api_key,
+                        &tc.name,
+                        &tc.arguments,
+                        true,
+                    )
+                    .await
+                }
+            } else {
+                execute_tool_with_policy(
+                    workspace_root,
+                    ctx.gate,
+                    &snapshot.settings.api_keys.brave_search_api_key,
+                    &tc.name,
+                    &tc.arguments,
+                    planner_is_cloud,
+                )
+                .await
+            };
             all_tools.push(ToolCallRecord {
                 id: tc.id.clone(),
                 name: tc.name.clone(),
@@ -846,7 +874,9 @@ pub async fn run_orchestrator_turn(
                     .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
                 return Ok(updated);
             }
-            let (risk_tier, risk_reason) = classify_tool_risk(&tc.name, &tc.arguments);
+            let executor_is_cloud = !executor_model.starts_with("local::");
+            let (risk_tier, risk_reason) =
+                classify_tool_risk_with_context(&tc.name, &tc.arguments, executor_is_cloud);
             let needs_approval = match risk_tier {
                 RiskTier::SafeReadOnly => false,
                 RiskTier::HighRiskDestructive => true,
@@ -900,6 +930,7 @@ pub async fn run_orchestrator_turn(
                 workspace_root,
                 &snapshot.settings.api_keys.brave_search_api_key,
                 &tc.name,
+                executor_is_cloud,
             )
             .await;
 

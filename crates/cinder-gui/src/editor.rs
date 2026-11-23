@@ -343,6 +343,30 @@ pub fn render_editor_view(
     }
 }
 
+fn terminal_cwd_arg(state: &GuiState) -> Option<String> {
+    let t = state.terminal_cwd.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn format_terminal_cwd_label(ws_root: &str, cwd: &str) -> (String, bool) {
+    let ws_norm = ws_root.trim().replace('\\', "/").trim_end_matches('/').to_string();
+    let cwd_norm = cwd.trim().replace('\\', "/").trim_end_matches('/').to_string();
+    if cwd_norm.is_empty() || cwd_norm.eq_ignore_ascii_case(&ws_norm) {
+        return (".".to_string(), true);
+    }
+    if !ws_norm.is_empty() && cwd_norm.len() > ws_norm.len() {
+        let prefix = format!("{ws_norm}/");
+        if cwd_norm.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()) {
+            return (cwd_norm[prefix.len()..].to_string(), false);
+        }
+    }
+    (cwd_norm, false)
+}
+
 fn render_terminal_drawer(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
@@ -350,6 +374,13 @@ fn render_terminal_drawer(
     backend: &Arc<BackendHandle>,
     p: &CinderPalette,
 ) {
+    let ws_root = state
+        .snap
+        .as_ref()
+        .map(|s| s.settings.active_workspace_path.clone())
+        .unwrap_or_default();
+    let (cwd_label, at_root) = format_terminal_cwd_label(&ws_root, &state.terminal_cwd);
+
     Frame::new()
         .fill(p.bg_sidebar)
         .stroke(Stroke::new(1.0_f32, p.border_strong))
@@ -359,10 +390,28 @@ fn render_terminal_drawer(
             ui.set_height(state.terminal_height);
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("Workspace Terminal").strong());
+                let cwd_resp = ghost_button(
+                    ui,
+                    p,
+                    egui::RichText::new(format!("cwd: {cwd_label}"))
+                        .monospace()
+                        .small()
+                        .color(if at_root { p.muted } else { p.accent_hot }),
+                )
+                .on_hover_text(if state.terminal_cwd.is_empty() {
+                    format!("Working directory: {ws_root}")
+                } else if at_root {
+                    format!("Working directory: {}", state.terminal_cwd)
+                } else {
+                    format!("Working directory: {}\nClick to reset to workspace root", state.terminal_cwd)
+                });
+                if cwd_resp.clicked() && !at_root && !ws_root.is_empty() {
+                    state.terminal_cwd = ws_root.clone();
+                }
                 for qcmd in ["git status", "cargo check", "cargo test", "pytest"] {
                     if secondary_button(ui, p, qcmd).clicked() {
                         state.terminal_cmd = qcmd.into();
-                        backend.run_terminal(qcmd.into());
+                        backend.run_terminal(qcmd.into(), terminal_cwd_arg(state));
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -401,12 +450,12 @@ fn render_terminal_drawer(
                     );
                     if resp.lost_focus() && enter {
                         let cmd = state.terminal_cmd.clone();
-                        backend.run_terminal(cmd);
+                        backend.run_terminal(cmd, terminal_cwd_arg(state));
                     }
                 });
                 if primary_button(ui, p, "Run").clicked() {
                     let cmd = state.terminal_cmd.clone();
-                    backend.run_terminal(cmd);
+                    backend.run_terminal(cmd, terminal_cwd_arg(state));
                 }
             });
 

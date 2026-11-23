@@ -2,7 +2,7 @@ use crate::backend::{BackendHandle, OpenedFilePayload, UiSnapshot};
 use harness_models::{HfModelSummary, HfRepoDetails};
 use harness_providers::ProviderVerifyStatus;
 use harness_store::{AgentMode, PlanStatus, ProviderKind};
-use harness_tools::{IndexStats, KnowledgeSearchHit, McpProbeResult, WorkspaceFileNode};
+use harness_tools::{GitDiffEntry, IndexStats, KnowledgeSearchHit, McpProbeResult, WorkspaceFileNode};
 use image::GenericImageView;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -114,6 +114,12 @@ pub enum StageTab {
     Editor,
     Artifacts,
     Diffs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffsViewMode {
+    Checkpoints,
+    GitHead,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,10 +301,17 @@ pub struct GuiState {
     pub editor_replace_query: String,
     pub terminal_cmd: String,
     pub terminal_output: String,
+    pub terminal_cwd: String,
+    pub terminal_workspace_root: String,
 
-    // Inspector
+    // Inspector & Diffs
     pub editing_artifact_id: Option<String>,
     pub artifact_edit_buf: String,
+    pub diffs_view_mode: DiffsViewMode,
+    pub git_diff_entries: Vec<GitDiffEntry>,
+    pub git_diff_filter: Option<String>,
+    pub git_diff_loaded_for_ws: String,
+    pub git_diff_loading: bool,
 
     // Forge drafts
     pub vault_dir_draft: String,
@@ -420,8 +433,15 @@ impl GuiState {
             editor_replace_query: String::new(),
             terminal_cmd: String::new(),
             terminal_output: "Ready. Run any command inside your active workspace.".into(),
+            terminal_cwd: String::new(),
+            terminal_workspace_root: String::new(),
             editing_artifact_id: None,
             artifact_edit_buf: String::new(),
+            diffs_view_mode: DiffsViewMode::Checkpoints,
+            git_diff_entries: Vec::new(),
+            git_diff_filter: None,
+            git_diff_loaded_for_ws: String::new(),
+            git_diff_loading: false,
             vault_dir_draft: String::new(),
             ctx_size_draft: "16384".into(),
             ngl_draft: "99".into(),
@@ -626,6 +646,14 @@ impl GuiState {
                     .cloned()
                     .unwrap_or_else(|| "cargo".into()),
             );
+        }
+        if self.terminal_workspace_root != snap.settings.active_workspace_path {
+            self.terminal_workspace_root = snap.settings.active_workspace_path.clone();
+            self.terminal_cwd = snap.settings.active_workspace_path.clone();
+            self.git_diff_entries.clear();
+            self.git_diff_loaded_for_ws.clear();
+            self.git_diff_filter = None;
+            self.git_diff_loading = false;
         }
         if !self.did_init_projects {
             self.expanded_projects

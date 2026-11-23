@@ -1055,7 +1055,7 @@ pub fn render_left_sidebar(
                         p,
                         Icon::Filter,
                         state.show_session_filter,
-                        "Filter projects or chats",
+                        "Search projects, chats & messages (Ctrl+Shift+F)",
                     )
                     .clicked()
                     {
@@ -1077,12 +1077,20 @@ pub fn render_left_sidebar(
 
             if state.show_session_filter {
                 input_frame(p, false).show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.session_filter)
-                            .hint_text("Filter projects or chats...")
-                            .desired_width(f32::INFINITY)
-                            .frame(false),
-                    );
+                    ui.horizontal(|ui| {
+                        let clear_w = if state.session_filter.is_empty() { 0.0 } else { 20.0 };
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.session_filter)
+                                .hint_text("Search chats & messages...")
+                                .desired_width((ui.available_width() - clear_w).max(80.0))
+                                .frame(false),
+                        );
+                        if !state.session_filter.is_empty()
+                            && ghost_button(ui, p, egui::RichText::new("×").small()).clicked()
+                        {
+                            state.session_filter.clear();
+                        }
+                    });
                 });
                 ui.add_space(4.0);
             }
@@ -1104,25 +1112,32 @@ pub fn render_left_sidebar(
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let mut assigned = HashSet::new();
+                    let mut any_search_hit = false;
 
                     for ws in &snap.workspaces {
                         let ws_n = norm_path(&ws.path);
                         let is_active_ws = ws_n == active_ws_norm && !is_active_standalone;
-                        let ws_sessions: Vec<_> = snap
+                        let ws_sessions: Vec<(&crate::backend::SessionSummary, Option<String>)> = snap
                             .sessions
                             .iter()
                             .filter(|s| {
                                 !s.workspace_path.trim().is_empty()
                                     && norm_path(&s.workspace_path) == ws_n
                             })
-                            .filter(|s| {
-                                filter_q.is_empty()
-                                    || s.title.to_ascii_lowercase().contains(&filter_q)
-                                    || ws.name.to_ascii_lowercase().contains(&filter_q)
+                            .filter_map(|s| {
+                                assigned.insert(s.id.clone());
+                                match_session_search(s, &ws.name, &filter_q)
+                                    .map(|snip| (s, snip))
                             })
                             .collect();
-                        for s in &ws_sessions {
-                            assigned.insert(s.id.clone());
+
+                        let ws_name_matches = !filter_q.is_empty()
+                            && ws.name.to_ascii_lowercase().contains(&filter_q);
+                        if !filter_q.is_empty() && ws_sessions.is_empty() && !ws_name_matches {
+                            continue;
+                        }
+                        if !filter_q.is_empty() {
+                            any_search_hit = true;
                         }
 
                         let is_open =
@@ -1202,13 +1217,14 @@ pub fn render_left_sidebar(
                                                     .color(p.muted),
                                             );
                                         } else {
-                                            for s in visible_sessions {
+                                            for (s, snip) in visible_sessions {
                                                 render_session_row(
                                                     ui,
                                                     state,
                                                     backend,
                                                     p,
                                                     s,
+                                                    snip.as_deref(),
                                                     &active_sid,
                                                     &snap.workspaces,
                                                 );
@@ -1250,36 +1266,7 @@ pub fn render_left_sidebar(
                     }
 
                     // Always-visible dedicated segment for standalone / one-off conversations
-                    ui.add_space(14.0);
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if icon_button(
-                                ui,
-                                p,
-                                Icon::Plus,
-                                false,
-                                "New One-Off Conversation (Not in any Project)",
-                            )
-                            .clicked()
-                            {
-                                backend.create_standalone_session(None);
-                                state.switch_main_view(MainView::Chat, true);
-                            }
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.add_space(4.0);
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new("Conversations")
-                                            .size(11.5)
-                                            .color(p.muted),
-                                    )
-                                    .truncate(),
-                                );
-                            });
-                        });
-                    });
-
-                    let standalone_sessions: Vec<_> = snap
+                    let standalone_sessions: Vec<(&crate::backend::SessionSummary, Option<String>)> = snap
                         .sessions
                         .iter()
                         .filter(|s| {
@@ -1287,37 +1274,84 @@ pub fn render_left_sidebar(
                                 || !known_ws_norms.contains(&norm_path(&s.workspace_path));
                             standalone_ws && !assigned.contains(&s.id)
                         })
-                        .filter(|s| {
-                            filter_q.is_empty()
-                                || s.title.to_ascii_lowercase().contains(&filter_q)
+                        .filter_map(|s| {
+                            match_session_search(s, "", &filter_q).map(|snip| (s, snip))
                         })
                         .collect();
 
-                    if standalone_sessions.is_empty() {
-                        if ghost_button(
-                            ui,
-                            p,
-                            egui::RichText::new("Start a one-off chat...")
+                    if !standalone_sessions.is_empty() && !filter_q.is_empty() {
+                        any_search_hit = true;
+                    }
+
+                    if filter_q.is_empty() || !standalone_sessions.is_empty() {
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if icon_button(
+                                    ui,
+                                    p,
+                                    Icon::Plus,
+                                    false,
+                                    "New One-Off Conversation (Not in any Project)",
+                                )
+                                .clicked()
+                                {
+                                    backend.create_standalone_session(None);
+                                    state.switch_main_view(MainView::Chat, true);
+                                }
+                                ui.with_layout(
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_space(4.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new("Conversations")
+                                                    .size(11.5)
+                                                    .color(p.muted),
+                                            )
+                                            .truncate(),
+                                        );
+                                    },
+                                );
+                            });
+                        });
+
+                        if standalone_sessions.is_empty() {
+                            if ghost_button(
+                                ui,
+                                p,
+                                egui::RichText::new("Start a one-off chat...")
+                                    .small()
+                                    .color(p.muted),
+                            )
+                            .clicked()
+                            {
+                                backend.create_standalone_session(None);
+                                state.switch_main_view(MainView::Chat, true);
+                            }
+                        } else {
+                            for (s, snip) in standalone_sessions {
+                                render_session_row(
+                                    ui,
+                                    state,
+                                    backend,
+                                    p,
+                                    s,
+                                    snip.as_deref(),
+                                    &active_sid,
+                                    &snap.workspaces,
+                                );
+                            }
+                        }
+                    }
+
+                    if !filter_q.is_empty() && !any_search_hit {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("No matching chats or messages.")
                                 .small()
                                 .color(p.muted),
-                        )
-                        .clicked()
-                        {
-                            backend.create_standalone_session(None);
-                            state.switch_main_view(MainView::Chat, true);
-                        }
-                    } else {
-                        for s in standalone_sessions {
-                            render_session_row(
-                                ui,
-                                state,
-                                backend,
-                                p,
-                                s,
-                                &active_sid,
-                                &snap.workspaces,
-                            );
-                        }
+                        );
                     }
                 });
         });
@@ -1484,12 +1518,80 @@ fn render_project_row(
     (res.inner, add_clicked)
 }
 
+fn extract_search_snippet(text: &str, match_start_byte: usize, match_len: usize) -> String {
+    let mut start = match_start_byte.min(text.len());
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut back_chars = 0usize;
+    let mut slice_start = start;
+    for (idx, _) in text[..start].char_indices().rev() {
+        slice_start = idx;
+        back_chars += 1;
+        if back_chars >= 20 {
+            break;
+        }
+    }
+
+    let mut end = (match_start_byte + match_len).min(text.len());
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    let mut fwd_chars = 0usize;
+    let mut slice_end = end;
+    for (rel_idx, ch) in text[end..].char_indices() {
+        slice_end = end + rel_idx + ch.len_utf8();
+        fwd_chars += 1;
+        if fwd_chars >= 44 {
+            break;
+        }
+    }
+
+    let collapsed = text[slice_start..slice_end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut out = String::new();
+    if slice_start > 0 {
+        out.push('…');
+    }
+    out.push_str(&collapsed);
+    if slice_end < text.len() {
+        out.push('…');
+    }
+    out
+}
+
+pub(crate) fn match_session_search(
+    s: &crate::backend::SessionSummary,
+    ws_name: &str,
+    query_lower: &str,
+) -> Option<Option<String>> {
+    if query_lower.is_empty() {
+        return Some(None);
+    }
+    if s.title.to_ascii_lowercase().contains(query_lower)
+        || (!ws_name.is_empty() && ws_name.to_ascii_lowercase().contains(query_lower))
+    {
+        return Some(None);
+    }
+    for msg in &s.message_texts {
+        let lower = msg.to_ascii_lowercase();
+        if let Some(pos) = lower.find(query_lower) {
+            return Some(Some(extract_search_snippet(msg, pos, query_lower.len())));
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_session_row(
     ui: &mut egui::Ui,
     state: &mut GuiState,
     backend: &Arc<BackendHandle>,
     p: &CinderPalette,
     s: &crate::backend::SessionSummary,
+    match_snippet: Option<&str>,
     active_sid: &str,
     workspaces: &[WorkspaceEntry],
 ) {
@@ -1504,8 +1606,9 @@ fn render_session_row(
     let is_working = (live_active && live_sid.as_deref() == Some(s.id.as_str()))
         || (state.is_generating && live_sid.as_deref().unwrap_or(active_sid) == s.id);
 
+    let row_h = if match_snippet.is_some() { 40.0 } else { 26.0 };
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let fill = if is_active_chat {
             p.bg_card
@@ -1533,6 +1636,11 @@ fn render_session_row(
                 .rect_filled(tick, CornerRadius::same(1), tick_col);
         }
 
+        let top_y = if match_snippet.is_some() {
+            rect.top() + 12.0
+        } else {
+            rect.center().y
+        };
         let age_galley =
             ui.painter()
                 .layout_no_wrap(age, egui::FontId::proportional(11.0), p.muted);
@@ -1554,17 +1662,30 @@ fn render_session_row(
             egui::TextStyle::Button,
         );
         ui.painter().galley(
-            egui::pos2(
-                rect.left() + 9.0,
-                rect.center().y - title_galley.size().y * 0.5,
-            ),
+            egui::pos2(rect.left() + 9.0, top_y - title_galley.size().y * 0.5),
             title_galley,
             fg,
         );
+        if let Some(snip) = match_snippet {
+            let snip_galley = egui::WidgetText::from(
+                egui::RichText::new(snip).size(11.0).color(p.muted),
+            )
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Truncate),
+                (rect.width() - 18.0).max(20.0),
+                egui::TextStyle::Small,
+            );
+            ui.painter().galley(
+                egui::pos2(rect.left() + 9.0, rect.top() + 22.0),
+                snip_galley,
+                p.muted,
+            );
+        }
         if is_working {
             draw_working_indicator(
                 ui,
-                egui::pos2(rect.right() - 12.5, rect.center().y),
+                egui::pos2(rect.right() - 12.5, top_y),
                 4.6,
                 p,
             );
@@ -1572,7 +1693,7 @@ fn render_session_row(
             ui.painter().galley(
                 egui::pos2(
                     rect.right() - age_galley.size().x - 8.0,
-                    rect.center().y - age_galley.size().y * 0.5,
+                    top_y - age_galley.size().y * 0.5,
                 ),
                 age_galley,
                 p.muted,
@@ -1632,4 +1753,36 @@ fn render_session_row(
             ui.close_menu();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_session_search_matches_titles_workspaces_and_utf8_message_snippets() {
+        let mk_summary = |title: &str, msgs: Vec<&str>| crate::backend::SessionSummary {
+            id: "s1".into(),
+            title: title.into(),
+            workspace_path: "C:/ws/Bumbo".into(),
+            mode: harness_store::AgentMode::Auto,
+            message_count: msgs.len(),
+            updated_at: chrono::Utc::now(),
+            message_texts: msgs.into_iter().map(String::from).collect(),
+        };
+
+        let s_title = mk_summary("Fix Cargo Build", vec!["hello"]);
+        assert_eq!(match_session_search(&s_title, "Bumbo", "cargo"), Some(None));
+        assert_eq!(match_session_search(&s_title, "Bumbo", "bumbo"), Some(None));
+
+        let s_msg = mk_summary(
+            "Evening check-in",
+            vec!["We configured UTF-8 café routing for OpenRouter fallback chains reliably."],
+        );
+        let hit = match_session_search(&s_msg, "Proj", "openrouter");
+        let snip = hit.expect("should match body").expect("should return snippet");
+        assert!(snip.contains("OpenRouter"));
+
+        assert_eq!(match_session_search(&s_msg, "Proj", "nonexistent_xyz"), None);
+    }
 }

@@ -24,14 +24,15 @@ use harness_store::{
 };
 use harness_tools::{
     build_workspace_index, create_workspace_dir, create_workspace_file, delete_workspace_entry,
-    evict_mcp_server_session, export_antigravity_mcp_json, inspect_project_dependencies,
-    install_curated_plugin, install_custom_project_dependency, install_project_dependency,
-    is_dependency_allowlisted, list_plugin_catalog_with_status, list_workspace_tree, pick_files,
-    pick_folder, probe_mcp_server, probe_toolchains, rename_workspace_entry,
-    search_workspace_knowledge, sync_from_antigravity, uninstall_curated_plugin,
-    uninstall_project_dependency, validate_custom_package_name, AntigravitySyncReport, IndexStats,
-    InstallJobManager, InstallJobRecord, KnowledgeSearchHit, McpProbeResult, PluginCatalogView,
-    ProjectDependenciesOverview, ToolchainStatus, WorkspaceFileNode,
+    evict_mcp_server_session, export_antigravity_mcp_json, inspect_git_diff_head,
+    inspect_git_status, inspect_project_dependencies, install_curated_plugin,
+    install_custom_project_dependency, install_project_dependency, is_dependency_allowlisted,
+    list_plugin_catalog_with_status, list_workspace_tree, pick_files, pick_folder,
+    probe_mcp_server, probe_toolchains, rename_workspace_entry, search_workspace_knowledge,
+    sync_from_antigravity, uninstall_curated_plugin, uninstall_project_dependency,
+    validate_custom_package_name, AntigravitySyncReport, GitDiffEntry, GitWorkspaceStatus,
+    IndexStats, InstallJobManager, InstallJobRecord, KnowledgeSearchHit, McpProbeResult,
+    PluginCatalogView, ProjectDependenciesOverview, ToolchainStatus, WorkspaceFileNode,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -64,6 +65,7 @@ pub struct SessionSummary {
     pub mode: AgentMode,
     pub message_count: usize,
     pub updated_at: chrono::DateTime<Utc>,
+    pub message_texts: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +75,7 @@ pub struct UiSnapshot {
     pub sessions: Vec<SessionSummary>,
     pub active_session: Option<Session>,
     pub workspace_tree: Vec<WorkspaceFileNode>,
+    pub git_status: GitWorkspaceStatus,
     pub workspace_rules: String,
     pub skills: Vec<SkillDefinition>,
     pub hardware: HardwareReport,
@@ -141,7 +144,9 @@ pub enum BackendEvent {
         exit_code: i32,
         output: String,
         duration_ms: u64,
+        cwd: String,
     },
+    GitDiffLoaded(Vec<GitDiffEntry>),
     McpProbed(McpProbeResult),
     AntigravityExported(String),
     EntryRenamed {
@@ -332,12 +337,12 @@ impl BackendHandle {
 
         let ws_str = snap.settings.active_workspace_path.clone();
         let ws_tree_str = ws_str.clone();
-        let workspace_tree = tokio::task::spawn_blocking(move || {
+        let (workspace_tree, git_status) = tokio::task::spawn_blocking(move || {
             let p = Path::new(&ws_tree_str);
             if p.exists() {
-                list_workspace_tree(p, 600)
+                (list_workspace_tree(p, 600), inspect_git_status(p))
             } else {
-                Vec::new()
+                (Vec::new(), GitWorkspaceStatus::default())
             }
         })
         .await
@@ -368,13 +373,30 @@ impl BackendHandle {
         let sessions = snap
             .sessions
             .iter()
-            .map(|s| SessionSummary {
-                id: s.id.clone(),
-                title: s.title.clone(),
-                workspace_path: s.workspace_path.clone(),
-                mode: s.mode,
-                message_count: s.messages.len(),
-                updated_at: s.updated_at,
+            .map(|s| {
+                let message_texts = s
+                    .messages
+                    .iter()
+                    .rev()
+                    .filter_map(|m| {
+                        let t = m.content.trim();
+                        if t.is_empty() {
+                            None
+                        } else {
+                            Some(truncate_chars(t, 2000))
+                        }
+                    })
+                    .take(80)
+                    .collect();
+                SessionSummary {
+                    id: s.id.clone(),
+                    title: s.title.clone(),
+                    workspace_path: s.workspace_path.clone(),
+                    mode: s.mode,
+                    message_count: s.messages.len(),
+                    updated_at: s.updated_at,
+                    message_texts,
+                }
             })
             .collect();
 
@@ -387,6 +409,7 @@ impl BackendHandle {
             sessions,
             active_session,
             workspace_tree,
+            git_status,
             workspace_rules,
             skills,
             hardware: hw,
@@ -1299,10 +1322,30 @@ impl BackendHandle {
         });
     }
 
-    pub fn run_terminal(self: &Arc<Self>, command: String) {
+    pub fn load_git_diff(self: &Arc<Self>, path_filter: Option<String>) {
+        let h = Arc::clone(self);
+        self.rt.spawn(async move {
+            let ws = h.store.snapshot().await.settings.active_workspace_path;
+            let entries = tokio::task::spawn_blocking(move || {
+                inspect_git_diff_head(Path::new(&ws), path_filter.as_deref(), 240_000)
+            })
+            .await
+            .unwrap_or_default();
+            h.send(BackendEvent::GitDiffLoaded(entries));
+        });
+    }
+
+    pub fn run_terminal(self: &Arc<Self>, command: String, current_cwd: Option<String>) {
         let h = Arc::clone(self);
         self.rt.spawn(async move {
             let ws_root = h.store.snapshot().await.settings.active_workspace_path;
+            let start_dir = current_cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty() && Path::new(d).is_dir())
+                .map(str::to_string)
+                .unwrap_or_else(|| ws_root.clone());
+
             let trimmed = command.trim().to_string();
             if trimmed.is_empty() {
                 h.toast("Command cannot be empty.", true);
@@ -1310,8 +1353,11 @@ impl BackendHandle {
             }
             let started = std::time::Instant::now();
             let mut cmd = if cfg!(windows) {
+                let ps_script = format!(
+                    "$global:LASTEXITCODE = 0\n{trimmed}\n$__cinder_ok = $?\n$__cinder_ec = if ($LASTEXITCODE -ne 0) {{ $LASTEXITCODE }} elseif ($__cinder_ok) {{ 0 }} else {{ 1 }}\n[Console]::Out.WriteLine(\"{TERMINAL_CWD_MARKER}$((Get-Location).Path)\")\nexit $__cinder_ec"
+                );
                 let mut c = tokio::process::Command::new("powershell");
-                c.args(["-NoProfile", "-Command", &trimmed]);
+                c.args(["-NoProfile", "-Command", &ps_script]);
                 #[cfg(windows)]
                 {
                     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -1319,12 +1365,15 @@ impl BackendHandle {
                 }
                 c
             } else {
+                let sh_script = format!(
+                    "{trimmed}\n__cinder_ec=$?\nprintf '\\n{TERMINAL_CWD_MARKER}%s\\n' \"$(pwd)\"\nexit $__cinder_ec"
+                );
                 let mut c = tokio::process::Command::new("sh");
-                c.args(["-c", &trimmed]);
+                c.args(["-c", &sh_script]);
                 c
             };
-            if !ws_root.trim().is_empty() && Path::new(&ws_root).is_dir() {
-                cmd.current_dir(&ws_root);
+            if !start_dir.trim().is_empty() && Path::new(&start_dir).is_dir() {
+                cmd.current_dir(&start_dir);
             }
             let out = match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
                 .await
@@ -1340,9 +1389,14 @@ impl BackendHandle {
                 }
             };
             let exit_code = out.status.code().unwrap_or(-1);
-            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stdout_raw = String::from_utf8_lossy(&out.stdout);
+            let (clean_stdout, parsed_cwd) = parse_terminal_cwd_marker(&stdout_raw);
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = format!("{stdout}{stderr}").trim().to_string();
+            let combined = format!("{clean_stdout}{stderr}").trim().to_string();
+            let next_cwd = parsed_cwd
+                .filter(|p| Path::new(p).is_dir())
+                .unwrap_or(start_dir);
+
             h.send(BackendEvent::TerminalOutput {
                 cmd: trimmed,
                 exit_code,
@@ -1352,6 +1406,7 @@ impl BackendHandle {
                     combined
                 },
                 duration_ms: started.elapsed().as_millis() as u64,
+                cwd: next_cwd,
             });
         });
     }
@@ -2275,6 +2330,54 @@ impl BackendHandle {
     }
 }
 
+const TERMINAL_CWD_MARKER: &str = "__CINDER_CWD_MARKER__:";
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut count = 0usize;
+    for (idx, _) in s.char_indices() {
+        if count == max_chars {
+            return format!("{}…", &s[..idx]);
+        }
+        count += 1;
+    }
+    s.to_string()
+}
+
+pub(crate) fn parse_terminal_cwd_marker(stdout: &str) -> (String, Option<String>) {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut found_cwd: Option<String> = None;
+    for line in stdout.lines() {
+        let trimmed_cr = line.trim_end_matches('\r');
+        if let Some(rest) = trimmed_cr.strip_prefix(TERMINAL_CWD_MARKER) {
+            let p = rest.trim();
+            if !p.is_empty() {
+                found_cwd = Some(p.to_string());
+            }
+        } else {
+            kept.push(trimmed_cr);
+        }
+    }
+    (kept.join("\n").trim().to_string(), found_cwd)
+}
+
 fn clean_verbatim(p: String) -> String {
     p.strip_prefix(r"\\?\").unwrap_or(&p).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_terminal_cwd_marker_strips_marker_and_extracts_path() {
+        let raw = "cargo check ok\nFinished in 0.4s\n__CINDER_CWD_MARKER__:C:\\Projects\\Bumbo\\crates\n";
+        let (out, cwd) = parse_terminal_cwd_marker(raw);
+        assert_eq!(out, "cargo check ok\nFinished in 0.4s");
+        assert_eq!(cwd.as_deref(), Some("C:\\Projects\\Bumbo\\crates"));
+
+        let no_marker = "only output\n";
+        let (out2, cwd2) = parse_terminal_cwd_marker(no_marker);
+        assert_eq!(out2, "only output");
+        assert_eq!(cwd2, None);
+    }
 }

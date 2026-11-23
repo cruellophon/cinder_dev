@@ -31,8 +31,8 @@ use harness_store::{
     Session, SessionArtifact, ToolCallRecord,
 };
 use harness_tools::{
-    apply_file_change, call_mcp_tool, classify_tool_risk, discover_enabled_mcp_tools,
-    execute_tool, extract_pdf_file_text, filter_tools_by_modules, mcp_tools_to_specs,
+    apply_file_change, call_mcp_tool, classify_tool_risk_with_context, discover_enabled_mcp_tools,
+    execute_tool_with_policy, extract_pdf_file_text, filter_tools_by_modules, mcp_tools_to_specs,
     prepare_file_change, resolve_workspace_path, sanitize_mcp_slug, tool_specs,
     ToolExecutionResult,
 };
@@ -1983,6 +1983,7 @@ pub async fn resolve_pending_approval(
             Path::new(&workspace_path),
             &snapshot.settings.api_keys.brave_search_api_key,
             &pending.tool_name,
+            !pending.model_id.starts_with("local::"),
         )
         .await
     } else {
@@ -2530,7 +2531,12 @@ pub(crate) fn build_pending_tool_approval(
             Err(_) => (None, args["path"].as_str().map(|s| s.to_string())),
         }
     } else {
-        (None, None)
+        let p = args["path"]
+            .as_str()
+            .or_else(|| args["file_path"].as_str())
+            .or_else(|| args["sub_path"].as_str())
+            .map(|s| s.to_string());
+        (None, p)
     };
     PendingToolApproval {
         id: tc_id.to_string(),
@@ -2587,6 +2593,7 @@ pub(crate) async fn execute_tool_with_checkpoint(
     workspace_root: &Path,
     brave_key: &str,
     tool_name: &str,
+    is_cloud_model: bool,
 ) -> ToolExecutionResult {
     if tool_name == "write_file" || tool_name == "edit_file" {
         match prepare_file_change(workspace_root, tool_name, args) {
@@ -2683,7 +2690,15 @@ pub(crate) async fn execute_tool_with_checkpoint(
         };
     }
 
-    execute_tool(workspace_root, ctx.gate, brave_key, tool_name, args).await
+    execute_tool_with_policy(
+        workspace_root,
+        ctx.gate,
+        brave_key,
+        tool_name,
+        args,
+        is_cloud_model,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3489,7 +3504,8 @@ async fn run_agent_loop(
                 continue;
             }
 
-            // 4. Smart Risk-Tier Classification (including live MCP tools)
+            // 4. Smart Risk-Tier Classification (including live MCP tools & Cloud Secret Guard)
+            let is_cloud_model = !active_model_id.starts_with("local::");
             let (risk_tier, risk_reason) = if tc.name.starts_with("mcp__") {
                 let is_ro = mcp_tools
                     .iter()
@@ -3505,7 +3521,7 @@ async fn run_agent_loop(
                     )
                 }
             } else {
-                classify_tool_risk(&tc.name, &tc.arguments)
+                classify_tool_risk_with_context(&tc.name, &tc.arguments, is_cloud_model)
             };
             let needs_approval = match risk_tier {
                 RiskTier::SafeReadOnly => false,
@@ -3559,6 +3575,7 @@ async fn run_agent_loop(
                 workspace_root,
                 &settings.api_keys.brave_search_api_key,
                 &tc.name,
+                is_cloud_model,
             )
             .await;
 
