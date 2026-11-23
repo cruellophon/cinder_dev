@@ -312,7 +312,37 @@ pub async fn complete(
                 settings.fallback_to_local,
             );
 
-            if candidates.is_empty() {
+            if candidates.is_empty() || !settings.auto_switch_models {
+                if !is_local && should_switch && !should_block {
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                    if let Ok((retry_resp, retry_headers)) = complete_single(
+                        gate,
+                        store,
+                        &settings,
+                        server_mgr,
+                        local_models,
+                        &fresh_catalog,
+                        &req,
+                    )
+                    .await
+                    {
+                        if let Some(headers) = retry_headers {
+                            let _ = store
+                                .record_usage(
+                                    &req.model_id,
+                                    retry_resp.prompt_tokens,
+                                    retry_resp.completion_tokens,
+                                    retry_resp.thinking_tokens,
+                                    headers.rem_req,
+                                    headers.lim_req,
+                                    headers.rem_tok,
+                                    headers.lim_tok,
+                                )
+                                .await;
+                        }
+                        return Ok(retry_resp);
+                    }
+                }
                 anyhow::bail!("{}", format_clean_provider_error(&raw_err));
             }
 
@@ -399,6 +429,14 @@ pub async fn complete(
 
 pub fn classify_provider_error(err_str: &str) -> (bool, bool, &'static str) {
     let lower = err_str.to_ascii_lowercase();
+    if lower.contains("context length")
+        || lower.contains("maximum context")
+        || lower.contains("too many tokens")
+        || lower.contains("prompt is too long")
+        || lower.contains("context_length_exceeded")
+    {
+        return (false, false, "context length exceeded");
+    }
     if err_str.contains("HTTP 402")
         || lower.contains("payment required")
         || lower.contains("insufficient credits")
@@ -407,7 +445,13 @@ pub fn classify_provider_error(err_str: &str) -> (bool, bool, &'static str) {
     {
         return (true, true, "requires paid credits / payment required");
     }
-    if lower.contains("limit: 0") || err_str.contains("HTTP 404") || err_str.contains("NOT_FOUND") {
+    if lower.contains("limit: 0")
+        || err_str.contains("HTTP 404")
+        || err_str.contains("NOT_FOUND")
+        || lower.contains("no endpoints found")
+        || lower.contains("not a valid model")
+        || lower.contains("model not found")
+    {
         return (true, true, "0 quota / unavailable on current API tier");
     }
     if err_str.contains("HTTP 429")
@@ -435,6 +479,10 @@ pub fn classify_provider_error(err_str: &str) -> (bool, bool, &'static str) {
         || err_str.contains("HTTP 502")
         || err_str.contains("HTTP 504")
         || lower.contains("overloaded")
+        || lower.contains("provider returned error")
+        || lower.contains("bad gateway")
+        || lower.contains("service unavailable")
+        || lower.contains("temporarily unavailable")
         || err_str.contains("UNAVAILABLE")
         || err_str.contains("INTERNAL")
     {
@@ -2664,6 +2712,18 @@ mod tests {
         let (sw7, blk7, r7) =
             classify_provider_error("OpenRouter HTTP 402: Insufficient credits / payment required");
         assert!(sw7 && blk7 && r7.contains("paid credits"));
+
+        let (sw8, blk8, _) =
+            classify_provider_error("HTTP 400: maximum context length is 128000 tokens");
+        assert!(!sw8 && !blk8);
+
+        let (sw9, blk9, _) =
+            classify_provider_error("OpenRouter HTTP 404: No endpoints found for this model");
+        assert!(sw9 && blk9);
+
+        let (sw10, blk10, _) =
+            classify_provider_error("OpenRouter HTTP 502: Provider returned error");
+        assert!(sw10 && !blk10);
     }
 
     #[test]

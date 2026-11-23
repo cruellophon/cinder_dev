@@ -39,12 +39,22 @@ const HIGH_RISK_SUBSTRINGS: &[&str] = &[
     "| sh",
     "| bash",
     "| iex",
+    "-encodedcommand",
+    "-enc ",
+    "cmd /c",
+    "powershell -c",
+    "pwsh -c",
+    "bash -c",
+    "sh -c",
 ];
 
 const HIGH_RISK_PROGRAMS: &[&str] = &[
     "iex",
     "irm",
     "iwr",
+    "pwsh",
+    "powershell",
+    "cmd",
     "rm",
     "del",
     "erase",
@@ -135,11 +145,23 @@ fn is_safe_readonly_git(tokens: &[String]) -> bool {
     let Some(sub) = tokens.get(1).map(String::as_str) else {
         return false;
     };
-    if matches!(sub, "-c" | "--exec-path") {
+    if matches!(sub, "-c" | "--exec-path" | "--git-dir" | "--work-tree")
+        || sub.starts_with("--git-dir=")
+        || sub.starts_with("--work-tree=")
+    {
+        return false;
+    }
+    let has_dangerous_git_flag = tokens.iter().any(|t| {
+        matches!(t.as_str(), "-c" | "--exec-path" | "--output" | "--git-dir" | "--work-tree")
+            || t.starts_with("--output=")
+            || t.starts_with("--git-dir=")
+            || t.starts_with("--work-tree=")
+    });
+    if has_dangerous_git_flag {
         return false;
     }
     match sub {
-        "status" | "diff" | "log" | "show" | "rev-parse" => !tokens.iter().any(|t| t == "--exec-path"),
+        "status" | "diff" | "log" | "show" | "rev-parse" => true,
         "branch" => !tokens.iter().skip(2).any(|f| {
             matches!(
                 f.as_str(),
@@ -307,6 +329,19 @@ mod tests {
         ] {
             let (tier, _) = classify_tool_risk("run_command", &json!({ "command": cmd }));
             assert_eq!(tier, RiskTier::SafeReadOnly, "cmd={cmd}");
+        }
+
+        // Extra bypass checks: git --output, encoded/nested shells
+        let (git_out, _) = classify_tool_risk("run_command", &json!({ "command": "git diff --output=leak.txt" }));
+        assert_eq!(git_out, RiskTier::WorkspaceMutation);
+
+        for high_cmd in [
+            "powershell -EncodedCommand SQBFAFgA",
+            "cmd /c dir",
+            "bash -c \"rm -rf /\"",
+        ] {
+            let (tier, _) = classify_tool_risk("run_command", &json!({ "command": high_cmd }));
+            assert_eq!(tier, RiskTier::HighRiskDestructive, "high_cmd={high_cmd}");
         }
     }
 }

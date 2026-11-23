@@ -272,6 +272,7 @@ impl CinderApp {
                     attached_files,
                     attachments,
                 } => {
+                    self.state.is_generating = false;
                     if let Some(ref mut snap) = self.state.snap {
                         snap.active_session = Some(session);
                     }
@@ -383,6 +384,9 @@ impl CinderApp {
             }
             if cmd && i.key_pressed(egui::Key::K) {
                 self.state.show_cmd_palette = !self.state.show_cmd_palette;
+                if self.state.show_cmd_palette {
+                    self.state.close_transient_popovers();
+                }
             }
             if cmd && i.key_pressed(egui::Key::Comma) {
                 if self.state.show_settings_modal {
@@ -420,8 +424,7 @@ impl CinderApp {
             }
             if i.key_pressed(egui::Key::Escape) {
                 self.state.show_cmd_palette = false;
-                self.state.show_status_popover = false;
-                self.state.show_downloads_popover = false;
+                self.state.close_transient_popovers();
                 self.state.show_settings_modal = false;
                 self.state.dragging_explorer_item = None;
             }

@@ -1,6 +1,6 @@
 use crate::app_state::{
     decode_base64_simple, fmt_bytes, fmt_rel_age, mode_label, norm_path,
-    resolve_model_display_name, GuiState, PromptModal, SelectableModel, StageTab,
+    resolve_model_display_name, GuiState, PromptModal, SelectableModel, SettingsTab, StageTab,
 };
 use crate::backend::{BackendHandle, FolderPickTarget};
 use crate::icons::{draw_icon, icon_button, Icon};
@@ -367,7 +367,7 @@ pub fn render_chat_column(
                     ui.add_space(4.0);
                 }
 
-                if state.is_generating || snap.live_activity.active {
+                if state.is_busy() {
                     Frame::new()
                         .fill(p.bg_elev)
                         .stroke(animated_working_stroke(ui, p))
@@ -391,6 +391,7 @@ pub fn render_chat_column(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         if danger_button(ui, p, "Stop").clicked() {
+                                            state.is_generating = false;
                                             backend.abort_turn();
                                         }
                                     },
@@ -463,7 +464,7 @@ pub fn render_chat_column(
     let stream_max_h = ui.available_height().max(120.0);
 
     let mut hero_clicked_prompt: Option<String> = None;
-    if !has_messages && !state.is_generating && !snap.live_activity.active {
+    if !has_messages && !state.is_busy() {
         // Calm minimal empty state
         egui::ScrollArea::vertical()
             .id_salt("home_hero_scroll")
@@ -613,15 +614,15 @@ pub fn render_chat_column(
             });
     } else {
         // Editorial Scrollable Message Stream
+        let busy = state.is_busy();
         egui::ScrollArea::vertical()
             .id_salt(("chat_stream_scroll", &sess.id))
             .max_height(stream_max_h)
             .auto_shrink([false, false])
-            .stick_to_bottom(state.is_generating || snap.live_activity.active)
+            .stick_to_bottom(busy)
             .show(ui, |ui| {
                 ui.add_space(14.0);
                 with_centered_column(ui, panel_w, col_w, |ui| {
-                    let busy = state.is_generating || snap.live_activity.active;
                     for (msg_idx, msg) in sess.messages.iter().enumerate() {
                         ui.push_id(&msg.id, |ui| {
                             let is_user = msg.role == "user";
@@ -1033,7 +1034,7 @@ pub fn render_chat_column(
                     }
 
                     // Live streaming turn preview (tokens + thought trace + completed tool steps)
-                    let live_for_this_sess = (state.is_generating || snap.live_activity.active)
+                    let live_for_this_sess = state.is_busy()
                         && snap
                             .live_activity
                             .session_id
@@ -1639,12 +1640,14 @@ fn render_composer(
                         .map(|m| format!("{} ({})\n{}", m.canonical_name, m.id, m.quota_tooltip))
                         .unwrap_or_else(|| "Select reasoning mode & active model".to_string());
                     if trig_resp.on_hover_text(trig_tip).clicked() {
-                        state.show_model_popover = !state.show_model_popover;
+                        let next = !state.show_model_popover;
+                        state.close_transient_popovers();
+                        state.show_model_popover = next;
                     }
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let is_gen = state.is_generating || snap.live_activity.active;
+                    let is_gen = state.is_busy();
                     let can_send = !state.prompt_text.trim().is_empty()
                         || !state.attached_files.is_empty()
                         || !state.attached_media.is_empty();
@@ -1652,6 +1655,7 @@ fn render_composer(
                     let send_resp = send_glow_button(ui, p, is_gen, can_send);
                     if is_gen {
                         if send_resp.on_hover_text("Stop Generation").clicked() {
+                            state.is_generating = false;
                             backend.abort_turn();
                         }
                     } else if (send_resp.clicked() || want_send) && can_send {
@@ -1854,7 +1858,7 @@ fn render_composer(
                             );
                             ui.add_space(8.0);
 
-                            // Models header + inline category filter
+                            // Models header + contextual Aliases link + inline category filter
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new("Models")
@@ -1862,6 +1866,16 @@ fn render_composer(
                                         .strong()
                                         .color(p.text),
                                 );
+                                if ghost_button(
+                                    ui,
+                                    p,
+                                    egui::RichText::new("Aliases →").small().color(p.accent_hot),
+                                )
+                                .on_hover_text("Assign custom model aliases & API keys in Settings")
+                                .clicked()
+                                {
+                                    state.open_settings(SettingsTab::Models);
+                                }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -3073,6 +3087,19 @@ pub(crate) fn format_antigravity_tool_step(
     }
 }
 
+pub(crate) fn window_trace_slice(
+    total: usize,
+    keep_recent: usize,
+    expanded: bool,
+) -> (usize, usize) {
+    if expanded || total <= keep_recent + 1 {
+        (0, 0)
+    } else {
+        let start = total.saturating_sub(keep_recent);
+        (start, start)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_activity_and_thought_trace(
     ui: &mut egui::Ui,
@@ -3154,10 +3181,31 @@ fn render_activity_and_thought_trace(
                         bottom: 2,
                     })
                     .show(ui, |ui| {
-                        // 1. Per-step planning Thought Traces
+                        // 1. Per-step planning Thought Traces (windowed cleanly when long)
                         if !thought_steps.is_empty() {
                             ui.add_space(2.0);
-                            for (sidx, (head, body)) in thought_steps.iter().enumerate() {
+                            let th_exp_id =
+                                ui.make_persistent_id(("trace_thoughts_expanded", scope_id));
+                            let mut th_exp =
+                                ui.data(|d| d.get_temp::<bool>(th_exp_id).unwrap_or(false));
+                            let (th_hidden, th_start) =
+                                window_trace_slice(thought_steps.len(), 3, th_exp);
+                            if thought_steps.len() > 4 {
+                                let toggle_lbl = if th_exp {
+                                    "▾ Show fewer earlier thoughts".to_string()
+                                } else {
+                                    format!("▸ Show {th_hidden} earlier thoughts")
+                                };
+                                if ghost_button(ui, p, egui::RichText::new(toggle_lbl).small())
+                                    .clicked()
+                                {
+                                    th_exp = !th_exp;
+                                    ui.data_mut(|d| d.insert_temp(th_exp_id, th_exp));
+                                }
+                            }
+                            for (sidx, (head, body)) in
+                                thought_steps.iter().enumerate().skip(th_start)
+                            {
                                 Frame::new()
                                     .fill(Color32::TRANSPARENT)
                                     .stroke(Stroke::NONE)
@@ -3213,7 +3261,7 @@ fn render_activity_and_thought_trace(
                             }
                         }
 
-                        // 2. Hierarchical Activity Summary Group
+                        // 2. Hierarchical Activity Summary Group (windowed when long, errors always visible)
                         if !tools.is_empty() {
                             let group_title = summarize_tool_activity_group(tools);
                             egui::CollapsingHeader::new(
@@ -3223,7 +3271,31 @@ fn render_activity_and_thought_trace(
                             .default_open(true)
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 3.0;
+                                let tool_exp_id =
+                                    ui.make_persistent_id(("trace_tools_expanded", scope_id));
+                                let mut tool_exp =
+                                    ui.data(|d| d.get_temp::<bool>(tool_exp_id).unwrap_or(false));
+                                let (_, tool_start) = window_trace_slice(tools.len(), 5, tool_exp);
+                                let hidden_tools = (0..tool_start)
+                                    .filter(|&i| tools[i].status == "completed")
+                                    .count();
+                                if hidden_tools > 0 || (tool_exp && tools.len() > 6) {
+                                    let toggle_lbl = if tool_exp {
+                                        "▾ Show fewer tool steps".to_string()
+                                    } else {
+                                        format!("▸ Show {hidden_tools} earlier tool steps")
+                                    };
+                                    if ghost_button(ui, p, egui::RichText::new(toggle_lbl).small())
+                                        .clicked()
+                                    {
+                                        tool_exp = !tool_exp;
+                                        ui.data_mut(|d| d.insert_temp(tool_exp_id, tool_exp));
+                                    }
+                                }
                                 for (tidx, tc) in tools.iter().enumerate() {
+                                    if tidx < tool_start && tc.status == "completed" {
+                                        continue;
+                                    }
                                     let step_fmt = format_antigravity_tool_step(tc, p);
                                     let det_id =
                                         ui.make_persistent_id(("act_step_open", scope_id, tidx));
@@ -3559,5 +3631,9 @@ mod tests {
         assert_eq!(parsed[0].0, "Step 1 · search for '*.ico'");
         assert_eq!(parsed[0].1, "Searching for the embedded icon.");
         assert_eq!(parsed[1].0, "Step 2 · analyze lib.rs");
+
+        assert_eq!(window_trace_slice(4, 3, false), (0, 0));
+        assert_eq!(window_trace_slice(10, 3, false), (7, 7));
+        assert_eq!(window_trace_slice(10, 3, true), (0, 0));
     }
 }

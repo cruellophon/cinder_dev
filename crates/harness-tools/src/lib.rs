@@ -1178,8 +1178,12 @@ async fn run_shell_command(
         c
     };
     cmd.current_dir(&cwd);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
 
-    let output = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await??;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("Command timed out after 60s and was terminated."))??;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let code = output.status.code().unwrap_or(-1);

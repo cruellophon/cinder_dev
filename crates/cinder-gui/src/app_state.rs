@@ -334,7 +334,6 @@ pub struct GuiState {
     pub rules_draft: String,
     pub rules_dirty: bool,
     pub custom_sys_draft: String,
-    pub orch_steps_draft: String,
     pub kb_stats: Option<IndexStats>,
     pub kb_query: String,
     pub kb_hits: Vec<KnowledgeSearchHit>,
@@ -451,7 +450,6 @@ impl GuiState {
             rules_draft: String::new(),
             rules_dirty: false,
             custom_sys_draft: String::new(),
-            orch_steps_draft: "8".into(),
             kb_stats: None,
             kb_query: String::new(),
             kb_hits: Vec::new(),
@@ -486,9 +484,25 @@ impl GuiState {
         self.toast = Some((msg.into(), is_error, Instant::now()));
     }
 
+    pub fn close_transient_popovers(&mut self) {
+        self.show_model_popover = false;
+        self.show_status_popover = false;
+        self.show_downloads_popover = false;
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.is_generating
+            || self
+                .snap
+                .as_ref()
+                .map(|s| s.live_activity.active)
+                .unwrap_or(false)
+    }
+
     pub fn switch_main_view(&mut self, view: MainView, record_history: bool) {
         self.main_view = view;
         self.show_settings_modal = false;
+        self.close_transient_popovers();
         if record_history {
             let sid = self
                 .snap
@@ -515,6 +529,7 @@ impl GuiState {
     pub fn open_stage_tab(&mut self, tab: StageTab) {
         self.main_view = MainView::Chat;
         self.show_settings_modal = false;
+        self.close_transient_popovers();
         self.stage_tab = tab;
         self.show_workbench = true;
     }
@@ -523,7 +538,7 @@ impl GuiState {
         self.settings_search.clear();
         self.settings_tab = tab;
         self.show_settings_modal = true;
-        self.show_status_popover = false;
+        self.close_transient_popovers();
     }
 
     pub fn navigate_history(&mut self, delta: isize, backend: &Arc<BackendHandle>) {
@@ -550,7 +565,6 @@ impl GuiState {
         self.ctx_size_draft = snap.settings.local_ctx_size.to_string();
         self.ngl_draft = snap.settings.local_gpu_layers.to_string();
         self.idle_mins_draft = snap.settings.idle_unload_minutes.to_string();
-        self.orch_steps_draft = snap.settings.orchestrator.max_autonomous_steps.to_string();
         if self.key_oai_url.is_empty() {
             self.key_oai_url = snap.settings.api_keys.openai_compat_base_url.clone();
         }
@@ -1381,5 +1395,21 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn close_transient_popovers_and_is_busy_consolidate_ui_state() {
+        let mut st = GuiState::new();
+        st.show_model_popover = true;
+        st.show_status_popover = true;
+        st.show_downloads_popover = true;
+        st.close_transient_popovers();
+        assert!(!st.show_model_popover);
+        assert!(!st.show_status_popover);
+        assert!(!st.show_downloads_popover);
+
+        assert!(!st.is_busy());
+        st.is_generating = true;
+        assert!(st.is_busy());
     }
 }

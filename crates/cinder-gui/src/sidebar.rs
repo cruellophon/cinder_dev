@@ -92,9 +92,6 @@ pub fn render_topbar(
                 .clicked()
             {
                 state.switch_main_view(MainView::Chat, true);
-                state.show_settings_modal = false;
-                state.show_status_popover = false;
-                state.show_downloads_popover = false;
             }
 
             ui.menu_button("Cinder", |ui| {
@@ -442,10 +439,9 @@ pub fn render_topbar(
                             .on_hover_text("Toggle Model Downloads manager")
                             .clicked()
                         {
-                            state.show_downloads_popover = !state.show_downloads_popover;
-                            if state.show_downloads_popover {
-                                state.show_status_popover = false;
-                            }
+                            let next = !state.show_downloads_popover;
+                            state.close_transient_popovers();
+                            state.show_downloads_popover = next;
                         }
                     }
 
@@ -1372,7 +1368,9 @@ pub fn render_left_sidebar(
                     .on_hover_text(tip)
                     .clicked()
                 {
-                    state.show_status_popover = !state.show_status_popover;
+                    let next = !state.show_status_popover;
+                    state.close_transient_popovers();
+                    state.show_status_popover = next;
                 }
             });
         },
