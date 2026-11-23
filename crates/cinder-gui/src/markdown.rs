@@ -430,7 +430,60 @@ fn hit_test_galley_link<'a>(
     None
 }
 
-fn render_inline_text(ui: &mut egui::Ui, p: &CinderPalette, text: &str, base_color: Color32) {
+fn append_bold_segment_to_job(
+    job: &mut egui::text::LayoutJob,
+    slice: &str,
+    p: &CinderPalette,
+    bold_font: &egui::FontId,
+    mono_font: &egui::FontId,
+    base_color: Color32,
+) {
+    let chars: Vec<char> = slice.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '`' {
+            if let Some(end_rel) = chars[i + 1..].iter().position(|&c| c == '`') {
+                let code_slice: String = chars[i + 1..i + 1 + end_rel].iter().collect();
+                append_inline_file_badge(job, &code_slice, p, bold_font, base_color);
+                job.append(
+                    &code_slice,
+                    0.0,
+                    egui::TextFormat {
+                        font_id: mono_font.clone(),
+                        color: p.accent_hot,
+                        background: p.bg_card,
+                        ..Default::default()
+                    },
+                );
+                i += end_rel + 2;
+                continue;
+            }
+        }
+        let start = i;
+        i += 1;
+        while i < chars.len() && chars[i] != '`' {
+            i += 1;
+        }
+        let plain: String = chars[start..i].iter().collect();
+        job.append(
+            &plain,
+            0.0,
+            egui::TextFormat {
+                font_id: bold_font.clone(),
+                color: p.text,
+                ..Default::default()
+            },
+        );
+    }
+}
+
+pub(crate) fn build_inline_layout_job(
+    p: &CinderPalette,
+    text: &str,
+    base_color: Color32,
+    max_width: f32,
+    default_bold: bool,
+) -> (egui::text::LayoutJob, Vec<(std::ops::Range<usize>, String)>) {
     let mut job = egui::text::LayoutJob::default();
     let mut links: Vec<(std::ops::Range<usize>, String)> = Vec::new();
     let normal_font = egui::FontId::proportional(p.base_font_size);
@@ -438,6 +491,11 @@ fn render_inline_text(ui: &mut egui::Ui, p: &CinderPalette, text: &str, base_col
         p.base_font_size + 0.2,
         FontFamily::Name("semibold".into()),
     );
+    let body_font = if default_bold {
+        bold_font.clone()
+    } else {
+        normal_font.clone()
+    };
     let mono_font = egui::FontId::monospace((p.base_font_size - 1.0).max(11.0));
 
     let normalized = normalize_inline_latex(text);
@@ -448,7 +506,7 @@ fn render_inline_text(ui: &mut egui::Ui, p: &CinderPalette, text: &str, base_col
         if chars[i] == '`' {
             if let Some(end_rel) = chars[i + 1..].iter().position(|&c| c == '`') {
                 let slice: String = chars[i + 1..i + 1 + end_rel].iter().collect();
-                append_inline_file_badge(&mut job, &slice, p, &normal_font, base_color);
+                append_inline_file_badge(&mut job, &slice, p, &body_font, base_color);
                 job.append(
                     &slice,
                     0.0,
@@ -463,7 +521,7 @@ fn render_inline_text(ui: &mut egui::Ui, p: &CinderPalette, text: &str, base_col
                 continue;
             }
         }
-        // Bold **text**
+        // Bold **text** (including nested `code` spans)
         if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
             let mut end_pos = None;
             let mut j = i + 2;
@@ -476,14 +534,13 @@ fn render_inline_text(ui: &mut egui::Ui, p: &CinderPalette, text: &str, base_col
             }
             if let Some(end) = end_pos {
                 let slice: String = chars[i + 2..end].iter().collect();
-                job.append(
+                append_bold_segment_to_job(
+                    &mut job,
                     &slice,
-                    0.0,
-                    egui::TextFormat {
-                        font_id: bold_font.clone(),
-                        color: p.text,
-                        ..Default::default()
-                    },
+                    p,
+                    &bold_font,
+                    &mono_font,
+                    base_color,
                 );
                 i = end + 2;
                 continue;
@@ -516,7 +573,7 @@ fn render_inline_text(ui: &mut egui::Ui, p: &CinderPalette, text: &str, base_col
                     &slice,
                     0.0,
                     egui::TextFormat {
-                        font_id: normal_font.clone(),
+                        font_id: body_font.clone(),
                         color: base_color,
                         italics: true,
                         ..Default::default()
@@ -559,13 +616,13 @@ fn render_inline_text(ui: &mut egui::Ui, p: &CinderPalette, text: &str, base_col
                         let label: String = chars[i + 1..cb].iter().collect();
                         let url_slice: String = chars[cb + 2..cp].iter().collect();
                         if !label.is_empty() && !url_slice.trim().is_empty() {
-                            append_inline_file_badge(&mut job, &label, p, &normal_font, base_color);
+                            append_inline_file_badge(&mut job, &label, p, &body_font, base_color);
                             let start_c = job.text.chars().count();
                             job.append(
                                 &label,
                                 0.0,
                                 egui::TextFormat {
-                                    font_id: normal_font.clone(),
+                                    font_id: body_font.clone(),
                                     color: p.accent_hot,
                                     underline: Stroke::new(1.0_f32, p.accent_hot),
                                     ..Default::default()
@@ -593,7 +650,7 @@ fn render_inline_text(ui: &mut egui::Ui, p: &CinderPalette, text: &str, base_col
                         &raw_url,
                         0.0,
                         egui::TextFormat {
-                            font_id: normal_font.clone(),
+                            font_id: body_font.clone(),
                             color: p.accent_hot,
                             underline: Stroke::new(1.0_f32, p.accent_hot),
                             ..Default::default()
@@ -621,14 +678,26 @@ fn render_inline_text(ui: &mut egui::Ui, p: &CinderPalette, text: &str, base_col
             &slice,
             0.0,
             egui::TextFormat {
-                font_id: normal_font.clone(),
+                font_id: body_font.clone(),
                 color: base_color,
                 ..Default::default()
             },
         );
     }
 
-    job.wrap.max_width = ui.available_width().max(80.0);
+    job.wrap.max_width = max_width.max(40.0);
+    (job, links)
+}
+
+fn render_inline_text_with_width(
+    ui: &mut egui::Ui,
+    p: &CinderPalette,
+    text: &str,
+    base_color: Color32,
+    max_width: f32,
+    default_bold: bool,
+) {
+    let (job, links) = build_inline_layout_job(p, text, base_color, max_width, default_bold);
     if links.is_empty() {
         ui.add(egui::Label::new(job).wrap().selectable(true));
     } else {
@@ -645,6 +714,10 @@ fn render_inline_text(ui: &mut egui::Ui, p: &CinderPalette, text: &str, base_col
             }
         }
     }
+}
+
+fn render_inline_text(ui: &mut egui::Ui, p: &CinderPalette, text: &str, base_color: Color32) {
+    render_inline_text_with_width(ui, p, text, base_color, ui.available_width().max(80.0), false);
 }
 
 pub fn render_markdown(
@@ -868,30 +941,227 @@ pub fn render_markdown(
                 ui.data_mut(|d| d.insert_temp(size_id, (cur_h, user_resized)));
             }
             MdBlock::Table { headers, rows } => {
+                let table_avail_w = ui.available_width().max(260.0);
+                let col_widths =
+                    compute_table_column_widths(&headers, &rows, (table_avail_w - 2.0).max(220.0));
+                let ncols = col_widths.len();
+                let total_table_w: f32 = col_widths.iter().sum();
+
+                ui.add_space(4.0);
                 egui::ScrollArea::horizontal()
                     .id_salt(("md_tbl", idx))
                     .show(ui, |ui| {
-                        egui::Grid::new(("md_grid", idx))
-                            .striped(true)
-                            .spacing([12.0, 4.0])
+                        Frame::new()
+                            .fill(p.bg_elev)
+                            .stroke(Stroke::new(1.0_f32, p.border))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::ZERO)
                             .show(ui, |ui| {
-                                for h in &headers {
-                                    ui.label(egui::RichText::new(h).strong().color(p.accent_hot));
-                                }
-                                ui.end_row();
-                                for r in &rows {
-                                    for c in r {
-                                        render_inline_text(ui, p, c, p.text);
+                                ui.set_width(total_table_w);
+                                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+
+                                // Header row
+                                let hdr_resp = Frame::new()
+                                    .fill(p.bg_card)
+                                    .inner_margin(Margin::ZERO)
+                                    .show(ui, |ui| {
+                                        ui.set_width(total_table_w);
+                                        ui.horizontal_top(|ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                            for (c_idx, &col_w) in col_widths.iter().enumerate() {
+                                                let h_txt = headers
+                                                    .get(c_idx)
+                                                    .map(String::as_str)
+                                                    .unwrap_or("");
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(col_w, 0.0),
+                                                    egui::Layout::top_down(egui::Align::Min),
+                                                    |ui| {
+                                                        ui.set_min_width(col_w);
+                                                        ui.set_max_width(col_w);
+                                                        Frame::new()
+                                                            .inner_margin(Margin::symmetric(10, 7))
+                                                            .show(ui, |ui| {
+                                                                let inner_w = (col_w - 20.0).max(40.0);
+                                                                render_inline_text_with_width(
+                                                                    ui,
+                                                                    p,
+                                                                    h_txt,
+                                                                    p.accent_hot,
+                                                                    inner_w,
+                                                                    true,
+                                                                );
+                                                            });
+                                                    },
+                                                );
+                                            }
+                                        });
+                                    })
+                                    .response;
+                                let hdr_rect = hdr_resp.rect;
+                                paint_table_column_hairlines(
+                                    ui.painter(),
+                                    hdr_rect,
+                                    &col_widths,
+                                    p.border,
+                                );
+                                ui.painter().hline(
+                                    hdr_rect.x_range(),
+                                    hdr_rect.bottom(),
+                                    Stroke::new(1.0_f32, p.border_strong),
+                                );
+
+                                // Body rows
+                                let stripe_bg = Color32::from_rgba_unmultiplied(
+                                    p.bg_card.r(),
+                                    p.bg_card.g(),
+                                    p.bg_card.b(),
+                                    110,
+                                );
+                                let row_count = rows.len();
+                                for (r_idx, r) in rows.iter().enumerate() {
+                                    let row_fill = if r_idx % 2 == 1 {
+                                        stripe_bg
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    };
+                                    let row_resp = Frame::new()
+                                        .fill(row_fill)
+                                        .inner_margin(Margin::ZERO)
+                                        .show(ui, |ui| {
+                                            ui.set_width(total_table_w);
+                                            ui.horizontal_top(|ui| {
+                                                ui.spacing_mut().item_spacing =
+                                                    egui::vec2(0.0, 0.0);
+                                                for c_idx in 0..ncols {
+                                                    let col_w = col_widths[c_idx];
+                                                    let cell_txt = r
+                                                        .get(c_idx)
+                                                        .map(String::as_str)
+                                                        .unwrap_or("");
+                                                    ui.allocate_ui_with_layout(
+                                                        egui::vec2(col_w, 0.0),
+                                                        egui::Layout::top_down(egui::Align::Min),
+                                                        |ui| {
+                                                            ui.set_min_width(col_w);
+                                                            ui.set_max_width(col_w);
+                                                            Frame::new()
+                                                                .inner_margin(Margin::symmetric(
+                                                                    10, 6,
+                                                                ))
+                                                                .show(ui, |ui| {
+                                                                    let inner_w =
+                                                                        (col_w - 20.0).max(40.0);
+                                                                    render_inline_text_with_width(
+                                                                        ui,
+                                                                        p,
+                                                                        cell_txt,
+                                                                        p.text,
+                                                                        inner_w,
+                                                                        false,
+                                                                    );
+                                                                });
+                                                        },
+                                                    );
+                                                }
+                                            });
+                                        })
+                                        .response;
+                                    let rr = row_resp.rect;
+                                    paint_table_column_hairlines(
+                                        ui.painter(),
+                                        rr,
+                                        &col_widths,
+                                        p.border,
+                                    );
+                                    if r_idx + 1 < row_count {
+                                        ui.painter().hline(
+                                            rr.x_range(),
+                                            rr.bottom(),
+                                            Stroke::new(1.0_f32, p.border),
+                                        );
                                     }
-                                    ui.end_row();
                                 }
                             });
                     });
+                ui.add_space(4.0);
             }
             MdBlock::Rule => {
                 ui.add(egui::Separator::default());
             }
         });
+    }
+}
+
+pub(crate) fn compute_table_column_widths(
+    headers: &[String],
+    rows: &[Vec<String>],
+    avail_w: f32,
+) -> Vec<f32> {
+    let ncols = headers
+        .len()
+        .max(rows.iter().map(|r| r.len()).max().unwrap_or(0))
+        .max(1);
+    let min_col_w = if ncols <= 4 { 130.0_f32 } else { 110.0_f32 };
+
+    let mut scores = Vec::with_capacity(ncols);
+    for c in 0..ncols {
+        let h_len = headers
+            .get(c)
+            .map(|s| s.trim().chars().count())
+            .unwrap_or(4);
+        let mut sum_len = 0usize;
+        let mut count = 0usize;
+        let mut max_len = h_len;
+        for r in rows {
+            if let Some(cell) = r.get(c) {
+                let len = cell.trim().chars().count();
+                sum_len += len;
+                count += 1;
+                max_len = max_len.max(len);
+            }
+        }
+        let avg_len = if count > 0 {
+            sum_len as f32 / count as f32
+        } else {
+            h_len as f32
+        };
+        let raw_score =
+            (h_len as f32 * 0.6).max(6.0) + (avg_len * 0.9 + (max_len.min(60) as f32) * 0.3);
+        scores.push(raw_score.clamp(10.0, 64.0));
+    }
+
+    let min_total = min_col_w * ncols as f32;
+    if avail_w <= min_total {
+        return vec![min_col_w; ncols];
+    }
+
+    let extra_w = avail_w - min_total;
+    let excess_weights: Vec<f32> = scores.iter().map(|s| (*s - 9.0).max(2.0)).collect();
+    let weight_sum: f32 = excess_weights.iter().sum::<f32>().max(1.0);
+
+    let mut widths: Vec<f32> = excess_weights
+        .iter()
+        .map(|w| (min_col_w + extra_w * (*w / weight_sum)).floor())
+        .collect();
+    let used: f32 = widths.iter().sum();
+    if let Some(last) = widths.last_mut() {
+        *last = (*last + (avail_w - used)).max(min_col_w);
+    }
+    widths
+}
+
+fn paint_table_column_hairlines(
+    painter: &egui::Painter,
+    row_rect: egui::Rect,
+    col_widths: &[f32],
+    color: Color32,
+) {
+    let mut x = row_rect.left();
+    let stroke = Stroke::new(1.0_f32, color);
+    for w in col_widths.iter().take(col_widths.len().saturating_sub(1)) {
+        x += *w;
+        painter.vline(x, row_rect.top()..=row_rect.bottom(), stroke);
     }
 }
 
@@ -1371,5 +1641,49 @@ mod tests {
         let end_c = parse_bare_url_end(&chars, start_c).unwrap();
         let url: String = chars[start_c..end_c].iter().collect();
         assert_eq!(url, "https://en.wikipedia.org/wiki/Langlands_program_(math)");
+    }
+
+    #[test]
+    fn table_column_widths_fill_canvas_and_respect_minimums() {
+        let headers = vec![
+            "Capability".to_string(),
+            "Risk".to_string(),
+            "Mitigation".to_string(),
+        ];
+        let rows = vec![vec![
+            "Reading files".to_string(),
+            "May expose secrets (keys, .env, tokens) to the model".to_string(),
+            "Exclude sensitive paths; keep Strict Local mode for private code".to_string(),
+        ]];
+        let widths = compute_table_column_widths(&headers, &rows, 720.0);
+        assert_eq!(widths.len(), 3);
+        let sum: f32 = widths.iter().sum();
+        assert!((sum - 720.0).abs() <= 2.0, "sum={sum}");
+        assert!(widths[0] >= 130.0);
+        assert!(widths[1] > widths[0] && widths[2] > widths[0]);
+
+        // 6 columns in 420px triggers horizontal scroll minimums without crushing words
+        let wide_headers = vec!["A", "B", "C", "D", "E", "F"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let wide_widths = compute_table_column_widths(&wide_headers, &[], 420.0);
+        assert_eq!(wide_widths.len(), 6);
+        assert!(wide_widths.iter().all(|&w| w >= 110.0));
+    }
+
+    #[test]
+    fn bold_spans_render_nested_inline_code_without_literal_backticks() {
+        let p = CinderPalette::from_ui(&harness_store::UiCustomization::default());
+        let (job, _) = build_inline_layout_job(
+            &p,
+            "**Path sandbox (`resolve_workspace_path`):** holds up.",
+            p.text,
+            600.0,
+            false,
+        );
+        assert!(!job.text.contains('`'), "unexpected literal backtick in {:?}", job.text);
+        assert!(job.text.contains("resolve_workspace_path"));
+        assert!(job.sections.len() >= 4);
     }
 }

@@ -830,4 +830,31 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn resolve_workspace_path_blocks_symlinks_pointing_outside_workspace() {
+        let base = std::env::temp_dir().join(format!("cinder_symlink_test_{}", uuid::Uuid::new_v4()));
+        let ws = base.join("ws");
+        let outside_dir = base.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let secret = outside_dir.join("secret.txt");
+        std::fs::write(&secret, "top_secret").unwrap();
+
+        let link = ws.join("escape_link.txt");
+        #[cfg(unix)]
+        let link_res = std::os::unix::fs::symlink(&secret, &link);
+        #[cfg(windows)]
+        let link_res = std::os::windows::fs::symlink_file(&secret, &link);
+
+        // Non-elevated Windows accounts may lack SeCreateSymbolicLinkPrivilege; assert whenever creation succeeds.
+        if link_res.is_ok() {
+            assert!(
+                resolve_workspace_path(&ws, "escape_link.txt").is_err(),
+                "symlink pointing outside workspace must be rejected"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

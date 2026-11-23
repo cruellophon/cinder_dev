@@ -1,4 +1,4 @@
-# Cinder (v5.5)
+# Cinder (v0.5.7-beta)
 
 > A local-first, 100% pure-Rust desktop agentic IDE and GGUF model forge powered by a native `eframe` / `egui` GPU frontend (`cinder-gui`) and modular backend crates — zero Electron, zero WebView bloat, and strict network privacy controls.
 
@@ -85,8 +85,8 @@ cargo build --release --bin cinder
 ```
 
 - **Windows:** Copy standalone executable (`target\release\cinder.exe`) to `release\cinder.exe`.
-- **macOS `.app` bundle:** `bash scripts/bundle-macos-app.sh target/release/cinder dist native 0.5.5`
-- **Linux archive:** `bash scripts/package-linux.sh target/release/cinder dist 0.5.5`
+- **macOS `.app` bundle:** `bash scripts/bundle-macos-app.sh target/release/cinder dist native 0.5.7-beta`
+- **Linux archive:** `bash scripts/package-linux.sh target/release/cinder dist 0.5.7-beta`
 
 ### Runtime Flags & Environment Variables
 - `--open-stage` / `--open-settings` / `--open-forge` / `--open-customizations` — open directly into a specific panel
@@ -96,7 +96,7 @@ cargo build --release --bin cinder
 
 ## Privacy & API Key Storage
 
-Cinder never stores API keys or runtime chat state inside source repositories. All provider keys (`gemini_api_key`, `anthropic_api_key`, `openrouter_api_key`, `openai_compat_api_key`, `huggingface_token`, `brave_search_api_key`), sessions, and preferences are stored strictly inside your local OS application data directory (`%APPDATA%\Cinder\` / `%LOCALAPPDATA%\Project_Bumbo\state.json` on Windows, `~/Library/Application Support/Project_Bumbo/state.json` on macOS, `~/.local/share/Project_Bumbo/state.json` on Linux, or `$CINDER_DATA_DIR`).
+Cinder never stores API keys or runtime chat state inside source repositories. All provider keys (`gemini_api_key`, `anthropic_api_key`, `openrouter_api_key`, `openai_compat_api_key`, `huggingface_token`, `brave_search_api_key`), sessions, and preferences are stored strictly inside your local OS application data directory (`%LOCALAPPDATA%\Project_Bumbo\state.json` on Windows, `~/Library/Application Support/Project_Bumbo/state.json` on macOS, `~/.local/share/Project_Bumbo/state.json` on Linux, or `$CINDER_DATA_DIR`).
 
 See [`SECURITY.md`](SECURITY.md) for details on sandboxing, network gating, and vulnerability reporting, and [`CHANGELOG.md`](CHANGELOG.md) for full release notes.
 
