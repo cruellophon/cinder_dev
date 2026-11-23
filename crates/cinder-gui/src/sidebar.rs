@@ -5,8 +5,9 @@ use crate::app_state::{
 use crate::backend::{BackendHandle, FolderPickTarget};
 use crate::icons::{draw_icon, icon_button, icon_button_enabled, Icon};
 use crate::theme::{
-    copy_to_clipboard, danger_button, draw_cinder_orb_animated, draw_working_indicator,
-    ghost_button, input_frame, nav_row_with_icon, secondary_button, toggle_switch, CinderPalette,
+    copy_to_clipboard, danger_button, draw_cinder_flame, draw_cinder_orb_animated,
+    draw_working_indicator, ghost_button, input_frame, nav_row_with_icon, secondary_button,
+    toggle_switch, CinderPalette,
 };
 use egui::{Color32, CornerRadius, Frame, Margin, Stroke};
 use harness_net::PrivacyMode;
@@ -78,7 +79,7 @@ pub fn render_topbar(
             #[cfg(target_os = "macos")]
             ui.add_space(74.0);
 
-            // Top-left animated Cinder Glowing Orb (version hidden cleanly inside tooltip)
+            // Top-left Cinder Glowing Orb (static at rest for zero idle GPU load, animated when working)
             let (orb_rect, orb_resp) =
                 ui.allocate_exact_size(egui::vec2(26.0, 24.0), egui::Sense::click());
             if orb_resp.hovered() {
@@ -86,7 +87,11 @@ pub fn render_topbar(
                     .rect_filled(orb_rect, CornerRadius::same(6), p.bg_hover);
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            draw_cinder_orb_animated(ui, orb_rect.center(), 9.0, p);
+            if state.is_busy() {
+                draw_cinder_orb_animated(ui, orb_rect.center(), 9.0, p);
+            } else {
+                draw_cinder_flame(ui.painter(), orb_rect.center(), 9.0, p);
+            }
             if orb_resp
                 .on_hover_text("Cinder v5.5 — Local Agentic IDE & Model Forge\nClick to return to Chat")
                 .clicked()
@@ -445,15 +450,24 @@ pub fn render_topbar(
                         }
                     }
 
-                    // Remaining middle bar area: drag window + double-click maximize
+                    // Remaining middle bar area: instant OS window drag + double-click maximize
                     let drag_w = ui.available_width().max(1.0);
-                    let (_drag_rect, drag_resp) =
-                        ui.allocate_exact_size(egui::vec2(drag_w, 24.0), egui::Sense::click_and_drag());
-                    if drag_resp.drag_started_by(egui::PointerButton::Primary) {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                    }
+                    let drag_h = ui.available_height().max(26.0);
+                    let (_drag_rect, drag_resp) = ui.allocate_exact_size(
+                        egui::vec2(drag_w, drag_h),
+                        egui::Sense::click_and_drag(),
+                    );
                     if drag_resp.double_clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                    } else if drag_resp.drag_started_by(egui::PointerButton::Primary)
+                        || (drag_resp.is_pointer_button_down_on()
+                            && ctx.input(|i| {
+                                i.pointer.primary_down()
+                                    && !i.pointer.button_double_clicked(egui::PointerButton::Primary)
+                                    && i.pointer.delta().length_sq() > 0.0
+                            }))
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
                 },
             );

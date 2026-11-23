@@ -231,7 +231,7 @@ impl CinderApp {
             match ev {
                 BackendEvent::FullSnapshot(snap) => {
                     self.state.sync_from_snapshot(&snap);
-                    self.state.snap = Some(*snap);
+                    self.state.snap = Some(Arc::new(*snap));
                 }
                 BackendEvent::LiveTick {
                     live_activity,
@@ -241,7 +241,8 @@ impl CinderApp {
                     privacy_audit,
                     was_downloading_or_installing_finished,
                 } => {
-                    if let Some(ref mut snap) = self.state.snap {
+                    if let Some(ref mut snap_arc) = self.state.snap {
+                        let snap = Arc::make_mut(snap_arc);
                         snap.settings.privacy_mode = privacy_audit.privacy_mode;
                         snap.live_activity = live_activity;
                         snap.downloads = downloads;
@@ -257,7 +258,8 @@ impl CinderApp {
                     self.state.is_generating = false;
                     match res {
                         Ok(sess) => {
-                            if let Some(ref mut snap) = self.state.snap {
+                            if let Some(ref mut snap_arc) = self.state.snap {
+                                let snap = Arc::make_mut(snap_arc);
                                 snap.active_session = Some(sess);
                             }
                         }
@@ -273,7 +275,8 @@ impl CinderApp {
                     attachments,
                 } => {
                     self.state.is_generating = false;
-                    if let Some(ref mut snap) = self.state.snap {
+                    if let Some(ref mut snap_arc) = self.state.snap {
+                        let snap = Arc::make_mut(snap_arc);
                         snap.active_session = Some(session);
                     }
                     if !prompt_text.is_empty()

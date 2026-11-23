@@ -8,8 +8,8 @@ use crate::markdown::{render_diff, render_markdown, render_resizable_text_box};
 use crate::theme::{
     badge, copy_to_clipboard, danger_button, draw_cinder_flame, draw_cinder_orb_animated,
     draw_working_indicator, ghost_button, input_frame, is_copied_recently, mark_copied_feedback,
-    pane_header, primary_button, secondary_button, segmented_control, send_glow_button,
-    CinderPalette,
+    pane_header, primary_button, request_smooth_anim_repaint, secondary_button, segmented_control,
+    send_glow_button, CinderPalette,
 };
 use egui::{Color32, CornerRadius, Frame, Margin, Stroke};
 use harness_store::{AgentMode, PlanStatus};
@@ -66,8 +66,7 @@ fn paint_live_shimmer_bar(ui: &mut egui::Ui, p: &CinderPalette) {
         );
         painter.rect_filled(seg, CornerRadius::same(2), p.accent);
     }
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(50));
+    request_smooth_anim_repaint(ui.ctx());
 }
 
 pub fn render_chat_column(
@@ -90,7 +89,7 @@ pub fn render_chat_column(
 
     state.sync_turn_timer();
     if state.is_busy() {
-        ctx.request_repaint_after(std::time::Duration::from_millis(80));
+        request_smooth_anim_repaint(ctx);
     }
 
     let is_standalone = sess.workspace_path.trim().is_empty();
@@ -491,7 +490,8 @@ pub fn render_chat_column(
         });
 
     if clear_pending_question || clear_pending_approval {
-        if let Some(ref mut snap_mut) = state.snap {
+        if let Some(ref mut snap_arc) = state.snap {
+            let snap_mut = Arc::make_mut(snap_arc);
             if let Some(ref mut active_sess) = snap_mut.active_session {
                 if active_sess.id == sess.id {
                     if clear_pending_question {
@@ -670,8 +670,39 @@ pub fn render_chat_column(
             .show(ui, |ui| {
                 ui.add_space(14.0);
                 with_centered_column(ui, panel_w, col_w, |ui| {
+                    let msg_count = sess.messages.len();
                     for (msg_idx, msg) in sess.messages.iter().enumerate() {
                         ui.push_id(&msg.id, |ui| {
+                            let plan_sig = msg.plan_artifact.as_ref().map(|pa| match pa.status {
+                                PlanStatus::AwaitingReview => 0u8,
+                                PlanStatus::Approved => 1u8,
+                                PlanStatus::Executed => 2u8,
+                                PlanStatus::ChangesRequested => 3u8,
+                            });
+                            let h_id = ui.make_persistent_id((
+                                "chat_msg_h",
+                                &msg.id,
+                                col_w.round() as i32,
+                                (p.base_font_size * 10.0).round() as i32,
+                                msg.content.len(),
+                                msg.tool_calls.len(),
+                                plan_sig,
+                            ));
+                            let is_last_msg = msg_idx + 1 == msg_count;
+                            if !is_last_msg {
+                                if let Some(cached_h) = ui.data(|d| d.get_temp::<f32>(h_id)) {
+                                    let cur_y = ui.cursor().top();
+                                    let clip = ui.clip_rect();
+                                    if cur_y + cached_h < clip.top() - 450.0
+                                        || cur_y > clip.bottom() + 450.0
+                                    {
+                                        ui.allocate_space(egui::vec2(col_w, cached_h));
+                                        ui.add_space(10.0);
+                                        return;
+                                    }
+                                }
+                            }
+
                             let is_user = msg.role == "user";
                             let turn_user_idx = if is_user {
                                 Some(msg_idx)
@@ -701,7 +732,7 @@ pub fn render_chat_column(
                                     .inner_margin(Margin::symmetric(4, 6))
                             };
 
-                            msg_frame.show(ui, |ui| {
+                            let frame_resp = msg_frame.show(ui, |ui| {
                                 ui.set_width(ui.available_width());
 
                                 if !is_user {
@@ -1091,6 +1122,10 @@ pub fn render_chat_column(
                                     );
                                 });
                             });
+                            let measured_h = frame_resp.response.rect.height();
+                            if measured_h > 0.0 {
+                                ui.data_mut(|d| d.insert_temp(h_id, measured_h));
+                            }
 
                             ui.add_space(10.0);
                         });
@@ -1421,6 +1456,10 @@ fn summarize_checkpoints(sess: &harness_store::Session) -> (usize, usize, usize)
     (paths.len(), added, removed)
 }
 
+fn composer_return_key_shortcut() -> egui::KeyboardShortcut {
+    egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_composer(
     ctx: &egui::Context,
@@ -1670,20 +1709,30 @@ fn render_composer(
                 }
             }
 
-            // Borderless multiline prompt input (consume bare Enter before TextEdit so no trailing newline is inserted)
+            // Borderless multiline prompt input:
+            // - Bare Enter sends (or is suppressed when empty)
+            // - Shift+Enter inserts a newline cleanly at the cursor
             let can_send_now = !state.prompt_text.trim().is_empty()
                 || !state.attached_files.is_empty()
                 || !state.attached_media.is_empty();
-            let send_pressed = state.composer_focused
-                && can_send_now
+            let bare_enter = state.composer_focused
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-            let text_resp = ui.add(
-                egui::TextEdit::multiline(&mut state.prompt_text)
-                    .hint_text("Ask Cinder anything...")
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY)
-                    .frame(false),
-            );
+            let send_pressed = bare_enter && can_send_now;
+            let text_resp = egui::ScrollArea::vertical()
+                .id_salt("composer_input_scroll")
+                .max_height(180.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut state.prompt_text)
+                            .hint_text("Ask Cinder anything... (Shift+Enter for new line)")
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .return_key(composer_return_key_shortcut())
+                            .frame(false),
+                    )
+                })
+                .inner;
             state.composer_focused = text_resp.has_focus();
             let want_send = send_pressed && can_send_now;
 
@@ -2632,7 +2681,8 @@ pub(crate) fn dispatch_chat_prompt(
     } else {
         prompt_text.trim().to_string()
     };
-    if let Some(ref mut snap_mut) = state.snap {
+    if let Some(ref mut snap_arc) = state.snap {
+        let snap_mut = Arc::make_mut(snap_arc);
         if let Some(ref mut active_sess) = snap_mut.active_session {
             if active_sess.id == session_id {
                 if active_sess.messages.is_empty() && !send_msg.is_empty() {
@@ -3332,8 +3382,7 @@ fn render_activity_and_thought_trace(
                     );
                     if is_live {
                         draw_working_dots(ui, p);
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_millis(60));
+                        request_smooth_anim_repaint(ui.ctx());
                     }
                 })
                 .response
@@ -3808,5 +3857,10 @@ mod tests {
         assert_eq!(window_trace_slice(4, 3, false), (0, 0));
         assert_eq!(window_trace_slice(10, 3, false), (7, 7));
         assert_eq!(window_trace_slice(10, 3, true), (0, 0));
+
+        assert_eq!(
+            composer_return_key_shortcut(),
+            egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter)
+        );
     }
 }

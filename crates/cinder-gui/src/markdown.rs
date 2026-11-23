@@ -2,6 +2,109 @@ use crate::theme::{
     copy_to_clipboard, ghost_button, is_copied_recently, mark_copied_feedback, CinderPalette,
 };
 use egui::{Color32, CornerRadius, FontFamily, Frame, Margin, Stroke};
+use std::cell::RefCell;
+use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
+#[derive(Clone)]
+struct CachedCodeEntry {
+    code: String,
+    lang: String,
+    wrap_i32: i32,
+    is_light: bool,
+    font_bits: u32,
+    accent: [u8; 4],
+    job: Arc<egui::text::LayoutJob>,
+}
+
+thread_local! {
+    static MD_AST_CACHE: RefCell<HashMap<u64, (String, Arc<Vec<MdBlock>>)>> =
+        RefCell::new(HashMap::with_capacity(128));
+    static CODE_JOB_CACHE: RefCell<HashMap<u64, CachedCodeEntry>> =
+        RefCell::new(HashMap::with_capacity(64));
+}
+
+pub(crate) fn parse_markdown_blocks_cached(text: &str) -> Arc<Vec<MdBlock>> {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    let key = hasher.finish();
+
+    MD_AST_CACHE.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if let Some((raw, blocks)) = map.get(&key) {
+            if raw == text {
+                return Arc::clone(blocks);
+            }
+        }
+        if map.len() >= 512 {
+            map.clear();
+        }
+        let parsed = Arc::new(parse_markdown_blocks(text));
+        map.insert(key, (text.to_string(), Arc::clone(&parsed)));
+        parsed
+    })
+}
+
+pub(crate) fn highlight_code_job_cached(
+    code: &str,
+    lang: &str,
+    p: &CinderPalette,
+    wrap_width: f32,
+) -> Arc<egui::text::LayoutJob> {
+    let wrap_i32 = if wrap_width.is_finite() {
+        wrap_width.round() as i32
+    } else {
+        -1
+    };
+    let font_bits = p.base_font_size.to_bits();
+    let accent = p.accent.to_array();
+
+    let mut hasher = DefaultHasher::new();
+    code.hash(&mut hasher);
+    lang.hash(&mut hasher);
+    wrap_i32.hash(&mut hasher);
+    p.is_light.hash(&mut hasher);
+    font_bits.hash(&mut hasher);
+    accent.hash(&mut hasher);
+    let key = hasher.finish();
+
+    CODE_JOB_CACHE.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if let Some(entry) = map.get(&key) {
+            if entry.wrap_i32 == wrap_i32
+                && entry.is_light == p.is_light
+                && entry.font_bits == font_bits
+                && entry.accent == accent
+                && entry.lang == lang
+                && entry.code == code
+            {
+                return Arc::clone(&entry.job);
+            }
+        }
+        if map.len() >= 256 {
+            map.clear();
+        }
+        let mut job = highlight_code_job(code, lang, p);
+        if wrap_width.is_finite() {
+            job.wrap.max_width = wrap_width;
+        }
+        let arc_job = Arc::new(job);
+        map.insert(
+            key,
+            CachedCodeEntry {
+                code: code.to_string(),
+                lang: lang.to_string(),
+                wrap_i32,
+                is_light: p.is_light,
+                font_bits,
+                accent,
+                job: Arc::clone(&arc_job),
+            },
+        );
+        arc_job
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MdBlock {
@@ -727,11 +830,11 @@ pub fn render_markdown(
     wrap_code: bool,
     _full_message_for_ctx: Option<&str>,
 ) {
-    let blocks = parse_markdown_blocks(text);
-    for (idx, blk) in blocks.into_iter().enumerate() {
+    let blocks = parse_markdown_blocks_cached(text);
+    for (idx, blk) in blocks.iter().enumerate() {
         ui.push_id(idx, |ui| match blk {
             MdBlock::Heading { level, text } => {
-                let sz = match level {
+                let sz = match *level {
                     1 => p.base_font_size + 5.0,
                     2 => p.base_font_size + 3.0,
                     3 => p.base_font_size + 1.5,
@@ -740,7 +843,7 @@ pub fn render_markdown(
                 if idx > 0 {
                     ui.add_space(6.0);
                 }
-                let cleaned = clean_inline_markdown_heading(&text);
+                let cleaned = clean_inline_markdown_heading(text);
                 ui.label(
                     egui::RichText::new(cleaned)
                         .font(egui::FontId::new(
@@ -752,14 +855,14 @@ pub fn render_markdown(
                 ui.add_space(2.0);
             }
             MdBlock::Paragraph(txt) => {
-                render_inline_text(ui, p, &txt, p.text);
+                render_inline_text(ui, p, txt, p.text);
                 ui.add_space(2.0);
             }
             MdBlock::Bullet(txt) => {
                 ui.horizontal_top(|ui| {
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("•").strong().color(p.accent));
-                    render_inline_text(ui, p, &txt, p.text);
+                    render_inline_text(ui, p, txt, p.text);
                 });
             }
             MdBlock::OrderedItem { number, text } => {
@@ -773,15 +876,15 @@ pub fn render_markdown(
                             ))
                             .color(p.accent_hot),
                     );
-                    render_inline_text(ui, p, &text, p.text);
+                    render_inline_text(ui, p, text, p.text);
                 });
             }
             MdBlock::Task { checked, text } => {
                 ui.horizontal_top(|ui| {
-                    let marker = if checked { "[x]" } else { "[ ]" };
-                    let col = if checked { p.green } else { p.amber };
+                    let marker = if *checked { "[x]" } else { "[ ]" };
+                    let col = if *checked { p.green } else { p.amber };
                     ui.label(egui::RichText::new(marker).monospace().strong().color(col));
-                    render_inline_text(ui, p, &text, p.text);
+                    render_inline_text(ui, p, text, p.text);
                 });
             }
             MdBlock::Quote(txt) => {
@@ -791,7 +894,7 @@ pub fn render_markdown(
                     .corner_radius(CornerRadius::same(6))
                     .inner_margin(Margin::symmetric(10, 6))
                     .show(ui, |ui| {
-                        render_inline_text(ui, p, &txt, p.muted);
+                        render_inline_text(ui, p, txt, p.muted);
                     });
             }
             MdBlock::Alert { kind, text } => {
@@ -813,12 +916,11 @@ pub fn render_markdown(
                                 .strong()
                                 .color(border_col),
                         );
-                        render_inline_text(ui, p, &text, p.text);
+                        render_inline_text(ui, p, text, p.text);
                     });
             }
             MdBlock::Code { lang, code } => {
-                let code_clone = code.clone();
-                let copy_id = ui.make_persistent_id(("md_code_copy", idx, &code_clone));
+                let copy_id = ui.make_persistent_id(("md_code_copy", idx, code.as_str()));
                 let line_count = code.lines().count().max(1);
                 let font_size = (p.base_font_size - 1.0).max(11.0);
                 let (default_h, natural_h) =
@@ -856,7 +958,7 @@ pub fn render_markdown(
                                     egui::RichText::new("Copy").small()
                                 };
                                 if ghost_button(ui, p, copy_rt).clicked() {
-                                    copy_to_clipboard(ui.ctx(), &code_clone);
+                                    copy_to_clipboard(ui.ctx(), code);
                                     mark_copied_feedback(ui.ctx(), copy_id);
                                 }
                                 if natural_h > default_h + 8.0 || user_resized {
@@ -881,35 +983,32 @@ pub fn render_markdown(
                             });
                         });
                         ui.separator();
-                        let lang_tag = lang.clone();
-                        if wrap_code {
-                            let mut scroll = egui::ScrollArea::vertical()
-                                .id_salt(("code_v", idx))
-                                .max_height(cur_h);
-                            if user_resized {
-                                scroll = scroll.min_scrolled_height(cur_h);
-                            }
-                            scroll.show(ui, |ui| {
-                                if user_resized {
-                                    ui.set_min_height((cur_h - 6.0).max(40.0));
-                                }
-                                let mut txt = code.clone();
-                                let mut layouter =
-                                    |ui: &egui::Ui, string: &str, wrap_width: f32| {
-                                        let mut j = highlight_code_job(string, &lang_tag, p);
-                                        j.wrap.max_width = wrap_width;
-                                        ui.fonts(|f| f.layout_job(j))
-                                    };
-                                let lay = egui::TextEdit::multiline(&mut txt)
-                                    .id_salt(("code_te", idx))
-                                    .font(egui::TextStyle::Monospace)
-                                    .layouter(&mut layouter)
-                                    .frame(false)
-                                    .desired_width(f32::INFINITY)
-                                    .interactive(true);
-                                let _ = ui.add_enabled(true, |ui: &mut egui::Ui| ui.add(lay));
-                            });
+                        let needs_v_scroll = natural_h > cur_h + 2.0 || user_resized;
+                        let wrap_w = if wrap_code {
+                            ui.available_width().max(120.0)
                         } else {
+                            f32::INFINITY
+                        };
+                        let job = highlight_code_job_cached(code, lang, p, wrap_w);
+
+                        if wrap_code {
+                            if needs_v_scroll {
+                                let mut scroll = egui::ScrollArea::vertical()
+                                    .id_salt(("code_v", idx))
+                                    .max_height(cur_h);
+                                if user_resized {
+                                    scroll = scroll.min_scrolled_height(cur_h);
+                                }
+                                scroll.show(ui, |ui| {
+                                    if user_resized {
+                                        ui.set_min_height((cur_h - 6.0).max(40.0));
+                                    }
+                                    ui.add(egui::Label::new((*job).clone()).wrap().selectable(true));
+                                });
+                            } else {
+                                ui.add(egui::Label::new((*job).clone()).wrap().selectable(true));
+                            }
+                        } else if needs_v_scroll {
                             let mut scroll = egui::ScrollArea::both()
                                 .id_salt(("code_b", idx))
                                 .max_height(cur_h);
@@ -920,9 +1019,14 @@ pub fn render_markdown(
                                 if user_resized {
                                     ui.set_min_height((cur_h - 6.0).max(40.0));
                                 }
-                                let job = highlight_code_job(&code, &lang_tag, p);
-                                ui.add(egui::Label::new(job).selectable(true));
+                                ui.add(egui::Label::new((*job).clone()).selectable(true));
                             });
+                        } else {
+                            egui::ScrollArea::horizontal()
+                                .id_salt(("code_h", idx))
+                                .show(ui, |ui| {
+                                    ui.add(egui::Label::new((*job).clone()).selectable(true));
+                                });
                         }
                         if natural_h > default_h + 8.0 || line_count >= 3 || user_resized {
                             render_vertical_resize_handle(
@@ -943,7 +1047,7 @@ pub fn render_markdown(
             MdBlock::Table { headers, rows } => {
                 let table_avail_w = ui.available_width().max(260.0);
                 let col_widths =
-                    compute_table_column_widths(&headers, &rows, (table_avail_w - 2.0).max(220.0));
+                    compute_table_column_widths(headers, rows, (table_avail_w - 2.0).max(220.0));
                 let ncols = col_widths.len();
                 let total_table_w: f32 = col_widths.iter().sum();
 
@@ -1685,5 +1789,25 @@ mod tests {
         assert!(!job.text.contains('`'), "unexpected literal backtick in {:?}", job.text);
         assert!(job.text.contains("resolve_workspace_path"));
         assert!(job.sections.len() >= 4);
+    }
+
+    #[test]
+    fn markdown_and_code_caches_return_consistent_results() {
+        let md = "# Heading\n\n```rust\nlet x = 42;\nprintln!(\"{x}\");\n```";
+        let a1 = parse_markdown_blocks_cached(md);
+        let a2 = parse_markdown_blocks_cached(md);
+        assert!(Arc::ptr_eq(&a1, &a2), "identical markdown should reuse cached AST");
+        assert_eq!(a1.len(), 2);
+
+        let p = CinderPalette::from_ui(&harness_store::UiCustomization::default());
+        let code = "let x = 42;\nprintln!(\"{x}\");";
+        let j1 = highlight_code_job_cached(code, "rust", &p, 480.0);
+        let j2 = highlight_code_job_cached(code, "rust", &p, 480.0);
+        assert!(Arc::ptr_eq(&j1, &j2), "identical code/wrap/palette should reuse cached LayoutJob");
+        assert_eq!(j1.text, code);
+
+        let j3 = highlight_code_job_cached(code, "rust", &p, 640.0);
+        assert!(!Arc::ptr_eq(&j1, &j3), "different wrap width should rebuild LayoutJob");
+        assert_eq!(j3.text, code);
     }
 }

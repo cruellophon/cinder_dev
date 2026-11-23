@@ -23,6 +23,10 @@ All notable changes to **Cinder** are documented in this file.
   - Added `resolve_workspace_path_blocks_symlinks_pointing_outside_workspace` verifying workspace escape blocking across symlinks.
 
 ### Changed
+- **Smooth Window Dragging, Scrolling & `Shift+Enter` Composer Newlines (`cinder-gui`):**
+  - Eliminated idle 30 Hz GPU/swapbuffer polling on the static topbar brand emblem and upgraded active focus animations to native display VSync cadence (`request_smooth_anim_repaint`) while backing off when unfocused; initiated `ViewportCommand::StartDrag` immediately on pointer movement in the full topbar drag strip.
+  - Tuned global `ScrollStyle` and `line_scroll_speed` (`56.0`) with `reduce_texture_memory = true`, switched `GuiState::snap` to zero-copy `Arc<UiSnapshot>`, added thread-local Markdown AST & syntax-highlighted `LayoutJob` caches, replaced per-frame `TextEdit` code blocks with lightweight selectable labels (only capturing vertical wheel events when overflowed), and added 450px-overscan offscreen culling to the chat stream.
+  - Wired `Shift+Enter` in the chat composer to insert newlines via `.return_key(...)` while bare `Enter` sends, wrapped inside a scrollable auto-growing composer input (up to `180 px`).
 - **Settings Alignment & Save Button Swap (`cinder-gui/src/settings.rs`):**
   - Locked label and status columns (`fixed_label_col` / `fixed_status_col`) so all 6 provider credential rows (including split `OpenAI-Compat` Base URL + API Key inputs) and Orchestrator/Engine controls align evenly.
   - Swapped save button order and colors: **`Save Keys Offline`** (primary orange, left) and **`Save & Live-Probe Models`** (secondary grey, right).

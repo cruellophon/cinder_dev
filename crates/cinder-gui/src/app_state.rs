@@ -236,7 +236,7 @@ pub struct SelectableModel {
 }
 
 pub struct GuiState {
-    pub snap: Option<UiSnapshot>,
+    pub snap: Option<Arc<UiSnapshot>>,
 
     // Layout toggles & resizable widths
     pub show_sidebar: bool,
@@ -521,7 +521,8 @@ impl GuiState {
     }
 
     pub fn approve_active_plan_optimistically(&mut self, session_id: &str) {
-        if let Some(ref mut snap_mut) = self.snap {
+        if let Some(ref mut snap_arc) = self.snap {
+            let snap_mut = Arc::make_mut(snap_arc);
             if let Some(ref mut sess_mut) = snap_mut.active_session {
                 if sess_mut.id == session_id {
                     if let Some(ref mut ap) = sess_mut.active_plan {

@@ -478,6 +478,15 @@ pub fn apply_palette(ctx: &egui::Context, p: &CinderPalette) {
     style.spacing.item_spacing = egui::vec2(7.0, 6.0);
     style.spacing.button_padding = egui::vec2(9.0, 5.0);
     style.spacing.indent = 16.0;
+    let mut scroll = egui::style::ScrollStyle::floating();
+    scroll.bar_width = 8.0;
+    scroll.floating_width = 4.0;
+    scroll.handle_min_length = 28.0;
+    scroll.dormant_handle_opacity = 0.22;
+    scroll.active_handle_opacity = 0.65;
+    scroll.interact_handle_opacity = 0.90;
+    style.spacing.scroll = scroll;
+    style.animation_time = 0.14;
     style.text_styles.insert(
         egui::TextStyle::Body,
         egui::FontId::proportional(p.base_font_size),
@@ -499,6 +508,10 @@ pub fn apply_palette(ctx: &egui::Context, p: &CinderPalette) {
         egui::FontId::proportional(p.base_font_size + 4.5),
     );
     ctx.set_style(style);
+    ctx.options_mut(|o| {
+        o.line_scroll_speed = 56.0;
+        o.reduce_texture_memory = true;
+    });
 }
 
 /// Shared exact `40px` pane header ensuring continuous horizontal divider lines across all panes.
@@ -1228,27 +1241,37 @@ pub fn draw_cinder_flame(painter: &egui::Painter, center: egui::Pos2, r: f32, p:
     }
 }
 
-/// Draw the Cinder glowing orb animated smoothly (~30 FPS) for the hero emblem and top-left brand orb.
+/// Request native VSync frame cadence while focused so active animations glide cleanly,
+/// backing off to 4 Hz when the window is in the background.
+pub fn request_smooth_anim_repaint(ctx: &egui::Context) {
+    if ctx.input(|i| i.focused) {
+        ctx.request_repaint();
+    } else {
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Draw the Cinder glowing orb animated smoothly at native VSync when focused.
 pub fn draw_cinder_orb_animated(
     ui: &mut egui::Ui,
     center: egui::Pos2,
     r: f32,
     p: &CinderPalette,
 ) {
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(33));
+    if ui.ctx().input(|i| i.focused) {
+        ui.ctx().request_repaint();
+    }
     draw_cinder_flame(ui.painter(), center, r, p);
 }
 
-/// Draw a compact animated orbiting-arc & pulsing-core working indicator (~30 FPS).
+/// Draw a compact animated orbiting-arc & pulsing-core working indicator.
 pub fn draw_working_indicator(
     ui: &mut egui::Ui,
     center: egui::Pos2,
     radius: f32,
     p: &CinderPalette,
 ) {
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(33));
+    request_smooth_anim_repaint(ui.ctx());
     let t = ui.input(|i| i.time) as f32;
     let pulse = (t * 3.4).sin() * 0.5 + 0.5;
     let painter = ui.painter();
