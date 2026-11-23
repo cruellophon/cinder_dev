@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "bumbo-app"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "cinder-gui",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "cinder-gui"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1183,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "harness-core"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "harness-models"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "harness-net"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "harness-providers"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1252,7 +1252,7 @@ dependencies = [
 
 [[package]]
 name = "harness-store"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "harness-tools"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",

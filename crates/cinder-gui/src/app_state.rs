@@ -361,7 +361,7 @@ pub struct GuiState {
     pub mcp_transport: String,
     pub mcp_target: String,
 
-    // Automations (v5.0)
+    // Automations
     pub automations: Vec<AutomationPlaybook>,
     pub auto_index_on_workspace_switch: bool,
     pub show_new_automation_form: bool,

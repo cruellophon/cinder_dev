@@ -1,4 +1,4 @@
-# Cinder (v0.5.7-beta)
+# Cinder (v0.6.0)
 
 > A local-first, 100% pure-Rust desktop agentic IDE and GGUF model forge powered by a native `eframe` / `egui` GPU frontend (`cinder-gui`) and modular backend crates — zero Electron, zero WebView bloat, and strict network privacy controls.
 

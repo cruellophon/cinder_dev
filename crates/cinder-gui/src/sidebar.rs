@@ -93,7 +93,10 @@ pub fn render_topbar(
                 draw_cinder_flame(ui.painter(), orb_rect.center(), 9.0, p);
             }
             if orb_resp
-                .on_hover_text("Cinder v5.5 — Local Agentic IDE & Model Forge\nClick to return to Chat")
+                .on_hover_text(format!(
+                    "Cinder v{} — Local Agentic IDE & Model Forge\nClick to return to Chat",
+                    env!("CARGO_PKG_VERSION")
+                ))
                 .clicked()
             {
                 state.switch_main_view(MainView::Chat, true);

@@ -53,7 +53,10 @@ pub fn run_native_cinder_with_launch(opts: CinderLaunchOptions) -> anyhow::Resul
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([1560.0, 960.0])
         .with_min_inner_size([960.0, 640.0])
-        .with_title("Cinder v5.5 — Local Agentic IDE & Model Forge")
+        .with_title(format!(
+            "Cinder v{} — Local Agentic IDE & Model Forge",
+            env!("CARGO_PKG_VERSION")
+        ))
         .with_drag_and_drop(true);
     #[cfg(target_os = "macos")]
     let mut viewport = viewport

@@ -8,7 +8,7 @@ fi
 
 BIN_PATH="$1"
 OUT_DIR="$2"
-RAW_VERSION="${3:-0.5.5}"
+RAW_VERSION="${3:-0.6.0}"
 CLEAN_VERSION="${RAW_VERSION#v}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

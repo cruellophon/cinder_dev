@@ -637,7 +637,7 @@ pub fn render_automations_page(
     pane_header(ui, p, |ui| {
         ui.label(egui::RichText::new("Automations").strong().color(p.text));
         ui.add_space(6.0);
-        badge(ui, "v5.0 Playbooks", p.accent_hot, p.bg_card);
+        badge(ui, "Playbooks", p.accent_hot, p.bg_card);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ghost_button(ui, p, "← Chat").clicked() {

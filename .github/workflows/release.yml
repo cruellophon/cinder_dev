@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish (e.g. beta or v0.5.6)"
+        description: "Release tag to build and publish (e.g. v0.6.0 or beta)"
         required: true
         default: "beta"
 
@@ -125,11 +125,41 @@ jobs:
         run: |
           sha256sum cinder-macos-intel.zip cinder-macos-apple-silicon.zip cinder-linux-x86_64.tar.gz cinder.exe > SHA256SUMS.txt
           cat SHA256SUMS.txt
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          tag = os.environ.get("RELEASE_TAG", "").strip()
+          clean = tag[1:] if tag.startswith("v") else tag
+          with open("CHANGELOG.md", encoding="utf-8") as fh:
+              text = fh.read()
+          sections = re.split(r"(?m)^(?=## \[)", text)
+          matched = None
+          first_release = None
+          for sec in sections:
+              m = re.match(r"^## \[([^\]]+)\]", sec)
+              if not m:
+                  continue
+              if first_release is None:
+                  first_release = sec.strip()
+              sec_ver = m.group(1).strip()
+              if sec_ver.lower() == clean.lower() or sec_ver.lower() == tag.lower():
+                  matched = sec.strip()
+                  break
+          body = matched or first_release or f"Cinder {tag}"
+          body = re.sub(r"\n+---\s*$", "", body).strip() + "\n"
+          os.makedirs("artifacts", exist_ok=True)
+          with open("artifacts/release_notes.md", "w", encoding="utf-8") as fh:
+              fh.write(body)
+          PY
       - name: Publish artifacts to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           name: Cinder ${{ inputs.tag || github.ref_name }}
+          body_path: artifacts/release_notes.md
           generate_release_notes: false
           files: |
             artifacts/cinder-macos-intel.zip

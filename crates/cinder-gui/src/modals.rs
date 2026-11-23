@@ -157,7 +157,7 @@ fn render_command_palette(
             let mut entries: Vec<(String, String, PaletteAction)> = Vec::new();
 
             let static_cmds: Vec<(&str, &'static str)> = vec![
-                ("View", "Automations & Playbooks (v5.0)"),
+                ("View", "Automations & Playbooks"),
                 ("Stage", "Code Editor & Terminal"),
                 ("Stage", "Session Artifacts"),
                 ("Stage", "Workspace Diffs"),
@@ -255,7 +255,7 @@ fn render_command_palette(
             if let Some(action) = triggered_action {
                 match action {
                     PaletteAction::Static(lbl) => match lbl {
-                        "Automations & Playbooks (v5.0)" => {
+                        "Automations & Playbooks" => {
                             state.switch_main_view(MainView::Automations, true)
                         }
                         "Code Editor & Terminal" => state.open_stage_tab(StageTab::Editor),
