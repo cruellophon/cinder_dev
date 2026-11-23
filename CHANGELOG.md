@@ -4,6 +4,53 @@ All notable changes to **Cinder** are documented in this file.
 
 ---
 
+## [0.5.8-beta] — UI Overhaul, Model Aliases, Provider Probing & Security Hardening — 2026-11-23
+
+### Added
+- **Working Model Aliases & Assigned Aliases Ledger (`harness-store`, `cinder-gui/src/settings.rs`):**
+  - Added persisted `AppSettings::model_aliases` (`BTreeMap<String, String>`) and `resolve_model_display_name` so assigned aliases appear consistently across Chat pickers, message footers, compare cards, live turn banners, Orchestrator dropdowns, and Forge tiles.
+  - Rebuilt the bottom section of **Settings → Models & Keys** into **Model Aliases** featuring an active-model dropdown (`ComboBox`), alias text box, `Assign Alias` action, and an **Assigned Aliases Ledger** below with per-row `Remove` buttons (while tucking advanced custom cloud ID registration into a clean collapsible header).
+- **OpenRouter & Multi-Provider Availability / Credit Probing (`harness-providers`, `harness-store/src/usage.rs`):**
+  - Added `requires_payment: bool` to `ModelCatalogEntry` and `ModelQuotaSnapshot`.
+  - Updated `sync_openrouter_models` to check `/api/v1/auth/key`, `/api/v1/credits`, and `/api/v1/models` pricing (`prompt` / `completion` and `:free`), separating free/reachable models from payment-gated models (discovering up to 40 free + 40 paid models cleanly) and classifying HTTP `402` / insufficient-credit errors in `classify_provider_error`.
+  - Added `probe_gemini_model_status` and filtered `SelectableModel` / `build_fallback_candidates` so paid and unreachable models stay hidden from Chat pickers while appearing under dedicated **`Available`**, **`Paid / Credits`**, and **`Unreachable`** tabs in **Forge → Cloud & Quotas** (`Probe All Providers`).
+- **Inline Quota & VRAM Fit Indicators (`cinder-gui/src/chat.rs`, `app_state.rs`):**
+  - Added color-coded daily quota remaining badges (`100%`, `82%`) and local VRAM fit pills (`100% GPU`, `Hybrid GPU`, `CPU Heavy`) directly inside the Chat model trigger pill and right-aligned on every model picker row, with detailed quota/VRAM hover tooltips.
+- **Unified Reusable Model Tile Grid (`cinder-gui/src/forge.rs`):**
+  - Built a shared responsive `render_model_tile` + `model_tile_grid_layout` card component (with concise non-clipping `concise_vram_badge`, progress bar, metadata lines, and pinned action bar) reused across **Local Vault**, **Hugging Face Search Results**, and **Cloud Model Quotas**.
+- **Symlink Sandbox Regression Test (`harness-tools/src/sandbox.rs`):**
+  - Added `resolve_workspace_path_blocks_symlinks_pointing_outside_workspace` verifying workspace escape blocking across symlinks.
+
+### Changed
+- **Settings Alignment & Save Button Swap (`cinder-gui/src/settings.rs`):**
+  - Locked label and status columns (`fixed_label_col` / `fixed_status_col`) so all 6 provider credential rows (including split `OpenAI-Compat` Base URL + API Key inputs) and Orchestrator/Engine controls align evenly.
+  - Swapped save button order and colors: **`Save Keys Offline`** (primary orange, left) and **`Save & Live-Probe Models`** (secondary grey, right).
+- **Chat Mode/Model Popover & Turn-Only Working Counter (`cinder-gui/src/chat.rs`, `harness-core/src/lib.rs`):**
+  - Replaced the downward-clipping `menu_button` with a custom `egui::Area` popover opening above the composer and to the left with streamlined rows and single-line model entries.
+  - Replaced `step X/Y` step ceilings in live working indicators and trace headers with turn-only counters (`Turn N`).
+- **Markdown Table Layout Overhaul (`cinder-gui/src/markdown.rs`):**
+  - Replaced unconstrained `egui::Grid` tables with `compute_table_column_widths` and bordered, striped card tables enforcing readable minimum column widths (`130 px` / `110 px`) and proportional full-width wrapping so words no longer break mid-word.
+- **Dead Code & WebView Cleanup (`ecbacde`):**
+  - Removed the legacy Axum/HTML/WebView stack and unused Rust helpers (`-9,316` lines), reducing `cinder.exe` size from ~39.2 MB to ~33.5 MB.
+
+### Fixed
+- **Nested Backticks Inside Bold Markdown (`cinder-gui/src/markdown.rs`):** Fixed `**bold (`code`)**` inline spans rendering literal backticks instead of styled monospace pills.
+- **Shell Command Risk Classifier Hardening (`harness-tools/src/risk.rs`):** Replaced prefix-based safe command matching (which previously allowed prefix collisions such as `dir`/`dirty-script` and `ls`/`lsof`) with exact parsed-token allowlisting (`tokenize_shell_command`), closed metacharacter/chaining gaps (`|`, `&`, `\n`, `\r`, `<`, `${`), and expanded `HighRiskDestructive` coverage for PowerShell/.NET calls (`iex`, `Invoke-Expression`, `[IO.Directory]::Delete`, etc.).
+- **Security & Documentation Consistency (`SECURITY.md`, `README.md`):** Aligned OS state paths (`%LOCALAPPDATA%\Project_Bumbo\state.json`), version headings, and shell execution scope notes.
+
+---
+
+## [0.5.7-beta] — Exclusive Privacy Toggle, `fetch_url` & Research Sub-Agent — 2026-11-22
+
+### Added
+- **`fetch_url` Tool & Web Search Enrichment (`harness-tools/src/lib.rs`):** Added SSRF-safe `fetch_url` with GitHub API release/repo fast-path mapping, HTML-to-readable-text extraction, and automatic top-result fetching in `web_search`.
+
+### Fixed
+- **Exclusive Local ↔ Hybrid Privacy Toggle (`cinder-gui/src/sidebar.rs`, `harness-models`):** Removed silent `StrictLocal` auto-switching when starting local models and duplicate GUI toggles, making the bottom-left **System & Forge Telemetry** popover the sole user control over Local ↔ Hybrid mode.
+- **Research Sub-Agent Guardrails (`harness-core/src/subagent.rs`):** Hardened research delegation output rules so delegated web lookups never fabricate or alter URLs.
+
+---
+
 ## [0.5.6-beta] — Cross-Platform macOS & Linux Support — 2026-11-22
 
 ### Added
