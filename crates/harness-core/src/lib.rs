@@ -2645,6 +2645,44 @@ pub(crate) async fn execute_tool_with_checkpoint(
         }
     }
 
+    if tool_name == "run_command" || tool_name == "verify_workspace" {
+        let raw_cmd = args["command"]
+            .as_str()
+            .or_else(|| args["cmd"].as_str())
+            .unwrap_or(tool_name)
+            .trim();
+        let cmd_label = if raw_cmd.chars().count() > 72 {
+            let cut: String = raw_cmd.chars().take(71).collect();
+            format!("{cut}…")
+        } else {
+            raw_cmd.to_string()
+        };
+        ctx.store
+            .set_live_tool_output(&cmd_label, "Starting command...")
+            .await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let store_ref = ctx.store;
+        let label_ref = cmd_label.as_str();
+        let (res, _) = tokio::join!(
+            harness_tools::run_shell_command_streaming(workspace_root, args, Some(tx)),
+            async {
+                while let Some(tail) = rx.recv().await {
+                    store_ref.set_live_tool_output(label_ref, &tail).await;
+                }
+            }
+        );
+        ctx.store.clear_live_tool_output().await;
+        return match res {
+            Ok(ok) => ok,
+            Err(e) => ToolExecutionResult {
+                output: format!("Tool error ({tool_name}): {e}"),
+                diff: None,
+                file_path: None,
+                is_error: true,
+            },
+        };
+    }
+
     execute_tool(workspace_root, ctx.gate, brave_key, tool_name, args).await
 }
 

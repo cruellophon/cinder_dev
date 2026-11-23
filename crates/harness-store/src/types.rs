@@ -312,6 +312,10 @@ pub struct LiveActivityStatus {
     pub active_model: String,
     #[serde(default)]
     pub completed_tools: Vec<ToolCallRecord>,
+    #[serde(default)]
+    pub live_tool_name: String,
+    #[serde(default)]
+    pub live_tool_output: String,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -329,6 +333,8 @@ impl Default for LiveActivityStatus {
             base_thinking: String::new(),
             active_model: String::new(),
             completed_tools: Vec::new(),
+            live_tool_name: String::new(),
+            live_tool_output: String::new(),
             updated_at: Utc::now(),
         }
     }

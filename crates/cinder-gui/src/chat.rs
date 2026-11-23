@@ -1318,6 +1318,58 @@ pub fn render_chat_column(
                                     ui.add_space(6.0);
                                 }
 
+                                if !act.live_tool_name.trim().is_empty()
+                                    || !act.live_tool_output.trim().is_empty()
+                                {
+                                    Frame::new()
+                                        .fill(p.bg_sidebar)
+                                        .stroke(Stroke::new(1.0_f32, p.border_strong))
+                                        .corner_radius(CornerRadius::same(8))
+                                        .inner_margin(Margin::symmetric(10, 7))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.horizontal(|ui| {
+                                                badge(ui, "LIVE SHELL", p.accent_hot, p.bg_elev);
+                                                if !act.live_tool_name.trim().is_empty() {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(&act.live_tool_name)
+                                                                .small()
+                                                                .monospace()
+                                                                .color(p.text),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                }
+                                            });
+                                            if !act.live_tool_output.trim().is_empty() {
+                                                ui.add_space(4.0);
+                                                egui::ScrollArea::vertical()
+                                                    .id_salt(("live_shell_scroll", &sess.id))
+                                                    .max_height(150.0)
+                                                    .stick_to_bottom(true)
+                                                    .show(ui, |ui| {
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                egui::RichText::new(
+                                                                    &act.live_tool_output,
+                                                                )
+                                                                .size(
+                                                                    (p.base_font_size - 1.5)
+                                                                        .max(10.5),
+                                                                )
+                                                                .monospace()
+                                                                .color(p.muted),
+                                                            )
+                                                            .wrap()
+                                                            .selectable(true),
+                                                        );
+                                                    });
+                                            }
+                                        });
+                                    ui.add_space(6.0);
+                                }
+
                                 if has_content {
                                     ui.push_id(("live_md", &sess.id), |ui| {
                                         render_markdown(

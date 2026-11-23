@@ -9,6 +9,7 @@ use reqwest::header::{HeaderMap, CONNECTION};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -130,6 +131,7 @@ async fn complete_single(
             ActiveServerBackend::LlamaServer => {
                 match complete_openai_compat(
                     gate,
+                    store,
                     &format!("{endpoint}/v1/chat/completions"),
                     token.as_deref(),
                     &model_name,
@@ -167,6 +169,7 @@ async fn complete_single(
                         }
                         complete_openai_compat(
                             gate,
+                            store,
                             &format!("{next_endpoint}/v1/chat/completions"),
                             next_token.as_deref(),
                             &next_model_name,
@@ -237,6 +240,7 @@ async fn complete_single(
             }
             complete_anthropic(
                 gate,
+                store,
                 &settings.api_keys.anthropic_api_key,
                 effective_cloud_req,
             )
@@ -248,6 +252,7 @@ async fn complete_single(
             }
             complete_openai_compat_with_headers(
                 gate,
+                store,
                 "https://openrouter.ai/api/v1/chat/completions",
                 Some(settings.api_keys.openrouter_api_key.trim()),
                 &effective_cloud_req.model_id,
@@ -264,6 +269,7 @@ async fn complete_single(
             let key = settings.api_keys.openai_compat_api_key.trim();
             complete_openai_compat_with_headers(
                 gate,
+                store,
                 &format!("{base}/chat/completions"),
                 if key.is_empty() { None } else { Some(key) },
                 &effective_cloud_req.model_id,
@@ -929,22 +935,324 @@ async fn complete_ollama_loopback(
     })
 }
 
+#[derive(Debug, Default)]
+struct OpenAiStreamToolAcc {
+    id: String,
+    name: String,
+    arguments_buf: String,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct OpenAiStreamAccumulator {
+    raw_content: String,
+    reasoning_out: String,
+    tools: BTreeMap<usize, OpenAiStreamToolAcc>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    thinking_tokens: u64,
+}
+
+impl OpenAiStreamAccumulator {
+    pub(crate) fn apply_chunk(&mut self, val: &Value) -> bool {
+        let mut updated = false;
+        let delta = &val["choices"][0]["delta"];
+        if let Some(c) = delta["content"].as_str() {
+            if !c.is_empty() {
+                self.raw_content.push_str(c);
+                updated = true;
+            }
+        }
+        if let Some(r) = delta["reasoning_content"]
+            .as_str()
+            .or_else(|| delta["reasoning"].as_str())
+        {
+            if !r.is_empty() {
+                self.reasoning_out.push_str(r);
+                updated = true;
+            }
+        }
+        if let Some(arr) = delta["tool_calls"].as_array() {
+            for (vec_idx, tc) in arr.iter().enumerate() {
+                let idx = tc["index"]
+                    .as_u64()
+                    .map(|n| n as usize)
+                    .unwrap_or(vec_idx);
+                let entry = self.tools.entry(idx).or_default();
+                if let Some(id) = tc["id"].as_str() {
+                    if !id.is_empty() && entry.id.is_empty() {
+                        entry.id = id.to_string();
+                    }
+                }
+                if let Some(name) = tc["function"]["name"].as_str() {
+                    entry.name.push_str(name);
+                    updated = true;
+                }
+                if let Some(args) = tc["function"]["arguments"].as_str() {
+                    entry.arguments_buf.push_str(args);
+                    updated = true;
+                }
+            }
+        }
+        if let Some(pt) = val["usage"]["prompt_tokens"].as_u64() {
+            self.prompt_tokens = pt;
+        }
+        if let Some(ct) = val["usage"]["completion_tokens"].as_u64() {
+            self.completion_tokens = ct;
+        }
+        if let Some(rt) = val["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64() {
+            self.thinking_tokens = rt;
+        }
+        updated
+    }
+
+    pub(crate) fn apply_non_streaming_json(&mut self, val: &Value) {
+        let msg = &val["choices"][0]["message"];
+        if let Some(c) = msg["content"].as_str() {
+            self.raw_content = c.to_string();
+        }
+        if let Some(r) = msg["reasoning_content"]
+            .as_str()
+            .or_else(|| msg["reasoning"].as_str())
+        {
+            self.reasoning_out = r.to_string();
+        }
+        if let Some(arr) = msg["tool_calls"].as_array() {
+            for (idx, tc) in arr.iter().enumerate() {
+                if let Some(name) = tc["function"]["name"].as_str() {
+                    let id = tc["id"]
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| Uuid::new_v4().to_string());
+                    let raw_args = &tc["function"]["arguments"];
+                    let arguments_buf = if let Some(s) = raw_args.as_str() {
+                        s.to_string()
+                    } else if raw_args.is_null() {
+                        "{}".to_string()
+                    } else {
+                        raw_args.to_string()
+                    };
+                    self.tools.insert(
+                        idx,
+                        OpenAiStreamToolAcc {
+                            id,
+                            name: name.to_string(),
+                            arguments_buf,
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(pt) = val["usage"]["prompt_tokens"].as_u64() {
+            self.prompt_tokens = pt;
+        }
+        if let Some(ct) = val["usage"]["completion_tokens"].as_u64() {
+            self.completion_tokens = ct;
+        }
+        if let Some(rt) = val["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64() {
+            self.thinking_tokens = rt;
+        }
+    }
+
+    pub(crate) fn live_deltas(&self) -> (String, String) {
+        let (clean_content, leaked_th) = extract_think_tags_streaming(&self.raw_content);
+        let thought = match (
+            self.reasoning_out.trim().is_empty(),
+            leaked_th.as_deref().map(str::trim),
+        ) {
+            (false, Some(t)) if !t.is_empty() => format!("{}\n\n{t}", self.reasoning_out.trim()),
+            (false, _) => self.reasoning_out.trim().to_string(),
+            (true, Some(t)) => t.to_string(),
+            (true, None) => String::new(),
+        };
+        (thought, clean_content)
+    }
+
+    pub(crate) fn into_response(
+        self,
+        req: &CompletionRequest,
+        latency_ms: u64,
+    ) -> CompletionResponse {
+        let (clean_content, tag_thinking) = extract_think_tags(&self.raw_content);
+        let reasoning_clean = {
+            let trimmed = self.reasoning_out.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
+        let thinking = match (reasoning_clean, tag_thinking) {
+            (Some(r), Some(t)) => Some(format!("{r}\n\n{t}")),
+            (Some(r), None) => Some(r),
+            (None, Some(t)) => Some(t),
+            (None, None) => None,
+        };
+
+        let mut tool_calls: Vec<ToolCallRequest> = self
+            .tools
+            .into_values()
+            .filter(|t| !t.name.trim().is_empty())
+            .map(|t| {
+                let id = if t.id.trim().is_empty() {
+                    Uuid::new_v4().to_string()
+                } else {
+                    t.id
+                };
+                let trimmed = t.arguments_buf.trim();
+                let arguments = if trimmed.is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str(trimmed)
+                        .unwrap_or_else(|_| json!({ "raw": t.arguments_buf }))
+                };
+                ToolCallRequest {
+                    id,
+                    name: t.name,
+                    arguments,
+                    thought_signature: None,
+                }
+            })
+            .collect();
+
+        if tool_calls.is_empty() && !req.tools.is_empty() {
+            tool_calls = extract_fallback_tool_calls(&clean_content);
+        }
+
+        CompletionResponse {
+            content: clean_content,
+            thinking,
+            tool_calls,
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            thinking_tokens: self.thinking_tokens,
+            latency_ms,
+            actual_model_id: req.model_id.clone(),
+            switched_from: None,
+            switch_reason: None,
+        }
+    }
+}
+
+/// Shared SSE stream driver with per-chunk stall timeout, 45ms live-activity delta throttling,
+/// and automatic non-SSE JSON body fallback.
+async fn drive_sse_stream(
+    resp: reqwest::Response,
+    store: &BumboStore,
+    stall_timeout: Duration,
+    label: &str,
+    model_id: &str,
+    mut apply_event: impl FnMut(&Value, &mut String, &mut String) -> bool,
+) -> anyhow::Result<Option<Value>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut raw_body: Vec<u8> = Vec::new();
+    let mut saw_sse_data = false;
+    let mut last_flush = Instant::now();
+    let mut stream = resp.bytes_stream();
+    let mut latest_thought = String::new();
+    let mut latest_text = String::new();
+
+    loop {
+        let next_item = tokio::time::timeout(stall_timeout, stream.next())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "{label} timed out after {}s for model '{model_id}'",
+                    stall_timeout.as_secs()
+                )
+            })?;
+        let Some(chunk) = next_item else {
+            break;
+        };
+        let chunk = chunk?;
+        if !saw_sse_data {
+            raw_body.extend_from_slice(&chunk);
+        }
+        buf.extend_from_slice(&chunk);
+
+        let mut any_delta = false;
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            let trimmed = line.trim();
+            if let Some(data_payload) = trimmed.strip_prefix("data:") {
+                if !saw_sse_data {
+                    saw_sse_data = true;
+                    raw_body.clear();
+                }
+                let json_str = data_payload.trim();
+                if json_str.is_empty() || json_str == "[DONE]" {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<Value>(json_str) {
+                    if apply_event(&val, &mut latest_thought, &mut latest_text) {
+                        any_delta = true;
+                    }
+                }
+            }
+        }
+
+        if any_delta && last_flush.elapsed() >= Duration::from_millis(45) {
+            store
+                .update_activity_deltas(&latest_thought, &latest_text)
+                .await;
+            last_flush = Instant::now();
+        }
+    }
+
+    if !buf.is_empty() {
+        let line = String::from_utf8_lossy(&buf);
+        if let Some(data_payload) = line.trim().strip_prefix("data:") {
+            let json_str = data_payload.trim();
+            if !json_str.is_empty() && json_str != "[DONE]" {
+                saw_sse_data = true;
+                raw_body.clear();
+                if let Ok(val) = serde_json::from_str::<Value>(json_str) {
+                    let _ = apply_event(&val, &mut latest_thought, &mut latest_text);
+                }
+            }
+        }
+    }
+
+    if !saw_sse_data && !raw_body.is_empty() {
+        if let Ok(val) = serde_json::from_slice::<Value>(&raw_body) {
+            return Ok(Some(val));
+        }
+    }
+
+    if saw_sse_data {
+        store
+            .update_activity_deltas(&latest_thought, &latest_text)
+            .await;
+    }
+
+    Ok(None)
+}
+
 async fn complete_openai_compat(
     gate: &NetworkGate,
+    store: &BumboStore,
     url: &str,
     bearer_token: Option<&str>,
     model_name: &str,
     req: &CompletionRequest,
     purpose: &str,
 ) -> anyhow::Result<CompletionResponse> {
-    let (resp, _) =
-        complete_openai_compat_with_headers(gate, url, bearer_token, model_name, req, purpose)
-            .await?;
+    let (resp, _) = complete_openai_compat_with_headers(
+        gate,
+        store,
+        url,
+        bearer_token,
+        model_name,
+        req,
+        purpose,
+    )
+    .await?;
     Ok(resp)
 }
 
 async fn complete_openai_compat_with_headers(
     gate: &NetworkGate,
+    store: &BumboStore,
     url: &str,
     bearer_token: Option<&str>,
     model_name: &str,
@@ -1027,8 +1335,11 @@ async fn complete_openai_compat_with_headers(
         "messages": msgs,
         "temperature": req.temperature,
         "max_tokens": req.max_tokens,
-        "stream": false,
+        "stream": true,
     });
+    if purpose == "openrouter_api" {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
@@ -1041,7 +1352,20 @@ async fn complete_openai_compat_with_headers(
         http_req = http_req.bearer_auth(tok);
     }
 
-    let resp = http_req.send().await?;
+    let stall_timeout = if purpose == "local_inference" {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(45)
+    };
+    let resp = tokio::time::timeout(stall_timeout, http_req.send())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Endpoint {url} request timed out after {}s for model '{}'",
+                stall_timeout.as_secs(),
+                req.model_id
+            )
+        })??;
     let rate_headers = extract_rate_headers(resp.headers());
     let status = resp.status();
     if !status.is_success() {
@@ -1049,59 +1373,32 @@ async fn complete_openai_compat_with_headers(
         anyhow::bail!("Endpoint {url} returned HTTP {status}: {text}");
     }
 
-    let val: Value = resp.json().await?;
-    let msg = &val["choices"][0]["message"];
-    let raw_content = msg["content"].as_str().unwrap_or("").to_string();
-    let reasoning_content = msg["reasoning_content"]
-        .as_str()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let (clean_content, tag_thinking) = extract_think_tags(&raw_content);
-    let thinking = reasoning_content.or(tag_thinking);
-
-    let mut tool_calls = Vec::new();
-    if let Some(arr) = msg["tool_calls"].as_array() {
-        for tc in arr {
-            if let Some(name) = tc["function"]["name"].as_str() {
-                let id = tc["id"]
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| Uuid::new_v4().to_string());
-                let raw_args = &tc["function"]["arguments"];
-                let arguments = if let Some(s) = raw_args.as_str() {
-                    serde_json::from_str(s).unwrap_or_else(|_| json!({ "raw": s }))
-                } else {
-                    raw_args.clone()
-                };
-                tool_calls.push(ToolCallRequest {
-                    id,
-                    name: name.to_string(),
-                    arguments,
-                    thought_signature: None,
-                });
+    let mut acc = OpenAiStreamAccumulator::default();
+    if let Some(non_sse_val) = drive_sse_stream(
+        resp,
+        store,
+        stall_timeout,
+        &format!("Endpoint {url} stream"),
+        &req.model_id,
+        |val, out_th, out_txt| {
+            let changed = acc.apply_chunk(val);
+            if changed {
+                let (th, txt) = acc.live_deltas();
+                *out_th = th;
+                *out_txt = txt;
             }
-        }
-    }
-    if tool_calls.is_empty() && !req.tools.is_empty() {
-        tool_calls = extract_fallback_tool_calls(&clean_content);
+            changed
+        },
+    )
+    .await?
+    {
+        acc.apply_non_streaming_json(&non_sse_val);
+        let (th, txt) = acc.live_deltas();
+        store.update_activity_deltas(&th, &txt).await;
     }
 
     Ok((
-        CompletionResponse {
-            content: clean_content,
-            thinking,
-            tool_calls,
-            prompt_tokens: val["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-            completion_tokens: val["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-            thinking_tokens: val["usage"]["completion_tokens_details"]["reasoning_tokens"]
-                .as_u64()
-                .unwrap_or(0),
-            latency_ms: start.elapsed().as_millis() as u64,
-            actual_model_id: req.model_id.clone(),
-            switched_from: None,
-            switch_reason: None,
-        },
+        acc.into_response(req, start.elapsed().as_millis() as u64),
         rate_headers,
     ))
 }
@@ -1557,8 +1854,218 @@ fn build_anthropic_messages(messages_in: &[ProviderMessage]) -> Vec<Value> {
     messages
 }
 
+#[derive(Debug, Default)]
+struct AnthropicStreamToolAcc {
+    id: String,
+    name: String,
+    input_json_buf: String,
+    initial_input: Value,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AnthropicStreamAccumulator {
+    text_out: String,
+    thought_out: String,
+    tools: BTreeMap<usize, AnthropicStreamToolAcc>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+impl AnthropicStreamAccumulator {
+    pub(crate) fn apply_chunk(&mut self, val: &Value) -> bool {
+        let mut updated = false;
+        match val["type"].as_str().unwrap_or("") {
+            "message_start" => {
+                if let Some(in_tok) = val["message"]["usage"]["input_tokens"].as_u64() {
+                    self.prompt_tokens = in_tok;
+                }
+            }
+            "content_block_start" => {
+                let idx = val["index"].as_u64().unwrap_or(0) as usize;
+                let cb = &val["content_block"];
+                match cb["type"].as_str().unwrap_or("") {
+                    "text" => {
+                        if !self.text_out.is_empty() && !self.text_out.ends_with('\n') {
+                            self.text_out.push('\n');
+                            updated = true;
+                        }
+                        if let Some(t) = cb["text"].as_str() {
+                            if !t.is_empty() {
+                                self.text_out.push_str(t);
+                                updated = true;
+                            }
+                        }
+                    }
+                    "thinking" => {
+                        if let Some(t) = cb["thinking"].as_str() {
+                            if !t.is_empty() {
+                                self.thought_out.push_str(t);
+                                updated = true;
+                            }
+                        }
+                    }
+                    "tool_use" => {
+                        let name = cb["name"].as_str().unwrap_or("").to_string();
+                        let id = cb["id"]
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| Uuid::new_v4().to_string());
+                        let initial_input = if cb["input"].is_object() {
+                            cb["input"].clone()
+                        } else {
+                            json!({})
+                        };
+                        self.tools.insert(
+                            idx,
+                            AnthropicStreamToolAcc {
+                                id,
+                                name,
+                                input_json_buf: String::new(),
+                                initial_input,
+                            },
+                        );
+                        updated = true;
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_delta" => {
+                let idx = val["index"].as_u64().unwrap_or(0) as usize;
+                let delta = &val["delta"];
+                match delta["type"].as_str().unwrap_or("") {
+                    "thinking_delta" => {
+                        if let Some(t) = delta["thinking"].as_str() {
+                            if !t.is_empty() {
+                                self.thought_out.push_str(t);
+                                updated = true;
+                            }
+                        }
+                    }
+                    "text_delta" => {
+                        if let Some(t) = delta["text"].as_str() {
+                            if !t.is_empty() {
+                                self.text_out.push_str(t);
+                                updated = true;
+                            }
+                        }
+                    }
+                    "input_json_delta" => {
+                        if let Some(pj) = delta["partial_json"].as_str() {
+                            self.tools
+                                .entry(idx)
+                                .or_default()
+                                .input_json_buf
+                                .push_str(pj);
+                            updated = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "message_delta" => {
+                if let Some(out_tok) = val["usage"]["output_tokens"].as_u64() {
+                    self.completion_tokens = out_tok;
+                }
+            }
+            _ => {}
+        }
+        updated
+    }
+
+    pub(crate) fn apply_non_streaming_json(&mut self, val: &Value) {
+        if let Some(blocks) = val["content"].as_array() {
+            for (idx, b) in blocks.iter().enumerate() {
+                match b["type"].as_str().unwrap_or("") {
+                    "thinking" => {
+                        if let Some(t) = b["thinking"].as_str() {
+                            self.thought_out.push_str(t);
+                        }
+                    }
+                    "text" => {
+                        if let Some(t) = b["text"].as_str() {
+                            if !self.text_out.is_empty() {
+                                self.text_out.push('\n');
+                            }
+                            self.text_out.push_str(t);
+                        }
+                    }
+                    "tool_use" => {
+                        if let Some(name) = b["name"].as_str() {
+                            self.tools.insert(
+                                idx,
+                                AnthropicStreamToolAcc {
+                                    id: b["id"]
+                                        .as_str()
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                                    name: name.to_string(),
+                                    input_json_buf: String::new(),
+                                    initial_input: b["input"].clone(),
+                                },
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(pt) = val["usage"]["input_tokens"].as_u64() {
+            self.prompt_tokens = pt;
+        }
+        if let Some(ct) = val["usage"]["output_tokens"].as_u64() {
+            self.completion_tokens = ct;
+        }
+    }
+
+    pub(crate) fn into_response(self, model_id: &str, latency_ms: u64) -> CompletionResponse {
+        let tool_calls = self
+            .tools
+            .into_values()
+            .filter(|t| !t.name.trim().is_empty())
+            .map(|t| {
+                let id = if t.id.trim().is_empty() {
+                    Uuid::new_v4().to_string()
+                } else {
+                    t.id
+                };
+                let trimmed = t.input_json_buf.trim();
+                let arguments = if trimmed.is_empty() {
+                    t.initial_input
+                } else {
+                    serde_json::from_str(trimmed)
+                        .unwrap_or_else(|_| json!({ "raw": t.input_json_buf }))
+                };
+                ToolCallRequest {
+                    id,
+                    name: t.name,
+                    arguments,
+                    thought_signature: None,
+                }
+            })
+            .collect();
+
+        CompletionResponse {
+            content: self.text_out,
+            thinking: if self.thought_out.trim().is_empty() {
+                None
+            } else {
+                Some(self.thought_out)
+            },
+            tool_calls,
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            thinking_tokens: 0,
+            latency_ms,
+            actual_model_id: model_id.to_string(),
+            switched_from: None,
+            switch_reason: None,
+        }
+    }
+}
+
 async fn complete_anthropic(
     gate: &NetworkGate,
+    store: &BumboStore,
     api_key: &str,
     req: &CompletionRequest,
 ) -> anyhow::Result<(CompletionResponse, RateHeaders)> {
@@ -1571,6 +2078,7 @@ async fn complete_anthropic(
         "model": req.model_id,
         "max_tokens": req.max_tokens.max(1024),
         "messages": messages,
+        "stream": true,
     });
     if !req.system_prompt.trim().is_empty() {
         body["system"] = Value::String(req.system_prompt.clone());
@@ -1590,13 +2098,20 @@ async fn complete_anthropic(
         body["tools"] = Value::Array(tools);
     }
 
-    let resp = gate
+    let http_req = gate
         .request(Method::POST, url, "anthropic_api")?
         .header("x-api-key", api_key.trim())
         .header("anthropic-version", "2023-06-01")
-        .json(&body)
-        .send()
-        .await?;
+        .json(&body);
+
+    let resp = tokio::time::timeout(Duration::from_secs(45), http_req.send())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Anthropic API request timed out after 45s for model '{}'",
+                req.model_id
+            )
+        })??;
 
     let rate_headers = extract_rate_headers(resp.headers());
     let status = resp.status();
@@ -1605,62 +2120,32 @@ async fn complete_anthropic(
         anyhow::bail!("Anthropic API HTTP {status}: {text}");
     }
 
-    let val: Value = resp.json().await?;
-    let mut text_out = String::new();
-    let mut thought_out = String::new();
-    let mut tool_calls = Vec::new();
-
-    if let Some(blocks) = val["content"].as_array() {
-        for b in blocks {
-            match b["type"].as_str().unwrap_or("") {
-                "thinking" => {
-                    if let Some(t) = b["thinking"].as_str() {
-                        thought_out.push_str(t);
-                    }
-                }
-                "text" => {
-                    if let Some(t) = b["text"].as_str() {
-                        if !text_out.is_empty() {
-                            text_out.push('\n');
-                        }
-                        text_out.push_str(t);
-                    }
-                }
-                "tool_use" => {
-                    if let Some(name) = b["name"].as_str() {
-                        tool_calls.push(ToolCallRequest {
-                            id: b["id"]
-                                .as_str()
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| Uuid::new_v4().to_string()),
-                            name: name.to_string(),
-                            arguments: b["input"].clone(),
-                            thought_signature: None,
-                        });
-                    }
-                }
-                _ => {}
+    let mut acc = AnthropicStreamAccumulator::default();
+    if let Some(non_sse_val) = drive_sse_stream(
+        resp,
+        store,
+        Duration::from_secs(45),
+        "Anthropic API stream",
+        &req.model_id,
+        |val, out_th, out_txt| {
+            let changed = acc.apply_chunk(val);
+            if changed {
+                *out_th = acc.thought_out.clone();
+                *out_txt = acc.text_out.clone();
             }
-        }
+            changed
+        },
+    )
+    .await?
+    {
+        acc.apply_non_streaming_json(&non_sse_val);
+        store
+            .update_activity_deltas(&acc.thought_out, &acc.text_out)
+            .await;
     }
 
     Ok((
-        CompletionResponse {
-            content: text_out,
-            thinking: if thought_out.trim().is_empty() {
-                None
-            } else {
-                Some(thought_out)
-            },
-            tool_calls,
-            prompt_tokens: val["usage"]["input_tokens"].as_u64().unwrap_or(0),
-            completion_tokens: val["usage"]["output_tokens"].as_u64().unwrap_or(0),
-            thinking_tokens: 0,
-            latency_ms: start.elapsed().as_millis() as u64,
-            actual_model_id: req.model_id.clone(),
-            switched_from: None,
-            switch_reason: None,
-        },
+        acc.into_response(&req.model_id, start.elapsed().as_millis() as u64),
         rate_headers,
     ))
 }
@@ -3110,5 +3595,117 @@ mod tests {
         assert!(is_local_transport_error("connection reset by peer"));
         assert!(!is_local_transport_error("HTTP 400 Bad Request"));
         assert!(!is_local_transport_error("context length exceeded"));
+    }
+
+    #[test]
+    fn openai_stream_accumulator_assembles_tokens_reasoning_and_chunked_tool_calls() {
+        let mut acc = OpenAiStreamAccumulator::default();
+        assert!(acc.apply_chunk(&json!({
+            "choices": [{ "delta": { "reasoning_content": "Check files first." } }]
+        })));
+        assert!(acc.apply_chunk(&json!({
+            "choices": [{ "delta": { "content": "<think>Hidden</think>Hello " } }]
+        })));
+        assert!(acc.apply_chunk(&json!({
+            "choices": [{ "delta": { "content": "world" } }]
+        })));
+        assert!(acc.apply_chunk(&json!({
+            "choices": [{ "delta": {
+                "tool_calls": [{ "index": 0, "id": "call_1", "function": { "name": "read_", "arguments": "{\"path\":" } }]
+            }}]
+        })));
+        assert!(acc.apply_chunk(&json!({
+            "choices": [{ "delta": {
+                "tool_calls": [{ "index": 0, "function": { "name": "file", "arguments": "\"Cargo.toml\"}" } }]
+            }}]
+        })));
+        let _ = acc.apply_chunk(&json!({
+            "usage": { "prompt_tokens": 12, "completion_tokens": 9, "completion_tokens_details": { "reasoning_tokens": 4 } }
+        }));
+
+        let (live_th, live_txt) = acc.live_deltas();
+        assert!(live_th.contains("Check files first."));
+        assert!(live_th.contains("Hidden"));
+        assert_eq!(live_txt.trim(), "Hello world");
+
+        let req = CompletionRequest {
+            model_id: "openrouter::demo".into(),
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            enable_thinking: true,
+            max_tokens: 1024,
+            temperature: 0.2,
+        };
+        let resp = acc.into_response(&req, 42);
+        assert_eq!(resp.content.trim(), "Hello world");
+        let th = resp.thinking.expect("should preserve combined reasoning");
+        assert!(th.contains("Check files first."));
+        assert!(th.contains("Hidden"));
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "call_1");
+        assert_eq!(resp.tool_calls[0].name, "read_file");
+        assert_eq!(resp.tool_calls[0].arguments, json!({ "path": "Cargo.toml" }));
+        assert_eq!(resp.prompt_tokens, 12);
+        assert_eq!(resp.completion_tokens, 9);
+        assert_eq!(resp.thinking_tokens, 4);
+    }
+
+    #[test]
+    fn anthropic_stream_accumulator_assembles_thinking_text_and_tool_use_deltas() {
+        let mut acc = AnthropicStreamAccumulator::default();
+        acc.apply_chunk(&json!({
+            "type": "message_start",
+            "message": { "usage": { "input_tokens": 30 } }
+        }));
+        acc.apply_chunk(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "thinking" }
+        }));
+        acc.apply_chunk(&json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "thinking_delta", "thinking": "Step A" }
+        }));
+        acc.apply_chunk(&json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": { "type": "text" }
+        }));
+        acc.apply_chunk(&json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": { "type": "text_delta", "text": "Reading Cargo.toml." }
+        }));
+        acc.apply_chunk(&json!({
+            "type": "content_block_start",
+            "index": 2,
+            "content_block": { "type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {} }
+        }));
+        acc.apply_chunk(&json!({
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": { "type": "input_json_delta", "partial_json": "{\"path\":" }
+        }));
+        acc.apply_chunk(&json!({
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": { "type": "input_json_delta", "partial_json": "\"Cargo.toml\"}" }
+        }));
+        acc.apply_chunk(&json!({
+            "type": "message_delta",
+            "usage": { "output_tokens": 18 }
+        }));
+
+        let resp = acc.into_response("claude-sonnet-4-5", 88);
+        assert_eq!(resp.content, "Reading Cargo.toml.");
+        assert_eq!(resp.thinking.as_deref(), Some("Step A"));
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "toolu_1");
+        assert_eq!(resp.tool_calls[0].name, "read_file");
+        assert_eq!(resp.tool_calls[0].arguments, json!({ "path": "Cargo.toml" }));
+        assert_eq!(resp.prompt_tokens, 30);
+        assert_eq!(resp.completion_tokens, 18);
     }
 }

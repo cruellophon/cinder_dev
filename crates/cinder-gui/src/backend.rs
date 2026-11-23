@@ -217,7 +217,7 @@ impl BackendHandle {
             handle.rt.spawn(async move {
                 let mut had_bg_work = false;
                 loop {
-                    let sleep_ms = if had_bg_work { 100 } else { 320 };
+                    let sleep_ms = if had_bg_work { 50 } else { 320 };
                     tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
                     let act = h.store.get_activity().await;
                     let downloads = h.download_mgr.list_jobs().await;

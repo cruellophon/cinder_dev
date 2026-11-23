@@ -324,8 +324,26 @@ impl BumboStore {
             base_thinking: partial_thinking.to_string(),
             active_model: active_model.to_string(),
             completed_tools: completed_tools.to_vec(),
+            live_tool_name: String::new(),
+            live_tool_output: String::new(),
             updated_at: Utc::now(),
         };
+    }
+
+    pub async fn set_live_tool_output(&self, tool_label: &str, output_tail: &str) {
+        let mut guard = self.live_activity.write().await;
+        if guard.active {
+            guard.live_tool_name = tool_label.to_string();
+            guard.live_tool_output = output_tail.to_string();
+            guard.updated_at = Utc::now();
+        }
+    }
+
+    pub async fn clear_live_tool_output(&self) {
+        let mut guard = self.live_activity.write().await;
+        guard.live_tool_name.clear();
+        guard.live_tool_output.clear();
+        guard.updated_at = Utc::now();
     }
 
     pub async fn update_activity_deltas(&self, partial_thinking: &str, partial_content: &str) {

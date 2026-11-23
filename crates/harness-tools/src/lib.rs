@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use similar::TextDiff;
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncReadExt;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1148,9 +1149,46 @@ fn run_extract_pdf_text(workspace_root: &Path, args: &Value) -> anyhow::Result<T
     })
 }
 
+fn format_tail_utf8_lossy(buf: &[u8], max_bytes: usize) -> String {
+    let mut start = buf.len().saturating_sub(max_bytes);
+    while start < buf.len() && (buf[start] & 0xC0) == 0x80 {
+        start += 1;
+    }
+    String::from_utf8_lossy(&buf[start..]).into_owned()
+}
+
+fn spawn_pipe_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    pipe: Option<R>,
+    is_stderr: bool,
+    tx: tokio::sync::mpsc::UnboundedSender<(bool, Vec<u8>)>,
+) {
+    let Some(mut reader) = pipe else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut chunk = [0u8; 2048];
+        while let Ok(n) = reader.read(&mut chunk).await {
+            if n == 0 {
+                break;
+            }
+            if tx.send((is_stderr, chunk[..n].to_vec())).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 async fn run_shell_command(
     workspace_root: &Path,
     args: &Value,
+) -> anyhow::Result<ToolExecutionResult> {
+    run_shell_command_streaming(workspace_root, args, None).await
+}
+
+pub async fn run_shell_command_streaming(
+    workspace_root: &Path,
+    args: &Value,
+    live_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> anyhow::Result<ToolExecutionResult> {
     if workspace_root.as_os_str().is_empty() || !workspace_root.is_dir() {
         anyhow::bail!(
@@ -1179,14 +1217,72 @@ async fn run_shell_command(
     };
     cmd.current_dir(&cwd);
     cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let output = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
-        .await
-        .map_err(|_| anyhow::anyhow!("Command timed out after 60s and was terminated."))??;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let code = output.status.code().unwrap_or(-1);
+    let mut child = cmd.spawn()?;
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<(bool, Vec<u8>)>();
+    spawn_pipe_reader(child.stdout.take(), false, chunk_tx.clone());
+    spawn_pipe_reader(child.stderr.take(), true, chunk_tx);
+
+    let mut stdout_bytes: Vec<u8> = Vec::new();
+    let mut stderr_bytes: Vec<u8> = Vec::new();
+    let mut live_raw: Vec<u8> = Vec::new();
+    let mut last_flush = std::time::Instant::now();
+    let mut sent_any = false;
+
+    let run_res = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while let Some((is_err, bytes)) = chunk_rx.recv().await {
+            if is_err {
+                stderr_bytes.extend_from_slice(&bytes);
+            } else {
+                stdout_bytes.extend_from_slice(&bytes);
+            }
+            if live_tx.is_some() {
+                live_raw.extend_from_slice(&bytes);
+                if live_raw.len() > 8192 {
+                    let drop_n = live_raw.len() - 4096;
+                    live_raw.drain(..drop_n);
+                }
+                if !sent_any || last_flush.elapsed() >= std::time::Duration::from_millis(80) {
+                    if let Some(ref tx) = live_tx {
+                        let _ = tx.send(format_tail_utf8_lossy(&live_raw, 4000));
+                    }
+                    last_flush = std::time::Instant::now();
+                    sent_any = true;
+                }
+            }
+        }
+        child.wait().await
+    })
+    .await;
+
+    let status = match run_res {
+        Ok(res) => res?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let partial = format_tail_utf8_lossy(&live_raw, 1200);
+            if partial.trim().is_empty() {
+                anyhow::bail!("Command timed out after 60s and was terminated.");
+            } else {
+                anyhow::bail!(
+                    "Command timed out after 60s and was terminated.\nPartial output:\n{partial}"
+                );
+            }
+        }
+    };
+
+    if let Some(tx) = live_tx {
+        if !live_raw.is_empty() {
+            let _ = tx.send(format_tail_utf8_lossy(&live_raw, 4000));
+        }
+    }
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    let code = status.code().unwrap_or(-1);
 
     let mut combined = format!("Exit code: {code}\n");
     if !stdout.trim().is_empty() {
@@ -1212,7 +1308,7 @@ async fn run_shell_command(
         output: combined,
         diff: None,
         file_path: None,
-        is_error: !output.status.success(),
+        is_error: !status.success(),
     })
 }
 
@@ -2373,5 +2469,34 @@ mod upload_tests {
             hits[0].2,
             "Bridge between number theory and representation theory."
         );
+    }
+
+    #[test]
+    fn run_shell_command_streaming_emits_live_chunks_and_captures_exit_code() {
+        let dir = std::env::temp_dir().join(format!("cinder_stream_cmd_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let res = run_shell_command_streaming(
+                &dir,
+                &serde_json::json!({ "command": "echo streaming_hello_cinder" }),
+                Some(tx),
+            )
+            .await
+            .expect("echo command should succeed");
+            assert!(!res.is_error);
+            assert!(res.output.contains("streaming_hello_cinder"));
+
+            let mut received = String::new();
+            while let Ok(chunk) = rx.try_recv() {
+                received.push_str(&chunk);
+            }
+            assert!(
+                received.contains("streaming_hello_cinder"),
+                "expected streamed tail to include stdout, got: {received:?}"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
