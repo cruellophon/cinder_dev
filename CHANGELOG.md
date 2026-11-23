@@ -4,6 +4,37 @@ All notable changes to **Cinder** are documented in this file.
 
 ---
 
+## [0.6.0] — Streaming Everywhere, Git & Terminal Workbench, Model Consistency & Turn-Scoped Fallback — 2026-11-23
+
+### Added
+- **Model Consistency, `FallbackPolicy` & Ordered Fallback Chain (`harness-store`, `harness-providers`, `harness-core`, `cinder-gui`):**
+  - Added 3-way `FallbackPolicy` (`Ask` [**Ask First**, default], `AutoChain` [**Auto-Chain**], and `Strict` [**Never**]) plus a user-configurable **Ordered Fallback Chain** (`AppSettings::fallback_chain`) in **Settings → Models & Keys → Model Routing & Failover**.
+  - Added in-chat **Model Fallback** action card (`Session::pending_fallback` / `PendingModelFallback`) offering `Retry <Model>`, `Continue with <Candidate>`, and `Cancel` without dropping accumulated multi-step tool progress.
+  - Added persistent `Fallback: Orig → Actual` footer badge and one-click `Retry with Orig` action on fallback-completed messages (`ChatMessage::fallback_from_model_id`, `fallback_reason`).
+  - Pinned `PlanArtifact::executor_model_id` across Orchestrator plan review/execution so approved plans execute with the planned model rather than drifting silently.
+- **Git Status & Diff Integration (`harness-tools/src/git.rs`, `cinder-gui/src/{explorer.rs,editor.rs}`):**
+  - Added Git repository status parsing (`branch`, ahead/behind counts, per-file status badges) in the **Explorer** pane and side-by-side/unified Git diff previews in the **Editor**.
+- **Cross-Session & Message Search (`cinder-gui/src/sidebar.rs`):**
+  - Added instant UTF-8-safe sidebar search across conversation titles, workspace paths, and message contents.
+- **Persistent Terminal Working Directory (`cinder-gui/src/{backend.rs,inspector.rs}`):**
+  - Tracked `cwd` across consecutive commands executed inside the Workbench integrated terminal drawer.
+- **Cloud Secret-File Guard (`harness-tools/src/risk.rs`):**
+  - Automatically escalates read/search operations on sensitive credential or key paths (`.env`, `.pem`, `.key`, secrets) for approval when executing under cloud models.
+- **Local `llama-server` Crash Diagnostics & GPU OOM Risk Estimator (`harness-models`, `cinder-gui/src/forge.rs`):**
+  - Added `assess_oom_risk` pre-flight warnings and `llama-server` stderr ring-buffer diagnostics so failed local launches report exact driver/VRAM causes instead of generic connection errors.
+
+### Changed
+- **Turn-Scoped Model Failover & Transient Primary Retry (`harness-providers`, `harness-core`, `orchestrator.rs`, `subagent.rs`):**
+  - Stopped silently mutating `AppSettings::active_model_id` during provider failover or sub-agent routing; fallback switches now apply strictly to the active turn.
+  - Added an automatic single 800ms transient retry on the user's selected cloud model before triggering `NeedsFallbackChoice` or `AutoChain` switching, and enforced strict chain adherence (no unrequested jumps outside a non-empty `fallback_chain`, always filtering `!requires_payment` and required tool/vision capabilities).
+  - Anchored Orchestrator `Auto` planner/executor resolution and `Vision` / `Research` sub-agents to the user's active free cloud model and `fallback_chain` first.
+- **Streaming Everywhere (`harness-tools`, `harness-providers`, `cinder-gui`):**
+  - Streamed live output chunks from `run_command` shell executions, OpenAI-compatible SSE streams, and Anthropic delta accumulators directly into Chat traces.
+- **Single-Source Workspace Versioning & Automated Release Notes (`Cargo.toml`, `.github/workflows/release.yml`, `scripts/`):**
+  - Synchronized workspace crate version (`0.6.0`) via `env!("CARGO_PKG_VERSION")` across UI labels and build scripts, and configured `.github/workflows/release.yml` to extract release notes directly from `CHANGELOG.md`.
+
+---
+
 ## [0.5.8-beta] — UI Overhaul, Model Aliases, Provider Probing & Security Hardening — 2026-11-23
 
 ### Added

@@ -243,7 +243,30 @@ pub struct PlanArtifact {
     pub markdown: String,
     pub status: PlanStatus,
     pub model_id: String,
+    #[serde(default)]
+    pub executor_model_id: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackPolicy {
+    #[default]
+    Ask,
+    AutoChain,
+    Strict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingModelFallback {
+    pub id: String,
+    pub failed_model_id: String,
+    pub error_summary: String,
+    pub reason: String,
+    pub candidates: Vec<String>,
+    pub mode: AgentMode,
+    pub agent_history_json: String,
+    pub step_index: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,6 +434,10 @@ pub struct ChatMessage {
     pub attachments: Vec<MediaAttachment>,
     #[serde(default)]
     pub artifact_id: Option<String>,
+    #[serde(default)]
+    pub fallback_from_model_id: Option<String>,
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -450,6 +477,8 @@ pub struct Session {
     pub active_plan: Option<PlanArtifact>,
     #[serde(default)]
     pub pending_question: Option<PendingUserQuestion>,
+    #[serde(default)]
+    pub pending_fallback: Option<PendingModelFallback>,
     #[serde(default)]
     pub checkpoints: Vec<TurnCheckpoint>,
     #[serde(default)]
@@ -597,6 +626,13 @@ pub struct AppSettings {
     /// (off by default because it loads the GPU without asking).
     #[serde(default)]
     pub fallback_to_local: bool,
+    /// Controls fallback behavior on model failure / rate limits:
+    /// Ask before switching (default), Auto-switch along user's chain, or Strict (never switch).
+    #[serde(default)]
+    pub fallback_policy: FallbackPolicy,
+    /// User-ordered fallback model IDs tried in order when a primary model fails.
+    #[serde(default)]
+    pub fallback_chain: Vec<String>,
     /// User-assigned custom display aliases mapped by model ID.
     #[serde(default)]
     pub model_aliases: std::collections::BTreeMap<String, String>,

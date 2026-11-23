@@ -9,23 +9,24 @@ Repository: <https://github.com/cruellophon/cinder_dev>
 ## Core Capabilities
 
 - **Local-First GGUF Model Forge (`harness-models`):**
-  - Search and inspect Hugging Face GGUF repositories with per-quantization GPU VRAM fit estimation.
-  - Managed local `llama-server` lifecycle with pause/resume chunked downloads, automatic idle VRAM unloading, and support for Ollama, LM Studio, or any OpenAI-compatible local endpoint.
+  - Search and inspect Hugging Face GGUF repositories with per-quantization GPU VRAM fit and OOM risk estimation.
+  - Managed local `llama-server` lifecycle with pause/resume chunked downloads, captured stderr crash diagnostics, automatic idle VRAM unloading, and support for Ollama, LM Studio, or any OpenAI-compatible local endpoint.
 - **Strict Local vs. Hybrid Network Gate (`harness-net`):**
-  - **Strict Local Mode:** Physically blocks non-loopback sockets and logs every loopback/external decision in the live Network Audit trail.
+  - **Strict Local Mode:** Physically blocks non-loopback sockets and logs every loopback/external decision in the live Network Audit trail, alongside a **Cloud Secret-File Guard** that escalates sensitive credential/key reads in Hybrid Mode.
   - **Hybrid Mode:** Enables external cloud APIs (Google Gemini, Anthropic, OpenAI/OpenRouter), live web search, and model/plugin installers when explicitly enabled by the user. Models are strictly prevented from switching network privacy mode.
 - **Multi-Mode Agentic Engine (`harness-core`):**
-  - **`Auto`**, **`Chat`**, **`Plan`**, **`Agent`**, **`Orchestrator`** (dual-model Planner + Executor with **`Auto` Best Planner / Execution Model** selection), and **`Compare`** (side-by-side model evaluation).
-  - Live borderless inline thought traces with animated working indicators, per-step colored file badges, and automatic structured post-work summaries.
+  - **`Auto`**, **`Chat`**, **`Plan`**, **`Agent`**, **`Orchestrator`** (dual-model Planner + Executor anchoring `Auto` selection to your active free cloud model and pinning `PlanArtifact` execution), and **`Compare`** (side-by-side model evaluation).
+  - Turn-scoped **Model Consistency & Fallback Policies** (`Ask First`, `Auto-Chain`, `Never`) with an ordered **Fallback Chain**, automatic single transient primary retry, interactive in-chat fallback prompts, and `Fallback: Orig → Actual` badges with one-click retry — never silently overwriting your active Chat model.
+  - Streaming token output (Gemini, Anthropic, OpenAI-compatible SSE), live streaming shell command output, inline local tool-call parsing (Gemma, Qwen, DeepSeek), borderless thought traces, and structured summaries.
 - **Multimodal Vision & Sub-Agent Delegation (`harness-core/src/subagent.rs`):**
   - Paste screenshots directly via `Ctrl+V` (Win32 `CF_DIB` / `CF_DIBV5` + Explorer file lists) or drag-and-drop images, code files, PDFs, and folders anywhere onto the window.
-  - Dedicated **Vision Sub-Agent** (local `--mmproj` or cloud vision) and **Research Sub-Agent** (automatically delegates to reachable cloud models such as Gemini in Hybrid Mode, with exact delegated model visibility in the UI trace).
+  - Dedicated **Vision Sub-Agent** (local `--mmproj` or free cloud vision) and **Research Sub-Agent** (respecting your active cloud model and ordered fallback chain while filtering paid models).
 - **Live Zero-Key Web Search & Clickable Chat Links:**
   - Multi-tier `web_search` in Hybrid Mode combining Brave Search (if configured), the official Wikipedia MediaWiki API, DuckDuckGo HTML Lite, and Instant Answer fallback — failing honestly instead of fabricating URLs.
   - Interactive Markdown `[label](url)` and bare `https://` links inside Chat, Artifacts, and Markdown previews using scheme-restricted OS launching (`http`, `https`, `mailto`).
 - **Offline Workspace RAG & IDE Workbench (`harness-tools`, `cinder-gui`):**
   - 100% offline PDF text extraction (`lopdf`) and semantic + BM25 workspace indexing.
-  - Workspace File Explorer, syntax-highlighted Code Editor + live Markdown preview, resizable code/diff/artifact boxes, integrated PowerShell/shell terminal drawer, turn checkpoints with per-file accept/revert and rollback, MCP server integration, custom slash skills, and 5 UI themes.
+  - Workspace File Explorer with live Git branch/status indicators and file diffs, syntax-highlighted Code Editor + live Markdown preview, integrated shell terminal drawer with persistent `cwd`, cross-session & message search in the sidebar, turn checkpoints with per-file accept/revert and rollback, MCP server integration, custom slash skills, and 5 UI themes.
 
 ---
 
@@ -85,8 +86,8 @@ cargo build --release --bin cinder
 ```
 
 - **Windows:** Copy standalone executable (`target\release\cinder.exe`) to `release\cinder.exe`.
-- **macOS `.app` bundle:** `bash scripts/bundle-macos-app.sh target/release/cinder dist native 0.5.7-beta`
-- **Linux archive:** `bash scripts/package-linux.sh target/release/cinder dist 0.5.7-beta`
+- **macOS `.app` bundle:** `bash scripts/bundle-macos-app.sh target/release/cinder dist native 0.6.0`
+- **Linux archive:** `bash scripts/package-linux.sh target/release/cinder dist 0.6.0`
 
 ### Runtime Flags & Environment Variables
 - `--open-stage` / `--open-settings` / `--open-forge` / `--open-customizations` — open directly into a specific panel

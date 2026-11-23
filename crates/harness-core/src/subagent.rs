@@ -61,30 +61,77 @@ pub async fn resolve_vision_model(ctx: &HarnessContext<'_>) -> anyhow::Result<St
             {
                 return Ok(configured.to_string());
             }
-        } else if allow_cloud && catalog.iter().any(|c| c.id == configured && c.reachable) {
+        } else if allow_cloud
+            && catalog
+                .iter()
+                .any(|c| c.id == configured && c.reachable && !c.requires_payment)
+        {
             return Ok(configured.to_string());
         }
     }
 
-    // 2. Reuse already-loaded local model when it already has an active --mmproj projector
-    let srv = ctx.server_mgr.server_status().await;
-    if srv.running && srv.has_mmproj {
-        if let Some(ref active_id) = srv.model_id {
+    // 2. Respect the user's active Chat model when it is vision-capable and reachable
+    let active_id = settings.active_model_id.trim();
+    if !active_id.is_empty() {
+        if active_id.starts_with("local::") {
             if ctx
                 .local_models
                 .iter()
-                .any(|m| m.id == *active_id && !m.is_embedding)
+                .any(|m| m.id == active_id && !m.is_embedding && score_local_vision_model(m) >= 2)
             {
-                return Ok(active_id.clone());
+                return Ok(active_id.to_string());
+            }
+        } else if allow_cloud
+            && catalog
+                .iter()
+                .any(|c| c.id == active_id && c.reachable && !c.requires_payment && c.supports_vision)
+        {
+            return Ok(active_id.to_string());
+        }
+    }
+
+    // 3. Reuse already-loaded local model when it already has an active --mmproj projector
+    let srv = ctx.server_mgr.server_status().await;
+    if srv.running && srv.has_mmproj {
+        if let Some(ref loaded_id) = srv.model_id {
+            if ctx
+                .local_models
+                .iter()
+                .any(|m| m.id == *loaded_id && !m.is_embedding)
+            {
+                return Ok(loaded_id.clone());
             }
         }
     }
 
-    // 3. In Hybrid Mode, prefer fast reachable cloud vision models
+    // 4. Consult user's ordered fallback chain for a reachable, free vision-capable model
+    for chain_id in &settings.fallback_chain {
+        let cid = chain_id.trim();
+        if cid.is_empty() {
+            continue;
+        }
+        if cid.starts_with("local::") {
+            if ctx
+                .local_models
+                .iter()
+                .any(|m| m.id == cid && !m.is_embedding && score_local_vision_model(m) > 0)
+            {
+                return Ok(cid.to_string());
+            }
+        } else if allow_cloud
+            && catalog
+                .iter()
+                .any(|c| c.id == cid && c.reachable && !c.requires_payment && c.supports_vision)
+        {
+            return Ok(cid.to_string());
+        }
+    }
+
+    // 5. In Hybrid Mode, prefer fast reachable free cloud vision models
     if allow_cloud {
         let mut cloud_candidates: Vec<_> = catalog
             .iter()
-            .filter(|c| c.reachable && c.supports_vision)
+            .filter(|c| c.reachable && !c.requires_payment && c.supports_vision)
             .collect();
         cloud_candidates.sort_by_key(|c| {
             let l = c.id.to_ascii_lowercase();
@@ -101,7 +148,7 @@ pub async fn resolve_vision_model(ctx: &HarnessContext<'_>) -> anyhow::Result<St
         }
     }
 
-    // 4. Pick best local non-embedding model with mmproj or known multimodal tag
+    // 6. Pick best local non-embedding model with mmproj or known multimodal tag
     let mut local_candidates: Vec<&LocalModelEntry> = ctx
         .local_models
         .iter()
@@ -261,15 +308,30 @@ pub async fn resolve_research_model(
 
         let configured = settings.orchestrator.planner_model_id.trim();
         if !configured.is_empty()
+            && !configured.eq_ignore_ascii_case("auto")
             && !configured.starts_with("local::")
-            && catalog.iter().any(|c| c.id == configured && c.reachable)
+            && catalog
+                .iter()
+                .any(|c| c.id == configured && c.reachable && !c.requires_payment)
         {
             return configured.to_string();
         }
 
+        for chain_id in &settings.fallback_chain {
+            let cid = chain_id.trim();
+            if !cid.is_empty()
+                && !cid.starts_with("local::")
+                && catalog
+                    .iter()
+                    .any(|c| c.id == cid && c.reachable && !c.requires_payment)
+            {
+                return cid.to_string();
+            }
+        }
+
         let mut cloud_candidates: Vec<_> = catalog
             .iter()
-            .filter(|c| c.reachable && !c.id.starts_with("local::"))
+            .filter(|c| c.reachable && !c.requires_payment && !c.id.starts_with("local::"))
             .collect();
         cloud_candidates.sort_by_key(|c| {
             let l = c.id.to_ascii_lowercase();

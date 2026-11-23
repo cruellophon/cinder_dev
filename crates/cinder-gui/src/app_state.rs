@@ -332,6 +332,7 @@ pub struct GuiState {
     pub quotas_filter: QuotasTabFilter,
     pub alias_target_model_id: String,
     pub alias_name_draft: String,
+    pub fallback_chain_add_draft: String,
     pub custom_model_id: String,
     pub custom_model_name: String,
 
@@ -460,6 +461,7 @@ impl GuiState {
             quotas_filter: QuotasTabFilter::Available,
             alias_target_model_id: String::new(),
             alias_name_draft: String::new(),
+            fallback_chain_add_draft: String::new(),
             custom_model_id: String::new(),
             custom_model_name: String::new(),
             plugin_cat_filter: "all".into(),

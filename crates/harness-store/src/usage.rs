@@ -541,6 +541,8 @@ mod tests {
                 ui: UiCustomization::default(),
                 orchestrator: OrchestratorConfig::default(),
                 auto_switch_models: true,
+                fallback_policy: crate::FallbackPolicy::Ask,
+                fallback_chain: Vec::new(),
                 fallback_to_local: false,
                 model_aliases,
             },

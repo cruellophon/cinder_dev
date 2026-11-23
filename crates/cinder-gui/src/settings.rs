@@ -9,6 +9,7 @@ use crate::theme::{
 };
 use egui::{Color32, CornerRadius, Stroke};
 use harness_net::{AuditOutcome, PrivacyMode};
+use harness_store::FallbackPolicy;
 use std::sync::Arc;
 
 pub fn render_settings_rail(ui: &mut egui::Ui, state: &mut GuiState, p: &CinderPalette) {
@@ -624,21 +625,203 @@ fn render_models_section(
                 },
             );
 
-            let mut auto_sw = snap.settings.auto_switch_models;
+            let cur_policy = if !snap.settings.auto_switch_models {
+                FallbackPolicy::Strict
+            } else {
+                snap.settings.fallback_policy
+            };
+            let cur_policy_key = match cur_policy {
+                FallbackPolicy::Ask => "ask",
+                FallbackPolicy::AutoChain => "auto_chain",
+                FallbackPolicy::Strict => "strict",
+            };
             setting_row_item(
                 ui,
                 p,
-                "Auto-switch on 429 or overload",
-                "Automatically fail over to another healthy model when daily quota or RPM limits hit.",
+                "Fallback policy on failure",
+                "Ask before switching models, follow an ordered chain automatically, or fail cleanly without switching.",
                 true,
                 |ui| {
-                    if toggle_switch(ui, p, &mut auto_sw).changed() {
+                    if let Some(next_key) = segmented_control(
+                        ui,
+                        p,
+                        "settings_fallback_policy_seg",
+                        cur_policy_key,
+                        &[
+                            ("ask", "Ask First"),
+                            ("auto_chain", "Auto-Chain"),
+                            ("strict", "Never"),
+                        ],
+                    ) {
+                        let next_policy = match next_key {
+                            "auto_chain" => FallbackPolicy::AutoChain,
+                            "strict" => FallbackPolicy::Strict,
+                            _ => FallbackPolicy::Ask,
+                        };
                         backend.update_settings(move |s| {
-                            s.auto_switch_models = auto_sw;
+                            s.fallback_policy = next_policy;
+                            s.auto_switch_models = next_policy != FallbackPolicy::Strict;
                         });
                     }
                 },
             );
+
+            if cur_policy != FallbackPolicy::Strict {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Ordered Fallback Chain")
+                        .strong()
+                        .color(p.text),
+                );
+                ui.label(
+                    egui::RichText::new(match cur_policy {
+                        FallbackPolicy::Ask => "Ask First lists these models first as quick-continue choices. Leave empty to suggest healthy free models automatically.",
+                        FallbackPolicy::AutoChain => "Auto-Chain tries only these models in order without jumping elsewhere. Leave empty for automatic healthy-model discovery.",
+                        FallbackPolicy::Strict => "",
+                    })
+                    .small()
+                    .color(p.muted),
+                );
+                ui.add_space(6.0);
+
+                if snap.settings.fallback_chain.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No custom fallback chain configured (automatic healthy-model discovery active).")
+                            .small()
+                            .color(p.muted),
+                    );
+                } else {
+                    let chain_len = snap.settings.fallback_chain.len();
+                    let all_models = state.selectable_models(false);
+                    let mut chain_action: Option<(usize, &str)> = None;
+                    for (idx, mid) in snap.settings.fallback_chain.iter().enumerate() {
+                        let display = all_models
+                            .iter()
+                            .find(|m| m.id == *mid)
+                            .map(|m| format!("[{}] {}", m.provider_label, m.canonical_name))
+                            .unwrap_or_else(|| mid.clone());
+                        p.subcard_frame().show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                badge(ui, &format!("#{}", idx + 1), p.amber, p.bg_elev);
+                                ui.vertical(|ui| {
+                                    ui.label(egui::RichText::new(display).strong().color(p.text));
+                                    ui.label(
+                                        egui::RichText::new(mid)
+                                            .monospace()
+                                            .small()
+                                            .color(p.muted),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if secondary_button(ui, p, "×")
+                                            .on_hover_text("Remove from fallback chain")
+                                            .clicked()
+                                        {
+                                            chain_action = Some((idx, "remove"));
+                                        }
+                                        if idx + 1 < chain_len
+                                            && secondary_button(ui, p, "↓")
+                                                .on_hover_text("Move lower")
+                                                .clicked()
+                                        {
+                                            chain_action = Some((idx, "down"));
+                                        }
+                                        if idx > 0
+                                            && secondary_button(ui, p, "↑")
+                                                .on_hover_text("Move higher")
+                                                .clicked()
+                                        {
+                                            chain_action = Some((idx, "up"));
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                        ui.add_space(4.0);
+                    }
+                    if let Some((idx, act)) = chain_action {
+                        backend.update_settings(move |s| {
+                            match act {
+                                "up" if idx > 0 && idx < s.fallback_chain.len() => {
+                                    s.fallback_chain.swap(idx, idx - 1);
+                                }
+                                "down" if idx + 1 < s.fallback_chain.len() => {
+                                    s.fallback_chain.swap(idx, idx + 1);
+                                }
+                                "remove" if idx < s.fallback_chain.len() => {
+                                    s.fallback_chain.remove(idx);
+                                }
+                                _ => {}
+                            }
+                        });
+                    }
+                }
+
+                ui.add_space(4.0);
+                let selectable: Vec<_> = state
+                    .selectable_models(true)
+                    .into_iter()
+                    .filter(|m| !snap.settings.fallback_chain.contains(&m.id))
+                    .collect();
+                if !selectable.is_empty()
+                    && (state.fallback_chain_add_draft.trim().is_empty()
+                        || !selectable
+                            .iter()
+                            .any(|m| m.id == state.fallback_chain_add_draft))
+                {
+                    state.fallback_chain_add_draft = selectable[0].id.clone();
+                } else if selectable.is_empty() {
+                    state.fallback_chain_add_draft.clear();
+                }
+                let add_lbl = selectable
+                    .iter()
+                    .find(|m| m.id == state.fallback_chain_add_draft)
+                    .map(|m| format!("[{}] {}", m.provider_label, m.canonical_name))
+                    .unwrap_or_else(|| "No more models available...".into());
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 7.0;
+                    let combo_w = (ui.available_width() - 138.0).clamp(180.0, 360.0);
+                    egui::ComboBox::from_id_salt("settings_fallback_chain_add_combo")
+                        .selected_text(add_lbl)
+                        .width(combo_w)
+                        .show_ui(ui, |ui| {
+                            for m in &selectable {
+                                let row_lbl = format!("[{}] {}", m.provider_label, m.canonical_name);
+                                if ui
+                                    .selectable_label(state.fallback_chain_add_draft == m.id, row_lbl)
+                                    .clicked()
+                                {
+                                    state.fallback_chain_add_draft = m.id.clone();
+                                }
+                            }
+                        });
+                    let can_add = !state.fallback_chain_add_draft.trim().is_empty()
+                        && selectable
+                            .iter()
+                            .any(|m| m.id == state.fallback_chain_add_draft);
+                    if ui
+                        .add_enabled_ui(can_add, |ui| primary_button(ui, p, "+ Add Fallback"))
+                        .inner
+                        .clicked()
+                    {
+                        let add_id = state.fallback_chain_add_draft.clone();
+                        backend.update_settings(move |s| {
+                            if !s.fallback_chain.contains(&add_id) {
+                                s.fallback_chain.push(add_id);
+                            }
+                        });
+                        state.fallback_chain_add_draft.clear();
+                    }
+                });
+                ui.add_space(6.0);
+                let y = ui.cursor().top();
+                ui.painter()
+                    .hline(ui.max_rect().x_range(), y, Stroke::new(1.0_f32, p.border));
+                ui.add_space(4.0);
+            }
 
             let mut fb_local = snap.settings.fallback_to_local;
             setting_row_item(

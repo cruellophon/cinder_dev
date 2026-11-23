@@ -29,6 +29,8 @@ pub async fn resolve_reachable_model(
     preferred_id: &str,
     fallback_id: &str,
 ) -> anyhow::Result<String> {
+    let settings = ctx.store.snapshot().await.settings;
+    let allow_cloud = ctx.gate.mode() == harness_net::PrivacyMode::Hybrid;
     let (catalog, _) = ctx.store.build_cloud_catalog_and_quotas().await;
     let is_reachable = |id: &str| -> bool {
         if id.starts_with("local::") {
@@ -36,7 +38,10 @@ pub async fn resolve_reachable_model(
                 .iter()
                 .any(|m| m.id == id && !m.is_embedding)
         } else {
-            catalog.iter().any(|c| c.id == id && c.reachable)
+            allow_cloud
+                && catalog
+                    .iter()
+                    .any(|c| c.id == id && c.reachable && !c.requires_payment)
         }
     };
 
@@ -46,31 +51,60 @@ pub async fn resolve_reachable_model(
     if is_reachable(fallback_id) {
         return Ok(fallback_id.to_string());
     }
-    if !preferred_id.starts_with("local::") {
-        if let Some(cloud) = catalog.iter().find(|c| c.reachable) {
+    for chain_id in &settings.fallback_chain {
+        let cid = chain_id.trim();
+        if !cid.is_empty() && is_reachable(cid) {
+            return Ok(cid.to_string());
+        }
+    }
+    if !preferred_id.starts_with("local::") && allow_cloud {
+        if let Some(cloud) = catalog
+            .iter()
+            .find(|c| c.reachable && !c.requires_payment)
+        {
             return Ok(cloud.id.clone());
         }
     }
     if let Some(local) = ctx.local_models.iter().find(|m| !m.is_embedding) {
         return Ok(local.id.clone());
     }
-    if let Some(cloud) = catalog.iter().find(|c| c.reachable) {
-        return Ok(cloud.id.clone());
+    if allow_cloud {
+        if let Some(cloud) = catalog
+            .iter()
+            .find(|c| c.reachable && !c.requires_payment)
+        {
+            return Ok(cloud.id.clone());
+        }
     }
     anyhow::bail!("No reachable local or cloud models found.")
 }
 
-/// Automatically select the strongest reachable Planner model for Orchestrator Auto mode.
+/// Automatically select the strongest reachable Planner model for Orchestrator Auto mode,
+/// anchoring to the user's active cloud Chat model or ordered fallback chain first.
 pub async fn resolve_auto_planner_model(
     ctx: &HarnessContext<'_>,
     active_fallback: &str,
 ) -> anyhow::Result<String> {
     if ctx.gate.mode() == harness_net::PrivacyMode::Hybrid {
+        let settings = ctx.store.snapshot().await.settings;
         let (catalog, _) = ctx.store.build_cloud_catalog_and_quotas().await;
         let mut cloud: Vec<_> = catalog
             .iter()
-            .filter(|c| c.reachable && !c.id.starts_with("local::"))
+            .filter(|c| c.reachable && !c.requires_payment && !c.id.starts_with("local::"))
             .collect();
+
+        if !active_fallback.starts_with("local::")
+            && cloud.iter().any(|c| c.id == active_fallback)
+        {
+            return Ok(active_fallback.to_string());
+        }
+        for chain_id in &settings.fallback_chain {
+            let cid = chain_id.trim();
+            if !cid.starts_with("local::") && cloud.iter().any(|c| c.id == cid) {
+                return Ok(cid.to_string());
+            }
+        }
+
         cloud.sort_by_key(|c| {
             let l = c.id.to_ascii_lowercase();
             if (l.contains("gemini") && l.contains("pro"))
@@ -94,18 +128,32 @@ pub async fn resolve_auto_planner_model(
 }
 
 /// Automatically select the fastest/strongest reachable Execution model:
-/// prefers fast cloud models (e.g. Gemini Flash / Sonnet / GPT-4o) in Hybrid Mode,
+/// anchors to the active cloud planner/Chat model or ordered fallback chain in Hybrid Mode,
 /// or reuses the loaded VRAM-fitting local model / best coding local model in Strict Local Mode.
 pub async fn resolve_auto_executor_model(
     ctx: &HarnessContext<'_>,
     planner_model: &str,
 ) -> anyhow::Result<String> {
     if ctx.gate.mode() == harness_net::PrivacyMode::Hybrid {
+        let settings = ctx.store.snapshot().await.settings;
         let (catalog, _) = ctx.store.build_cloud_catalog_and_quotas().await;
         let mut cloud: Vec<_> = catalog
             .iter()
-            .filter(|c| c.reachable && !c.id.starts_with("local::"))
+            .filter(|c| c.reachable && !c.requires_payment && !c.id.starts_with("local::"))
             .collect();
+
+        if !planner_model.starts_with("local::")
+            && cloud.iter().any(|c| c.id == planner_model)
+        {
+            return Ok(planner_model.to_string());
+        }
+        for chain_id in &settings.fallback_chain {
+            let cid = chain_id.trim();
+            if !cid.starts_with("local::") && cloud.iter().any(|c| c.id == cid) {
+                return Ok(cid.to_string());
+            }
+        }
+
         cloud.sort_by_key(|c| {
             let l = c.id.to_ascii_lowercase();
             if (l.contains("gemini") && l.contains("flash") && !l.contains("lite"))
@@ -408,6 +456,8 @@ pub async fn run_orchestrator_turn(
                     attached_files,
                     attachments: Vec::new(),
                     artifact_id: None,
+                    fallback_from_model_id: None,
+                    fallback_reason: None,
                     created_at: Utc::now(),
                 };
                 let updated = ctx
@@ -552,6 +602,7 @@ pub async fn run_orchestrator_turn(
             )
         });
     plan.status = plan_status;
+    plan.executor_model_id = Some(executor_model.clone());
 
     if plan_artifact_id.is_none() && !ctx.store.is_aborted() && !plan.markdown.trim().is_empty() {
         if let Ok(art) = upsert_session_artifact(
@@ -600,6 +651,8 @@ pub async fn run_orchestrator_turn(
             attached_files,
             attachments: Vec::new(),
             artifact_id: plan_artifact_id,
+            fallback_from_model_id: None,
+            fallback_reason: None,
             created_at: Utc::now(),
         };
         let updated = ctx
@@ -856,6 +909,8 @@ pub async fn run_orchestrator_turn(
                     attached_files,
                     attachments: Vec::new(),
                     artifact_id: None,
+                    fallback_from_model_id: None,
+                    fallback_reason: None,
                     created_at: Utc::now(),
                 };
                 let updated = ctx
@@ -1017,6 +1072,8 @@ pub async fn run_orchestrator_turn(
                 attached_files,
                 attachments: Vec::new(),
                 artifact_id: plan_artifact_id.clone(),
+                fallback_from_model_id: None,
+                fallback_reason: None,
                 created_at: Utc::now(),
             };
             let updated = ctx
@@ -1088,6 +1145,8 @@ pub async fn run_orchestrator_turn(
             attached_files,
             attachments: Vec::new(),
             artifact_id: plan_artifact_id.clone(),
+            fallback_from_model_id: None,
+            fallback_reason: None,
             created_at: Utc::now(),
         };
         let updated = ctx
@@ -1149,6 +1208,8 @@ pub async fn run_orchestrator_turn(
         attached_files,
         attachments: Vec::new(),
         artifact_id: plan_artifact_id,
+        fallback_from_model_id: None,
+        fallback_reason: None,
         created_at: Utc::now(),
     };
 
@@ -1300,6 +1361,54 @@ mod tests {
                 !picked_hybrid.starts_with("local::") && picked_hybrid.contains("gemini"),
                 "expected cloud gemini model in Hybrid mode, got: {picked_hybrid}"
             );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_auto_orchestrator_anchors_to_active_cloud_model_and_fallback_chain() {
+        let dir = std::env::temp_dir().join(format!("bumbo_orch_anchor_{}", Uuid::new_v4()));
+        let paths = BumboPaths {
+            app_data_dir: dir.clone(),
+            engines_dir: dir.join("engines"),
+            state_file: dir.join("state.json"),
+            default_vault_dir: dir.join("models"),
+        };
+        let store = BumboStore::init(paths).unwrap();
+        let srv = ServerManager::new(dir.join("engines"));
+        let gate_hybrid = NetworkGate::new(PrivacyMode::Hybrid).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            store
+                .update(|s| {
+                    s.settings.api_keys.gemini_api_key = "gem-key".into();
+                    s.settings.api_keys.anthropic_api_key = "ant-key".into();
+                    s.settings.fallback_chain = vec!["claude-sonnet-4-5".into()];
+                })
+                .await
+                .unwrap();
+
+            let ctx = HarnessContext {
+                gate: &gate_hybrid,
+                store: &store,
+                server_mgr: &srv,
+                local_models: &[],
+            };
+
+            // Anchors to active cloud Chat model rather than jumping to Gemini 3.0
+            let planner = resolve_auto_planner_model(&ctx, "claude-sonnet-4-5")
+                .await
+                .unwrap();
+            assert_eq!(planner, "claude-sonnet-4-5");
+            let executor = resolve_auto_executor_model(&ctx, &planner).await.unwrap();
+            assert_eq!(executor, "claude-sonnet-4-5");
+
+            // When active Chat model is local, fallback_chain comes before default ranking
+            let planner_chain = resolve_auto_planner_model(&ctx, "local::gemma4:12b")
+                .await
+                .unwrap();
+            assert_eq!(planner_chain, "claude-sonnet-4-5");
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

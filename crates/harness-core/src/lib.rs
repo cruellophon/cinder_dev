@@ -23,12 +23,13 @@ use chrono::Utc;
 use harness_models::{LocalModelEntry, ServerManager};
 use harness_net::{NetworkGate, PrivacyMode};
 use harness_providers::{
-    complete, CompletionRequest, CompletionResponse, ProviderMessage, ToolCallRequest, ToolSpec,
+    complete, complete_interactive, CompletionOutcome, CompletionRequest, CompletionResponse,
+    ProviderMessage, ToolCallRequest, ToolSpec,
 };
 use harness_store::{
-    AgentMode, BumboStore, ChatMessage, CompareResult, MediaAttachment, OrchestratorPhaseRecord,
-    PendingToolApproval, PendingUserQuestion, PlanArtifact, PlanStatus, PlanStep, RiskTier,
-    Session, SessionArtifact, ToolCallRecord,
+    AgentMode, BumboStore, ChatMessage, CompareResult, FallbackPolicy, MediaAttachment,
+    OrchestratorPhaseRecord, PendingModelFallback, PendingToolApproval, PendingUserQuestion,
+    PlanArtifact, PlanStatus, PlanStep, RiskTier, Session, SessionArtifact, ToolCallRecord,
 };
 use harness_tools::{
     apply_file_change, call_mcp_tool, classify_tool_risk_with_context, discover_enabled_mcp_tools,
@@ -59,6 +60,23 @@ pub(crate) async fn complete_cancellable(
     tokio::select! {
         _ = abort_wait => Ok(None),
         res = complete(ctx.gate, ctx.store, ctx.server_mgr, ctx.local_models, req) => {
+            res.map(Some)
+        }
+    }
+}
+
+pub(crate) async fn complete_cancellable_interactive(
+    ctx: &HarnessContext<'_>,
+    req: CompletionRequest,
+) -> anyhow::Result<Option<CompletionOutcome>> {
+    let abort_wait = async {
+        while !ctx.store.is_aborted() {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        }
+    };
+    tokio::select! {
+        _ = abort_wait => Ok(None),
+        res = complete_interactive(ctx.gate, ctx.store, ctx.server_mgr, ctx.local_models, req) => {
             res.map(Some)
         }
     }
@@ -277,6 +295,8 @@ pub async fn compact_session_context(store: &BumboStore, session_id: &str) -> an
                 attached_files: Vec::new(),
                 attachments: Vec::new(),
                 artifact_id: None,
+                fallback_from_model_id: None,
+                fallback_reason: None,
                 created_at: Utc::now(),
             };
 
@@ -1588,6 +1608,8 @@ pub async fn run_turn(
         attached_files: attached_files.clone(),
         attachments: attachments.clone(),
         artifact_id: None,
+        fallback_from_model_id: None,
+        fallback_reason: None,
         created_at: Utc::now(),
     };
 
@@ -1598,6 +1620,7 @@ pub async fn run_turn(
                 sess.mode = effective_mode;
                 sess.pending_approval = None;
                 sess.pending_question = None;
+                sess.pending_fallback = None;
                 if sess.messages.is_empty() && !user_text.trim().is_empty() {
                     let trimmed: String = user_text.trim().chars().take(42).collect();
                     sess.title = trimmed;
@@ -1690,27 +1713,37 @@ pub async fn run_turn(
         return res;
     }
 
-    let resolved_model =
+    let effective_policy = if !snapshot.settings.auto_switch_models {
+        FallbackPolicy::Strict
+    } else {
+        snapshot.settings.fallback_policy
+    };
+    let should_preresolve = model_id.trim().is_empty()
+        || (ctx.gate.mode() == PrivacyMode::StrictLocal && !model_id.starts_with("local::"))
+        || effective_policy == FallbackPolicy::AutoChain;
+    let resolved_model = if should_preresolve {
         resolve_reachable_model(ctx, model_id, &snapshot.settings.active_model_id)
             .await
-            .unwrap_or_else(|_| model_id.to_string());
+            .unwrap_or_else(|_| model_id.to_string())
+    } else {
+        model_id.to_string()
+    };
     let mut mode_phases: Vec<OrchestratorPhaseRecord> = Vec::new();
-    if resolved_model != model_id {
+    let initial_fallback = if resolved_model != model_id {
         mode_phases.push(OrchestratorPhaseRecord {
-            phase: "auto-fallback".into(),
+            phase: "fallback".into(),
             model_id: resolved_model.clone(),
-            summary: format!("Redirected unreachable model '{model_id}' to '{resolved_model}'"),
+            summary: format!("Turn-scoped fallback: '{model_id}' unreachable — used '{resolved_model}'"),
             latency_ms: 0,
             tokens: 0,
         });
-        let rm = resolved_model.clone();
-        let _ = ctx
-            .store
-            .update(|s| {
-                s.settings.active_model_id = rm;
-            })
-            .await;
-    }
+        Some((
+            model_id.to_string(),
+            "selected model unreachable".to_string(),
+        ))
+    } else {
+        None
+    };
     let model_id = resolved_model.as_str();
 
     if effective_mode == AgentMode::Compare {
@@ -1775,6 +1808,7 @@ pub async fn run_turn(
         effort_override,
         Vec::new(),
         mode_phases,
+        initial_fallback,
         Uuid::new_v4().to_string(),
         user_text.chars().take(48).collect(),
     )
@@ -1865,6 +1899,8 @@ async fn run_compare_turn(
             attached_files: Vec::new(),
             attachments: Vec::new(),
             artifact_id: None,
+            fallback_from_model_id: None,
+            fallback_reason: None,
             created_at: Utc::now(),
         },
         (Ok(a), Err(eb)) => ChatMessage {
@@ -1890,6 +1926,8 @@ async fn run_compare_turn(
             attached_files: Vec::new(),
             attachments: Vec::new(),
             artifact_id: None,
+            fallback_from_model_id: None,
+            fallback_reason: None,
             created_at: Utc::now(),
         },
         (Err(ea), Ok(b)) => ChatMessage {
@@ -1915,6 +1953,8 @@ async fn run_compare_turn(
             attached_files: Vec::new(),
             attachments: Vec::new(),
             artifact_id: None,
+            fallback_from_model_id: None,
+            fallback_reason: None,
             created_at: Utc::now(),
         },
         (Err(ea), Err(eb)) => {
@@ -2045,6 +2085,7 @@ pub async fn resolve_pending_approval(
         None,
         vec![record],
         Vec::new(),
+        None,
         checkpoint_id,
         format!("Approved {}", pending.tool_name),
     )
@@ -2243,6 +2284,7 @@ pub async fn answer_pending_question(
             None,
             vec![record],
             Vec::new(),
+            None,
             Uuid::new_v4().to_string(),
             "Continue workload".into(),
         )
@@ -2313,8 +2355,109 @@ pub async fn answer_pending_question(
         None,
         vec![record],
         Vec::new(),
+        None,
         Uuid::new_v4().to_string(),
         "Continue after clarification".into(),
+    )
+    .await;
+
+    ctx.store.clear_activity().await;
+    res
+}
+
+pub async fn resolve_pending_fallback(
+    ctx: &HarnessContext<'_>,
+    session_id: &str,
+    chosen_model_id: Option<&str>,
+) -> anyhow::Result<Session> {
+    ctx.store.clear_abort();
+    let snapshot = ctx.store.snapshot().await;
+    let sess = snapshot
+        .sessions
+        .iter()
+        .find(|s| s.id == session_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
+
+    let Some(pf) = sess.pending_fallback.clone() else {
+        return Ok(sess);
+    };
+
+    let workspace_path = sess.workspace_path.clone();
+    let Some(chosen_raw) = chosen_model_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        let updated = ctx
+            .store
+            .update(|s| {
+                if let Some(sx) = s.sessions.iter_mut().find(|x| x.id == session_id) {
+                    sx.pending_fallback = None;
+                    sx.updated_at = Utc::now();
+                    return Some(sx.clone());
+                }
+                None
+            })
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
+        ctx.store.clear_activity().await;
+        return Ok(updated);
+    };
+
+    let target_model = chosen_raw.to_string();
+    let initial_fallback = if target_model != pf.failed_model_id {
+        Some((pf.failed_model_id.clone(), pf.reason.clone()))
+    } else {
+        None
+    };
+    let history: Vec<ProviderMessage> =
+        serde_json::from_str(&pf.agent_history_json).unwrap_or_default();
+    let configured_steps = snapshot
+        .settings
+        .orchestrator
+        .max_autonomous_steps
+        .clamp(2, 64);
+    let next_max_steps = configured_steps.max(pf.step_index + 2);
+    let allow_web = ctx.gate.mode() == PrivacyMode::Hybrid;
+    let mode_phases = if target_model != pf.failed_model_id {
+        vec![OrchestratorPhaseRecord {
+            phase: "user-fallback".into(),
+            model_id: target_model.clone(),
+            summary: format!(
+                "Switched {} → {} after {}",
+                pf.failed_model_id, target_model, pf.reason
+            ),
+            latency_ms: 0,
+            tokens: 0,
+        }]
+    } else {
+        Vec::new()
+    };
+
+    ctx.store
+        .update(|s| {
+            if let Some(sx) = s.sessions.iter_mut().find(|x| x.id == session_id) {
+                sx.pending_fallback = None;
+                sx.updated_at = Utc::now();
+            }
+        })
+        .await?;
+
+    let res = run_agent_loop(
+        ctx,
+        session_id,
+        Path::new(&workspace_path),
+        &target_model,
+        pf.mode,
+        allow_web,
+        true,
+        snapshot.settings.ui.custom_system_prompt.clone(),
+        history,
+        pf.step_index,
+        next_max_steps,
+        None,
+        Vec::new(),
+        mode_phases,
+        initial_fallback,
+        Uuid::new_v4().to_string(),
+        format!("Resumed on {target_model}"),
     )
     .await;
 
@@ -2420,13 +2563,17 @@ pub async fn handle_plan_review_action(
                         .map(|p| p.title.clone())
                         .filter(|t| !t.trim().is_empty())
                         .unwrap_or_else(|| "Implementation Plan".into());
+                    let promised_executor = sess
+                        .active_plan
+                        .as_ref()
+                        .and_then(|p| p.executor_model_id.clone());
                     let md = sync_session_plan_status(sess, PlanStatus::Approved, edited_ref)?;
-                    return Some((title, md));
+                    return Some((title, md, promised_executor));
                 }
                 None
             })
             .await?;
-        let Some((plan_title, plan_md)) = updated_plan else {
+        let Some((plan_title, plan_md, promised_executor)) = updated_plan else {
             anyhow::bail!("No active plan found to execute.");
         };
         if edited_ref.is_some() {
@@ -2434,6 +2581,9 @@ pub async fn handle_plan_review_action(
                 .await;
         }
 
+        let exec_model = promised_executor
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or(active_model);
         let prompt = format!(
             "The implementation plan has been reviewed and approved. Execute it step by step inside the active workspace and run `verify_workspace` at the end.\n\nApproved Plan:\n{plan_md}"
         );
@@ -2442,7 +2592,7 @@ pub async fn handle_plan_review_action(
             session_id,
             &prompt,
             AgentMode::Agent,
-            &active_model,
+            &exec_model,
             None,
             Vec::new(),
             Vec::new(),
@@ -2717,6 +2867,7 @@ async fn run_agent_loop(
     effort_override: Option<String>,
     mut collected_tools: Vec<ToolCallRecord>,
     mut mode_phases: Vec<OrchestratorPhaseRecord>,
+    initial_fallback: Option<(String, String)>,
     checkpoint_id: String,
     checkpoint_title: String,
 ) -> anyhow::Result<Session> {
@@ -2734,6 +2885,7 @@ async fn run_agent_loop(
 
     let mut current_mode = initial_mode;
     let mut active_model_id = model_id.to_string();
+    let mut fallback_from: Option<(String, String)> = initial_fallback;
     let enabled_modules = settings.ui.enabled_modules.clone();
     let thinking_effort = effort_override.unwrap_or_else(|| settings.ui.thinking_effort.clone());
     let delegate_cloud_hint: Option<String> = if allow_web {
@@ -2885,7 +3037,7 @@ async fn run_agent_loop(
             temperature: 0.25,
         };
 
-        let completion_res = match complete_cancellable(ctx, req).await {
+        let completion_res = match complete_cancellable_interactive(ctx, req).await {
             Ok(v) => Ok(v),
             Err(e) if is_context_overflow_error(&e.to_string()) => {
                 for m in &mut history {
@@ -2929,18 +3081,92 @@ async fn run_agent_loop(
                     max_tokens: 4096,
                     temperature: 0.25,
                 };
-                complete_cancellable(ctx, retry_req).await
+                complete_cancellable_interactive(ctx, retry_req).await
             }
             Err(e) => Err(e),
         };
 
-        let Some(resp) = completion_res? else {
+        let Some(outcome) = completion_res? else {
             final_content = if final_content.trim().is_empty() {
                 "[Generation stopped by user]".into()
             } else {
                 format!("{final_content}\n\n[Generation stopped by user]")
             };
             break;
+        };
+        let resp = match outcome {
+            CompletionOutcome::Completed(r) => r,
+            CompletionOutcome::NeedsFallbackChoice(prompt) => {
+                let pending = PendingModelFallback {
+                    id: Uuid::new_v4().to_string(),
+                    failed_model_id: prompt.failed_model_id.clone(),
+                    error_summary: prompt.error_summary,
+                    reason: prompt.reason,
+                    candidates: prompt.candidates,
+                    mode: current_mode,
+                    agent_history_json: serde_json::to_string(&history)?,
+                    step_index: step,
+                };
+                let partial_msg = if !collected_tools.is_empty()
+                    || !accumulated_thoughts.is_empty()
+                    || !final_content.trim().is_empty()
+                {
+                    Some(ChatMessage {
+                        id: Uuid::new_v4().to_string(),
+                        role: "assistant".into(),
+                        content: if final_content.trim().is_empty() {
+                            format!(
+                                "Paused on `{}` ({}) — select how to continue below.",
+                                pending.failed_model_id, pending.reason
+                            )
+                        } else {
+                            final_content.clone()
+                        },
+                        thinking: if accumulated_thoughts.is_empty() {
+                            None
+                        } else {
+                            Some(accumulated_thoughts.join("\n\n"))
+                        },
+                        model_id: Some(active_model_id.clone()),
+                        latency_ms: Some(total_latency),
+                        prompt_tokens: Some(total_prompt),
+                        completion_tokens: Some(total_completion),
+                        tool_calls: collected_tools,
+                        compare_partner: None,
+                        checkpoint_id: if produced_checkpoint {
+                            Some(checkpoint_id)
+                        } else {
+                            None
+                        },
+                        plan_artifact: None,
+                        orchestrator_phases: mode_phases,
+                        attached_files: Vec::new(),
+                        attachments: Vec::new(),
+                        artifact_id: last_artifact_id,
+                        fallback_from_model_id: fallback_from.as_ref().map(|(m, _)| m.clone()),
+                        fallback_reason: fallback_from.as_ref().map(|(_, r)| r.clone()),
+                        created_at: Utc::now(),
+                    })
+                } else {
+                    None
+                };
+                let updated = ctx
+                    .store
+                    .update(|s| {
+                        if let Some(sess) = s.sessions.iter_mut().find(|x| x.id == session_id) {
+                            if let Some(msg) = partial_msg {
+                                sess.messages.push(msg);
+                            }
+                            sess.pending_fallback = Some(pending);
+                            sess.updated_at = Utc::now();
+                            return Some(sess.clone());
+                        }
+                        None
+                    })
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+                return Ok(updated);
+            }
         };
         if let Some(prev_model) = resp.switched_from.as_ref() {
             if !resp.actual_model_id.is_empty() {
@@ -2950,6 +3176,9 @@ async fn run_agent_loop(
                 .switch_reason
                 .as_deref()
                 .unwrap_or("unavailable / quota exhausted");
+            if fallback_from.is_none() {
+                fallback_from = Some((prev_model.clone(), reason.to_string()));
+            }
             mode_phases.push(OrchestratorPhaseRecord {
                 phase: "auto-switch".into(),
                 model_id: active_model_id.clone(),
@@ -3394,6 +3623,8 @@ async fn run_agent_loop(
                     attached_files: Vec::new(),
                     attachments: Vec::new(),
                     artifact_id: plan_art_id.or(last_artifact_id),
+                    fallback_from_model_id: fallback_from.as_ref().map(|(m, _)| m.clone()),
+                    fallback_reason: fallback_from.as_ref().map(|(_, r)| r.clone()),
                     created_at: Utc::now(),
                 };
 
@@ -3451,6 +3682,8 @@ async fn run_agent_loop(
                     attached_files: Vec::new(),
                     attachments: Vec::new(),
                     artifact_id: last_artifact_id,
+                    fallback_from_model_id: fallback_from.as_ref().map(|(m, _)| m.clone()),
+                    fallback_reason: fallback_from.as_ref().map(|(_, r)| r.clone()),
                     created_at: Utc::now(),
                 };
 
@@ -3675,6 +3908,8 @@ async fn run_agent_loop(
                 attached_files: Vec::new(),
                 attachments: Vec::new(),
                 artifact_id: last_artifact_id,
+                fallback_from_model_id: fallback_from.as_ref().map(|(m, _)| m.clone()),
+                fallback_reason: fallback_from.as_ref().map(|(_, r)| r.clone()),
                 created_at: Utc::now(),
             };
 
@@ -3760,6 +3995,8 @@ async fn run_agent_loop(
                 attached_files: Vec::new(),
                 attachments: Vec::new(),
                 artifact_id: last_artifact_id,
+                fallback_from_model_id: fallback_from.as_ref().map(|(m, _)| m.clone()),
+                fallback_reason: fallback_from.as_ref().map(|(_, r)| r.clone()),
                 created_at: Utc::now(),
             };
             let updated = ctx
@@ -3906,6 +4143,8 @@ async fn run_agent_loop(
         attached_files: Vec::new(),
         attachments: Vec::new(),
         artifact_id: last_artifact_id,
+        fallback_from_model_id: fallback_from.as_ref().map(|(m, _)| m.clone()),
+        fallback_reason: fallback_from.as_ref().map(|(_, r)| r.clone()),
         created_at: Utc::now(),
     };
 
@@ -4046,6 +4285,7 @@ pub(crate) fn build_fallback_plan_from_notes(
         markdown: clean_md,
         status,
         model_id: model_id.to_string(),
+        executor_model_id: None,
         created_at: Utc::now(),
     }
 }
@@ -4139,6 +4379,7 @@ pub(crate) fn build_plan_artifact(model_id: &str, args: &Value) -> PlanArtifact 
         markdown: md.trim().to_string(),
         status: PlanStatus::AwaitingReview,
         model_id: model_id.to_string(),
+        executor_model_id: None,
         created_at: Utc::now(),
     }
 }
@@ -4212,6 +4453,8 @@ mod tests {
                             attached_files: Vec::new(),
                             attachments: Vec::new(),
                             artifact_id: None,
+                            fallback_from_model_id: None,
+                            fallback_reason: None,
                             created_at: Utc::now(),
                         });
                     }
@@ -4381,6 +4624,7 @@ mod tests {
                             pending_approval: None,
                             active_plan: None,
                             pending_question: None,
+                            pending_fallback: None,
                             checkpoints: Vec::new(),
                             artifacts: Vec::new(),
                             created_at: now,
@@ -4655,6 +4899,7 @@ mod tests {
             markdown: "## Original".into(),
             status: PlanStatus::AwaitingReview,
             model_id: "gemini".into(),
+            executor_model_id: None,
             created_at: now,
         };
         let mut sess = Session {
@@ -4679,11 +4924,14 @@ mod tests {
                 attached_files: Vec::new(),
                 attachments: Vec::new(),
                 artifact_id: None,
+                fallback_from_model_id: None,
+                fallback_reason: None,
                 created_at: now,
             }],
             pending_approval: None,
             active_plan: Some(plan),
             pending_question: None,
+            pending_fallback: None,
             checkpoints: Vec::new(),
             artifacts: Vec::new(),
             created_at: now,
@@ -4868,5 +5116,255 @@ mod tests {
         assert!(plan.markdown.contains("## Files Touched"));
         assert!(plan.markdown.contains("## Verification"));
         assert!(!plan.markdown.contains("<|tool_call|>"));
+    }
+
+    #[test]
+    fn resolve_vision_model_excludes_paid_and_prefers_user_fallback_chain() {
+        use harness_models::ServerManager;
+        use harness_net::{NetworkGate, PrivacyMode};
+        use harness_store::{BumboPaths, BumboStore, ModelCatalogEntry, ProviderKind};
+
+        let dir = std::env::temp_dir().join(format!("bumbo_vision_fb_{}", Uuid::new_v4()));
+        let paths = BumboPaths {
+            app_data_dir: dir.clone(),
+            engines_dir: dir.join("engines"),
+            state_file: dir.join("state.json"),
+            default_vault_dir: dir.join("models"),
+        };
+        let store = BumboStore::init(paths).unwrap();
+        let srv = ServerManager::new(dir.join("engines"));
+        let gate = NetworkGate::new(PrivacyMode::Hybrid).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            store
+                .update(|s| {
+                    s.settings.api_keys.openrouter_api_key = "or-key".into();
+                    s.settings.orchestrator.vision_model_id = "paid/vision:pro".into();
+                    s.settings.active_model_id = "paid/vision:pro".into();
+                    s.settings.fallback_chain = vec![
+                        "paid/vision:pro".into(),
+                        "free/vision-backup:free".into(),
+                    ];
+                    s.verified_provider_models.insert(
+                        "open_router".into(),
+                        vec![
+                            ModelCatalogEntry {
+                                id: "free/vision-first:free".into(),
+                                display_name: "Free Vision First".into(),
+                                provider: ProviderKind::OpenRouter,
+                                context_window: 128_000,
+                                supports_thinking: false,
+                                supports_tools: true,
+                                supports_vision: true,
+                                tier_note: "Free tier".into(),
+                                quota_limit: None,
+                                reachable: true,
+                                reachability_reason: "Free".into(),
+                                antigravity_alias: None,
+                                requires_payment: false,
+                            },
+                            ModelCatalogEntry {
+                                id: "paid/vision:pro".into(),
+                                display_name: "Paid Vision Pro".into(),
+                                provider: ProviderKind::OpenRouter,
+                                context_window: 200_000,
+                                supports_thinking: true,
+                                supports_tools: true,
+                                supports_vision: true,
+                                tier_note: "Paid credits required".into(),
+                                quota_limit: None,
+                                reachable: true,
+                                reachability_reason: "Paid".into(),
+                                antigravity_alias: None,
+                                requires_payment: true,
+                            },
+                            ModelCatalogEntry {
+                                id: "free/vision-backup:free".into(),
+                                display_name: "Free Vision Backup".into(),
+                                provider: ProviderKind::OpenRouter,
+                                context_window: 128_000,
+                                supports_thinking: false,
+                                supports_tools: true,
+                                supports_vision: true,
+                                tier_note: "Free tier".into(),
+                                quota_limit: None,
+                                reachable: true,
+                                reachability_reason: "Free".into(),
+                                antigravity_alias: None,
+                                requires_payment: false,
+                            },
+                        ],
+                    );
+                })
+                .await
+                .unwrap();
+
+            let ctx = HarnessContext {
+                gate: &gate,
+                store: &store,
+                server_mgr: &srv,
+                local_models: &[],
+            };
+            let picked = resolve_vision_model(&ctx).await.unwrap();
+            assert_eq!(picked, "free/vision-backup:free");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_research_model_honors_fallback_chain_and_excludes_paid() {
+        use harness_models::ServerManager;
+        use harness_net::{NetworkGate, PrivacyMode};
+        use harness_store::{BumboPaths, BumboStore, ModelCatalogEntry, ProviderKind};
+
+        let dir = std::env::temp_dir().join(format!("bumbo_res_fb_{}", Uuid::new_v4()));
+        let paths = BumboPaths {
+            app_data_dir: dir.clone(),
+            engines_dir: dir.join("engines"),
+            state_file: dir.join("state.json"),
+            default_vault_dir: dir.join("models"),
+        };
+        let store = BumboStore::init(paths).unwrap();
+        let srv = ServerManager::new(dir.join("engines"));
+        let gate = NetworkGate::new(PrivacyMode::Hybrid).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            store
+                .update(|s| {
+                    s.settings.api_keys.gemini_api_key = "gem-key".into();
+                    s.settings.api_keys.openrouter_api_key = "or-key".into();
+                    s.settings.fallback_chain = vec![
+                        "paid/research:pro".into(),
+                        "free/qwen-research:free".into(),
+                    ];
+                    s.verified_provider_models.insert(
+                        "open_router".into(),
+                        vec![
+                            ModelCatalogEntry {
+                                id: "paid/research:pro".into(),
+                                display_name: "Paid Research".into(),
+                                provider: ProviderKind::OpenRouter,
+                                context_window: 200_000,
+                                supports_thinking: true,
+                                supports_tools: true,
+                                supports_vision: false,
+                                tier_note: "Paid credits required".into(),
+                                quota_limit: None,
+                                reachable: true,
+                                reachability_reason: "Paid".into(),
+                                antigravity_alias: None,
+                                requires_payment: true,
+                            },
+                            ModelCatalogEntry {
+                                id: "free/qwen-research:free".into(),
+                                display_name: "Free Qwen Research".into(),
+                                provider: ProviderKind::OpenRouter,
+                                context_window: 128_000,
+                                supports_thinking: false,
+                                supports_tools: true,
+                                supports_vision: false,
+                                tier_note: "Free tier".into(),
+                                quota_limit: None,
+                                reachable: true,
+                                reachability_reason: "Free".into(),
+                                antigravity_alias: None,
+                                requires_payment: false,
+                            },
+                        ],
+                    );
+                })
+                .await
+                .unwrap();
+
+            let ctx = HarnessContext {
+                gate: &gate,
+                store: &store,
+                server_mgr: &srv,
+                local_models: &[],
+            };
+            let picked = resolve_research_model(&ctx, "local::gemma4:12b", true).await;
+            assert_eq!(picked, "free/qwen-research:free");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_reachable_model_respects_fallback_chain_and_strict_local() {
+        use harness_models::{
+            FitTier, LocalModelEntry, LocalModelSource, ServerManager, VramFitAssessment,
+        };
+        use harness_net::{NetworkGate, PrivacyMode};
+        use harness_store::{BumboPaths, BumboStore};
+
+        let dir = std::env::temp_dir().join(format!("bumbo_reach_fb_{}", Uuid::new_v4()));
+        let paths = BumboPaths {
+            app_data_dir: dir.clone(),
+            engines_dir: dir.join("engines"),
+            state_file: dir.join("state.json"),
+            default_vault_dir: dir.join("models"),
+        };
+        let store = BumboStore::init(paths).unwrap();
+        let srv = ServerManager::new(dir.join("engines"));
+        let locals = vec![LocalModelEntry {
+            id: "local::qwen3.5:9b".into(),
+            name: "qwen3.5:9b".into(),
+            source: LocalModelSource::OllamaBlob,
+            gguf_path: "dummy.gguf".into(),
+            ollama_tag: Some("qwen3.5:9b".into()),
+            mmproj_path: None,
+            size_bytes: 6_000_000_000,
+            quant: "Q4_K_M".into(),
+            is_embedding: false,
+            is_valid_gguf: true,
+            vram_fit: VramFitAssessment {
+                tier: FitTier::FitsInVram,
+                label: "Fits".into(),
+                weights_mb: 5700,
+                kv_cache_mb: 1000,
+                compute_buffer_mb: 600,
+                estimated_total_mb: 7300,
+                recommended_ngl: 99,
+            },
+        }];
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            store
+                .update(|s| {
+                    s.settings.api_keys.gemini_api_key = "gem-key".into();
+                    s.settings.api_keys.anthropic_api_key = "ant-key".into();
+                    s.settings.fallback_chain = vec!["claude-sonnet-4-5".into()];
+                })
+                .await
+                .unwrap();
+
+            let gate_hybrid = NetworkGate::new(PrivacyMode::Hybrid).unwrap();
+            let ctx_hybrid = HarnessContext {
+                gate: &gate_hybrid,
+                store: &store,
+                server_mgr: &srv,
+                local_models: &locals,
+            };
+            let picked = resolve_reachable_model(&ctx_hybrid, "missing-a", "missing-b")
+                .await
+                .unwrap();
+            assert_eq!(picked, "claude-sonnet-4-5");
+
+            let gate_local = NetworkGate::new(PrivacyMode::StrictLocal).unwrap();
+            let ctx_local = HarnessContext {
+                gate: &gate_local,
+                store: &store,
+                server_mgr: &srv,
+                local_models: &locals,
+            };
+            let picked_local =
+                resolve_reachable_model(&ctx_local, "claude-sonnet-4-5", "gemini-3-flash-preview")
+                    .await
+                    .unwrap();
+            assert_eq!(picked_local, "local::qwen3.5:9b");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

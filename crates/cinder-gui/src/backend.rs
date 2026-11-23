@@ -2,9 +2,9 @@ use chrono::Utc;
 use harness_core::{
     accept_checkpoint_file, answer_pending_question, compact_session_context,
     delete_session_artifact, handle_plan_review_action, list_skills_with_global,
-    load_workspace_rules, resolve_pending_approval, revert_checkpoint_file,
-    rewind_session_to_message, rollback_entire_checkpoint, run_turn, save_custom_skill,
-    save_workspace_rules, upsert_session_artifact, HarnessContext,
+    load_workspace_rules, resolve_pending_approval, resolve_pending_fallback,
+    revert_checkpoint_file, rewind_session_to_message, rollback_entire_checkpoint, run_turn,
+    save_custom_skill, save_workspace_rules, upsert_session_artifact, HarnessContext,
 };
 use harness_models::{
     inspect_hf_repo, probe_hardware, scan_local_models, search_hf_gguf, DownloadJob,
@@ -520,6 +520,8 @@ impl BackendHandle {
                         attached_files: Vec::new(),
                         attachments: Vec::new(),
                         artifact_id: None,
+                        fallback_from_model_id: None,
+                        fallback_reason: None,
                         created_at: Utc::now(),
                     };
                     let updated_sess = h
@@ -619,6 +621,77 @@ impl BackendHandle {
                     h.store.clear_activity().await;
                     h.toast(msg.clone(), true);
                     h.send(BackendEvent::TurnFinished(Err(msg)));
+                    h.emit_snapshot(false).await;
+                }
+            }
+        });
+    }
+
+    pub fn resolve_fallback(
+        self: &Arc<Self>,
+        session_id: String,
+        chosen_model_id: Option<String>,
+    ) {
+        let h = Arc::clone(self);
+        self.rt.spawn(async move {
+            let snap = h.store.snapshot().await;
+            let hw = h.hardware_snapshot(false).await;
+            let local_models = scan_local_models(
+                Path::new(&snap.settings.model_vault_dir),
+                hw.primary_vram_mb,
+                snap.settings.local_ctx_size,
+            );
+            let ctx = HarnessContext {
+                gate: &h.gate,
+                store: &h.store,
+                server_mgr: &h.server_mgr,
+                local_models: &local_models,
+            };
+            match resolve_pending_fallback(&ctx, &session_id, chosen_model_id.as_deref()).await {
+                Ok(sess) => {
+                    h.send(BackendEvent::TurnFinished(Ok(sess)));
+                    h.emit_snapshot(false).await;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    h.store.clear_activity().await;
+                    h.toast(msg.clone(), true);
+                    h.send(BackendEvent::TurnFinished(Err(msg)));
+                    h.emit_snapshot(false).await;
+                }
+            }
+        });
+    }
+
+    pub fn retry_turn_with_model(
+        self: &Arc<Self>,
+        session_id: String,
+        user_msg_index: usize,
+        model_id: String,
+    ) {
+        let h = Arc::clone(self);
+        self.rt.spawn(async move {
+            match rewind_session_to_message(&h.store, &session_id, user_msg_index, false).await {
+                Ok((updated_sess, prompt_text, attached_files, attachments)) => {
+                    let mode = updated_sess.mode;
+                    h.send(BackendEvent::ChatRewound {
+                        session: updated_sess,
+                        prompt_text: String::new(),
+                        attached_files: Vec::new(),
+                        attachments: Vec::new(),
+                    });
+                    h.send_prompt(
+                        session_id,
+                        prompt_text,
+                        mode,
+                        model_id,
+                        None,
+                        attached_files,
+                        attachments,
+                    );
+                }
+                Err(e) => {
+                    h.toast(e.to_string(), true);
                     h.emit_snapshot(false).await;
                 }
             }
@@ -816,6 +889,7 @@ impl BackendHandle {
                         pending_approval: None,
                         active_plan: None,
                         pending_question: None,
+                        pending_fallback: None,
                         checkpoints: Vec::new(),
                         artifacts: Vec::new(),
                         created_at: now,
@@ -846,6 +920,7 @@ impl BackendHandle {
                         pending_approval: None,
                         active_plan: None,
                         pending_question: None,
+                        pending_fallback: None,
                         checkpoints: Vec::new(),
                         artifacts: Vec::new(),
                         created_at: now,
@@ -944,6 +1019,7 @@ impl BackendHandle {
                             pending_approval: None,
                             active_plan: None,
                             pending_question: None,
+                            pending_fallback: None,
                             checkpoints: Vec::new(),
                             artifacts: Vec::new(),
                             created_at: now,
@@ -1040,6 +1116,7 @@ impl BackendHandle {
                                 pending_approval: None,
                                 active_plan: None,
                                 pending_question: None,
+                                pending_fallback: None,
                                 checkpoints: Vec::new(),
                                 artifacts: Vec::new(),
                                 created_at: now,

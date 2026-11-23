@@ -234,6 +234,7 @@ pub fn render_chat_column(
     let has_changes_bar = changed_files > 0;
     let mut clear_pending_question = false;
     let mut clear_pending_approval = false;
+    let mut clear_pending_fallback = false;
 
     egui::TopBottomPanel::bottom(egui::Id::new(("chat_bottom_dock", &sess.id)))
         .frame(Frame::NONE)
@@ -397,6 +398,73 @@ pub fn render_chat_column(
                     ui.add_space(4.0);
                 }
 
+                if let Some(ref pf) = sess.pending_fallback {
+                    let failed_lbl = resolve_model_display_name(&snap, &pf.failed_model_id);
+                    Frame::new()
+                        .fill(p.bg_card)
+                        .stroke(Stroke::new(1.2_f32, p.amber))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                badge(ui, "MODEL FALLBACK", p.amber, p.bg_elev);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{failed_lbl} unavailable ({})",
+                                        pf.reason
+                                    ))
+                                    .strong()
+                                    .color(p.text),
+                                );
+                            });
+                            if !pf.error_summary.trim().is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(&pf.error_summary)
+                                        .small()
+                                        .color(p.muted),
+                                );
+                            }
+                            ui.add_space(6.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                if primary_button(ui, p, &format!("Retry {failed_lbl}")).clicked() {
+                                    state.is_generating = true;
+                                    state.turn_started_at = Some(std::time::Instant::now());
+                                    clear_pending_fallback = true;
+                                    backend.resolve_fallback(
+                                        sess.id.clone(),
+                                        Some(pf.failed_model_id.clone()),
+                                    );
+                                }
+                                for cand_id in &pf.candidates {
+                                    let cand_lbl = resolve_model_display_name(&snap, cand_id);
+                                    if secondary_button(
+                                        ui,
+                                        p,
+                                        &format!("Continue with {cand_lbl}"),
+                                    )
+                                    .on_hover_text(cand_id.as_str())
+                                    .clicked()
+                                    {
+                                        state.is_generating = true;
+                                        state.turn_started_at = Some(std::time::Instant::now());
+                                        clear_pending_fallback = true;
+                                        backend.resolve_fallback(
+                                            sess.id.clone(),
+                                            Some(cand_id.clone()),
+                                        );
+                                    }
+                                }
+                                if danger_button(ui, p, "Cancel").clicked() {
+                                    clear_pending_fallback = true;
+                                    backend.resolve_fallback(sess.id.clone(), None);
+                                }
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
+
                 if state.is_busy() {
                     let elapsed = state.format_elapsed_since_turn_start();
                     Frame::new()
@@ -489,7 +557,7 @@ pub fn render_chat_column(
             });
         });
 
-    if clear_pending_question || clear_pending_approval {
+    if clear_pending_question || clear_pending_approval || clear_pending_fallback {
         if let Some(ref mut snap_arc) = state.snap {
             let snap_mut = Arc::make_mut(snap_arc);
             if let Some(ref mut active_sess) = snap_mut.active_session {
@@ -499,6 +567,9 @@ pub fn render_chat_column(
                     }
                     if clear_pending_approval {
                         active_sess.pending_approval = None;
+                    }
+                    if clear_pending_fallback {
+                        active_sess.pending_fallback = None;
                     }
                 }
             }
@@ -1089,6 +1160,56 @@ pub fn render_chat_column(
                                                     .color(p.muted),
                                             )
                                             .on_hover_text(mid.as_str());
+                                        }
+                                        if let Some(ref orig_mid) = msg.fallback_from_model_id {
+                                            let orig_lbl =
+                                                resolve_model_display_name(&snap, orig_mid);
+                                            let actual_lbl = msg
+                                                .model_id
+                                                .as_deref()
+                                                .map(|m| resolve_model_display_name(&snap, m))
+                                                .unwrap_or_else(|| "fallback".into());
+                                            ui.scope(|ui| {
+                                                badge(
+                                                    ui,
+                                                    &format!("Fallback: {orig_lbl} → {actual_lbl}"),
+                                                    p.amber,
+                                                    p.bg_card,
+                                                );
+                                            })
+                                            .response
+                                            .on_hover_text(
+                                                msg.fallback_reason
+                                                    .as_deref()
+                                                    .unwrap_or("Turn-scoped model fallback"),
+                                            );
+                                            if !busy {
+                                                if let Some(u_idx) = turn_user_idx {
+                                                    if ghost_button(
+                                                        ui,
+                                                        p,
+                                                        egui::RichText::new(format!(
+                                                            "Retry with {orig_lbl}"
+                                                        ))
+                                                        .small()
+                                                        .color(p.amber),
+                                                    )
+                                                    .on_hover_text(format!(
+                                                        "Rewind this turn and retry on {orig_mid}"
+                                                    ))
+                                                    .clicked()
+                                                    {
+                                                        state.is_generating = true;
+                                                        state.turn_started_at =
+                                                            Some(std::time::Instant::now());
+                                                        backend.retry_turn_with_model(
+                                                            sess.id.clone(),
+                                                            u_idx,
+                                                            orig_mid.clone(),
+                                                        );
+                                                    }
+                                                }
+                                            }
                                         }
                                         if snap.settings.ui.show_token_metrics {
                                             if let Some(ms) = msg.latency_ms {
@@ -2757,6 +2878,8 @@ pub(crate) fn dispatch_chat_prompt(
                     attached_files: files.clone(),
                     attachments: media.clone(),
                     artifact_id: None,
+                    fallback_from_model_id: None,
+                    fallback_reason: None,
                     created_at: chrono::Utc::now(),
                 });
             }

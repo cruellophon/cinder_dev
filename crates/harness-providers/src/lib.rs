@@ -2,8 +2,8 @@ use futures_util::StreamExt;
 use harness_models::{ActiveServerBackend, LocalModelEntry, ServerManager};
 use harness_net::NetworkGate;
 use harness_store::{
-    is_viable_gemini_chat_model, sort_gemini_models_by_priority, BumboStore, ModelCatalogEntry,
-    ModelQuotaLimit, ProviderKind,
+    is_viable_gemini_chat_model, sort_gemini_models_by_priority, BumboStore, FallbackPolicy,
+    ModelCatalogEntry, ModelQuotaLimit, ProviderKind,
 };
 use reqwest::header::{HeaderMap, CONNECTION};
 use reqwest::Method;
@@ -311,6 +311,20 @@ fn strip_images_with_vision_hint(req: &CompletionRequest, reason: &str) -> Compl
     cloned
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FallbackChoicePrompt {
+    pub failed_model_id: String,
+    pub error_summary: String,
+    pub reason: String,
+    pub candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CompletionOutcome {
+    Completed(CompletionResponse),
+    NeedsFallbackChoice(FallbackChoicePrompt),
+}
+
 pub async fn complete(
     gate: &NetworkGate,
     store: &BumboStore,
@@ -318,6 +332,25 @@ pub async fn complete(
     local_models: &[LocalModelEntry],
     req: CompletionRequest,
 ) -> anyhow::Result<CompletionResponse> {
+    match complete_interactive(gate, store, server_mgr, local_models, req).await? {
+        CompletionOutcome::Completed(resp) => Ok(resp),
+        CompletionOutcome::NeedsFallbackChoice(prompt) => {
+            anyhow::bail!(
+                "Model '{}' failed ({}). Retry or select another model.",
+                prompt.failed_model_id,
+                prompt.error_summary
+            )
+        }
+    }
+}
+
+pub async fn complete_interactive(
+    gate: &NetworkGate,
+    store: &BumboStore,
+    server_mgr: &ServerManager,
+    local_models: &[LocalModelEntry],
+    req: CompletionRequest,
+) -> anyhow::Result<CompletionOutcome> {
     let settings = store.snapshot().await.settings;
     let (catalog, _) = store.build_cloud_catalog_and_quotas().await;
 
@@ -340,12 +373,49 @@ pub async fn complete(
             let is_local = req.model_id.starts_with("local::");
 
             if should_block && !is_local {
-                let _ = store
-                    .mark_model_blocked(&req.model_id, reason)
-                    .await;
+                let _ = store.mark_model_blocked(&req.model_id, reason).await;
             }
 
-            if !settings.auto_switch_models || !should_switch {
+            // Always try a single transient retry on the user's chosen primary model BEFORE switching or prompting.
+            if !is_local && should_switch && !should_block {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                let (retry_catalog, _) = store.build_cloud_catalog_and_quotas().await;
+                if let Ok((retry_resp, retry_headers)) = complete_single(
+                    gate,
+                    store,
+                    &settings,
+                    server_mgr,
+                    local_models,
+                    &retry_catalog,
+                    &req,
+                )
+                .await
+                {
+                    if let Some(headers) = retry_headers {
+                        let _ = store
+                            .record_usage(
+                                &req.model_id,
+                                retry_resp.prompt_tokens,
+                                retry_resp.completion_tokens,
+                                retry_resp.thinking_tokens,
+                                headers.rem_req,
+                                headers.lim_req,
+                                headers.rem_tok,
+                                headers.lim_tok,
+                            )
+                            .await;
+                    }
+                    return Ok(CompletionOutcome::Completed(retry_resp));
+                }
+            }
+
+            let effective_policy = if !settings.auto_switch_models {
+                FallbackPolicy::Strict
+            } else {
+                settings.fallback_policy
+            };
+
+            if !should_switch || effective_policy == FallbackPolicy::Strict {
                 anyhow::bail!("{}", format_clean_provider_error(&raw_err));
             }
 
@@ -360,45 +430,47 @@ pub async fn complete(
             };
 
             let (fresh_catalog, _) = store.build_cloud_catalog_and_quotas().await;
-            let candidates = build_fallback_candidates(
+            let needs_tools = !req.tools.is_empty();
+            let needs_vision = req.messages.iter().any(|m| !m.images.is_empty());
+            let allow_cloud = gate.mode() == harness_net::PrivacyMode::Hybrid;
+
+            if effective_policy == FallbackPolicy::Ask {
+                let candidates = build_fallback_candidates_for_request(
+                    &req.model_id,
+                    failed_provider,
+                    &fresh_catalog,
+                    local_models,
+                    &settings.fallback_chain,
+                    true,
+                    settings.fallback_to_local,
+                    allow_cloud,
+                    needs_tools,
+                    needs_vision,
+                );
+                return Ok(CompletionOutcome::NeedsFallbackChoice(FallbackChoicePrompt {
+                    failed_model_id: req.model_id.clone(),
+                    error_summary: format_clean_provider_error(&raw_err),
+                    reason: reason.to_string(),
+                    candidates: candidates.into_iter().take(3).collect(),
+                }));
+            }
+
+            // FallbackPolicy::AutoChain: obey user's explicit chain if configured; otherwise auto-discover.
+            let allow_auto = settings.fallback_chain.is_empty();
+            let candidates = build_fallback_candidates_for_request(
                 &req.model_id,
                 failed_provider,
                 &fresh_catalog,
                 local_models,
+                &settings.fallback_chain,
+                allow_auto,
                 settings.fallback_to_local,
+                allow_cloud,
+                needs_tools,
+                needs_vision,
             );
 
-            if candidates.is_empty() || !settings.auto_switch_models {
-                if !is_local && should_switch && !should_block {
-                    tokio::time::sleep(Duration::from_millis(800)).await;
-                    if let Ok((retry_resp, retry_headers)) = complete_single(
-                        gate,
-                        store,
-                        &settings,
-                        server_mgr,
-                        local_models,
-                        &fresh_catalog,
-                        &req,
-                    )
-                    .await
-                    {
-                        if let Some(headers) = retry_headers {
-                            let _ = store
-                                .record_usage(
-                                    &req.model_id,
-                                    retry_resp.prompt_tokens,
-                                    retry_resp.completion_tokens,
-                                    retry_resp.thinking_tokens,
-                                    headers.rem_req,
-                                    headers.lim_req,
-                                    headers.rem_tok,
-                                    headers.lim_tok,
-                                )
-                                .await;
-                        }
-                        return Ok(retry_resp);
-                    }
-                }
+            if candidates.is_empty() {
                 anyhow::bail!("{}", format_clean_provider_error(&raw_err));
             }
 
@@ -420,13 +492,8 @@ pub async fn complete(
                 .await
                 {
                     Ok((mut fb_resp, fb_headers)) => {
-                        let _ = store
-                            .update(|s| {
-                                s.settings.active_model_id = cand_id.clone();
-                            })
-                            .await;
                         let note = format!(
-                            "[Auto-Switch] Model '{}' hit {} — switched automatically to '{}'.",
+                            "[Fallback] Model '{}' hit {} — continued this turn on '{}'.",
                             req.model_id, reason, cand_id
                         );
                         fb_resp.thinking = Some(match fb_resp.thinking.take() {
@@ -456,7 +523,7 @@ pub async fn complete(
             match switched_ok {
                 Some(ok) => ok,
                 None => anyhow::bail!(
-                    "Model '{}' failed ({}) and auto-switch fallbacks failed ({})",
+                    "Model '{}' failed ({}) and fallback chain failed ({})",
                     req.model_id,
                     format_clean_provider_error(&raw_err),
                     last_fb_err
@@ -480,7 +547,7 @@ pub async fn complete(
             .await?;
     }
 
-    Ok(resp)
+    Ok(CompletionOutcome::Completed(resp))
 }
 
 pub fn is_local_transport_error(err_str: &str) -> bool {
@@ -556,12 +623,37 @@ pub fn classify_provider_error(err_str: &str) -> (bool, bool, &'static str) {
     (false, false, "provider error")
 }
 
-pub fn build_fallback_candidates(
+fn is_vision_capable_local_entry(m: &LocalModelEntry) -> bool {
+    if m.mmproj_path.is_some() {
+        return true;
+    }
+    let l = m.id.to_ascii_lowercase();
+    l.contains("gemma4")
+        || l.contains("gemma-4")
+        || l.contains("gemma3")
+        || l.contains("gemma-3")
+        || l.contains("qwen3.5")
+        || l.contains("qwen2.5-vl")
+        || l.contains("qwen2-vl")
+        || l.contains("-vl")
+        || l.contains("vision")
+        || l.contains("llava")
+        || l.contains("minicpm-v")
+        || l.contains("pixtral")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_fallback_candidates_for_request(
     failed_id: &str,
     failed_provider: ProviderKind,
     catalog: &[ModelCatalogEntry],
     local_models: &[LocalModelEntry],
+    fallback_chain: &[String],
+    allow_auto_discovery: bool,
     fallback_to_local: bool,
+    allow_cloud: bool,
+    needs_tools: bool,
+    needs_vision: bool,
 ) -> Vec<String> {
     const GEMINI_PRIORITY: &[&str] = &[
         "gemini-3-flash-preview",
@@ -573,69 +665,108 @@ pub fn build_fallback_candidates(
         "gemma-4-26b-a4b-it",
     ];
 
-    let mut out: Vec<String> = Vec::new();
-    let mut push_unique = |id: &str| {
-        if id != failed_id && !out.iter().any(|x| x == id) {
-            out.push(id.to_string());
+    let is_cloud_eligible = |c: &ModelCatalogEntry| -> bool {
+        allow_cloud
+            && c.reachable
+            && !c.requires_payment
+            && (!needs_tools || c.supports_tools)
+            && (!needs_vision || c.supports_vision)
+    };
+
+    let is_id_eligible = |id: &str| -> bool {
+        let tid = id.trim();
+        if tid.is_empty() || tid == failed_id {
+            return false;
+        }
+        if tid.starts_with("local::") {
+            local_models.iter().any(|m| {
+                m.id == tid
+                    && !m.is_embedding
+                    && m.is_valid_gguf
+                    && (!needs_vision || is_vision_capable_local_entry(m))
+            })
+        } else {
+            catalog.iter().any(|c| c.id == tid && is_cloud_eligible(c))
         }
     };
 
-    // 1. Preferred same-provider fallbacks first
-    if failed_provider == ProviderKind::GoogleGemini {
-        for pref in GEMINI_PRIORITY {
-            if catalog.iter().any(|c| {
-                c.id == *pref
-                    && c.provider == ProviderKind::GoogleGemini
-                    && c.reachable
-                    && !c.requires_payment
-            }) {
-                push_unique(pref);
-            }
+    let mut out: Vec<String> = Vec::new();
+    let mut push_unique = |id: &str| {
+        let tid = id.trim();
+        if !tid.is_empty() && tid != failed_id && !out.iter().any(|x| x == tid) {
+            out.push(tid.to_string());
         }
-    }
-    for c in catalog
-        .iter()
-        .filter(|c| c.provider == failed_provider && c.reachable && !c.requires_payment)
-    {
-        push_unique(&c.id);
+    };
+
+    // 1. User's explicit ordered fallback chain comes strictly first.
+    for cand in fallback_chain {
+        if is_id_eligible(cand) {
+            push_unique(cand);
+        }
     }
 
-    // 2. Cross-provider reachable cloud models
-    let provider_order = [
-        ProviderKind::GoogleGemini,
-        ProviderKind::Anthropic,
-        ProviderKind::OpenRouter,
-        ProviderKind::OpenAiCompat,
-    ];
-    for p in provider_order {
-        if p == failed_provider {
-            continue;
-        }
-        if p == ProviderKind::GoogleGemini {
+    if !allow_auto_discovery {
+        return out;
+    }
+
+    // 2. Same-provider free reachable cloud fallbacks
+    if allow_cloud {
+        if failed_provider == ProviderKind::GoogleGemini {
             for pref in GEMINI_PRIORITY {
-                if catalog.iter().any(|c| {
-                    c.id == *pref
-                        && c.provider == ProviderKind::GoogleGemini
-                        && c.reachable
-                        && !c.requires_payment
-                }) {
+                if catalog
+                    .iter()
+                    .any(|c| c.id == *pref && c.provider == ProviderKind::GoogleGemini && is_cloud_eligible(c))
+                {
                     push_unique(pref);
                 }
             }
         }
         for c in catalog
             .iter()
-            .filter(|c| c.provider == p && c.reachable && !c.requires_payment)
+            .filter(|c| c.provider == failed_provider && is_cloud_eligible(c))
         {
             push_unique(&c.id);
         }
+
+        // 3. Cross-provider reachable free cloud models
+        let provider_order = [
+            ProviderKind::GoogleGemini,
+            ProviderKind::Anthropic,
+            ProviderKind::OpenRouter,
+            ProviderKind::OpenAiCompat,
+        ];
+        for p in provider_order {
+            if p == failed_provider {
+                continue;
+            }
+            if p == ProviderKind::GoogleGemini {
+                for pref in GEMINI_PRIORITY {
+                    if catalog.iter().any(|c| {
+                        c.id == *pref && c.provider == ProviderKind::GoogleGemini && is_cloud_eligible(c)
+                    }) {
+                        push_unique(pref);
+                    }
+                }
+            }
+            for c in catalog
+                .iter()
+                .filter(|c| c.provider == p && is_cloud_eligible(c))
+            {
+                push_unique(&c.id);
+            }
+        }
     }
 
-    // 3. Optional fallback to local GGUF/Ollama models (only when opted in)
+    // 4. Optional fallback to local GGUF/Ollama models (only when opted in)
     if fallback_to_local {
         let mut locals: Vec<&LocalModelEntry> = local_models
             .iter()
-            .filter(|m| !m.is_embedding && m.is_valid_gguf && m.id != failed_id)
+            .filter(|m| {
+                !m.is_embedding
+                    && m.is_valid_gguf
+                    && m.id != failed_id
+                    && (!needs_vision || is_vision_capable_local_entry(m))
+            })
             .collect();
         locals.sort_by_key(|m| m.vram_fit.estimated_total_mb);
         for m in locals {
@@ -644,6 +775,27 @@ pub fn build_fallback_candidates(
     }
 
     out
+}
+
+pub fn build_fallback_candidates(
+    failed_id: &str,
+    failed_provider: ProviderKind,
+    catalog: &[ModelCatalogEntry],
+    local_models: &[LocalModelEntry],
+    fallback_to_local: bool,
+) -> Vec<String> {
+    build_fallback_candidates_for_request(
+        failed_id,
+        failed_provider,
+        catalog,
+        local_models,
+        &[],
+        true,
+        fallback_to_local,
+        true,
+        false,
+        false,
+    )
 }
 
 pub fn format_clean_provider_error(raw: &str) -> String {
@@ -3887,6 +4039,142 @@ mod tests {
             true,
         );
         assert_eq!(with_local, vec!["claude-sonnet-4-5", "local::qwen3.5:9b"]);
+    }
+
+    #[test]
+    fn fallback_candidates_for_request_honors_user_chain_capabilities_and_strict_discovery() {
+        let cat = vec![
+            ModelCatalogEntry {
+                id: "gemini-3-flash-preview".into(),
+                display_name: "Gemini 3 Flash".into(),
+                provider: ProviderKind::GoogleGemini,
+                context_window: 1_000_000,
+                supports_thinking: true,
+                supports_tools: true,
+                supports_vision: true,
+                tier_note: String::new(),
+                quota_limit: None,
+                reachable: true,
+                reachability_reason: String::new(),
+                antigravity_alias: None,
+                requires_payment: false,
+            },
+            ModelCatalogEntry {
+                id: "claude-sonnet-4-5".into(),
+                display_name: "Claude Sonnet".into(),
+                provider: ProviderKind::Anthropic,
+                context_window: 200_000,
+                supports_thinking: true,
+                supports_tools: true,
+                supports_vision: true,
+                tier_note: String::new(),
+                quota_limit: None,
+                reachable: true,
+                reachability_reason: String::new(),
+                antigravity_alias: None,
+                requires_payment: false,
+            },
+            ModelCatalogEntry {
+                id: "openrouter/paid-pro".into(),
+                display_name: "Paid Pro".into(),
+                provider: ProviderKind::OpenRouter,
+                context_window: 128_000,
+                supports_thinking: false,
+                supports_tools: true,
+                supports_vision: true,
+                tier_note: String::new(),
+                quota_limit: None,
+                reachable: true,
+                reachability_reason: String::new(),
+                antigravity_alias: None,
+                requires_payment: true,
+            },
+            ModelCatalogEntry {
+                id: "openrouter/free-chat-only".into(),
+                display_name: "Chat Only".into(),
+                provider: ProviderKind::OpenRouter,
+                context_window: 64_000,
+                supports_thinking: false,
+                supports_tools: false,
+                supports_vision: false,
+                tier_note: String::new(),
+                quota_limit: None,
+                reachable: true,
+                reachability_reason: String::new(),
+                antigravity_alias: None,
+                requires_payment: false,
+            },
+            ModelCatalogEntry {
+                id: "openrouter/qwen-coder:free".into(),
+                display_name: "Qwen Coder Free".into(),
+                provider: ProviderKind::OpenRouter,
+                context_window: 128_000,
+                supports_thinking: true,
+                supports_tools: true,
+                supports_vision: false,
+                tier_note: String::new(),
+                quota_limit: None,
+                reachable: true,
+                reachability_reason: String::new(),
+                antigravity_alias: None,
+                requires_payment: false,
+            },
+        ];
+
+        // With explicit fallback_chain & allow_auto_discovery = false:
+        // - Must preserve chain order, filter out paid & non-tool & non-vision models
+        // - Must NOT leak gemini-3-flash-preview since auto_discovery is false!
+        let chain = vec![
+            "openrouter/paid-pro".to_string(),
+            "openrouter/free-chat-only".to_string(),
+            "openrouter/qwen-coder:free".to_string(),
+            "claude-sonnet-4-5".to_string(),
+        ];
+        let tools_only = build_fallback_candidates_for_request(
+            "openai/primary",
+            ProviderKind::OpenAiCompat,
+            &cat,
+            &[],
+            &chain,
+            false,
+            false,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            tools_only,
+            vec!["openrouter/qwen-coder:free", "claude-sonnet-4-5"]
+        );
+
+        let vision_required = build_fallback_candidates_for_request(
+            "openai/primary",
+            ProviderKind::OpenAiCompat,
+            &cat,
+            &[],
+            &chain,
+            false,
+            false,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(vision_required, vec!["claude-sonnet-4-5"]);
+
+        // Strict Local: allow_cloud = false drops all cloud models
+        let strict_local = build_fallback_candidates_for_request(
+            "openai/primary",
+            ProviderKind::OpenAiCompat,
+            &cat,
+            &[],
+            &chain,
+            true,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert!(strict_local.is_empty());
     }
 
     #[test]
