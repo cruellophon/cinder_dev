@@ -8,7 +8,7 @@ use crate::theme::{
     primary_button, secondary_button, segmented_control, setting_group, underline_tab,
     CinderPalette,
 };
-use harness_models::{DownloadStatus, FitTier, VramFitAssessment};
+use harness_models::{assess_oom_risk, DownloadStatus, FitTier, OomRiskLevel, VramFitAssessment};
 use harness_store::{ModelQuotaSnapshot, ProviderKind, QuotaTier};
 use std::sync::Arc;
 
@@ -498,11 +498,29 @@ fn render_local_model_tile(
         });
     }
     let (vram_short, vram_col) = concise_vram_badge(&m.vram_fit, p);
+    let oom = assess_oom_risk(
+        &m.vram_fit,
+        snap.settings.local_ctx_size,
+        snap.settings.local_gpu_layers,
+        snap.hardware.primary_vram_mb,
+        snap.hardware.system_ram_mb,
+    );
+    let vram_tooltip = match oom.level {
+        OomRiskLevel::Safe => m.vram_fit.label.clone(),
+        _ => format!("{}\n{}", m.vram_fit.label, oom.detail),
+    };
     badges.push(ModelTileBadge {
         label: vram_short,
         color: vram_col,
-        tooltip: Some(m.vram_fit.label.clone()),
+        tooltip: Some(vram_tooltip),
     });
+    if oom.level == OomRiskLevel::HighOomRisk {
+        badges.push(ModelTileBadge {
+            label: oom.summary.clone(),
+            color: p.red,
+            tooltip: Some(oom.detail.clone()),
+        });
+    }
 
     let tail = short_path_tail(&m.gguf_path);
     let spec = ModelTileSpec {
@@ -631,6 +649,109 @@ fn render_vault_tab(
                 egui::ProgressBar::new((vram_used as f32 / vram_total_mb as f32).clamp(0.0, 1.0))
                     .text(format!("{vram_used} / {vram_total_mb} MB VRAM")),
             );
+
+            if let Some(ref err) = snap.server_status.last_error {
+                ui.add_space(8.0);
+                egui::Frame::new()
+                    .fill(p.bg_elev)
+                    .stroke(egui::Stroke::new(1.0_f32, p.red))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("⚠ Local Engine Error")
+                                    .strong()
+                                    .small()
+                                    .color(p.red),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if secondary_button(ui, p, "Tune Context / NGL").clicked() {
+                                        state.open_settings(SettingsTab::Engine);
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(err).small().color(p.text),
+                            )
+                            .wrap()
+                            .selectable(true),
+                        );
+                    });
+            }
+
+            if !snap.server_status.recent_logs.is_empty() {
+                ui.add_space(8.0);
+                let log_count = snap.server_status.recent_logs.len();
+                egui::CollapsingHeader::new(
+                    egui::RichText::new(format!(
+                        "Engine Diagnostics · llama-server ({log_count} lines)"
+                    ))
+                    .small()
+                    .strong()
+                    .color(p.text),
+                )
+                .id_salt("forge_llama_diag")
+                .default_open(snap.server_status.last_error.is_some())
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Recent stdout/stderr from local engine")
+                                .small()
+                                .color(p.muted),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ghost_button(ui, p, "Copy Log").clicked() {
+                                ui.ctx()
+                                    .copy_text(snap.server_status.recent_logs.join("\n"));
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    egui::Frame::new()
+                        .fill(p.bg_card)
+                        .stroke(egui::Stroke::new(1.0_f32, p.border))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("forge_llama_diag_scroll")
+                                .max_height(150.0)
+                                .auto_shrink([false, true])
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    for line in &snap.server_status.recent_logs {
+                                        let low = line.to_ascii_lowercase();
+                                        let color = if low.contains("error")
+                                            || low.contains("failed")
+                                            || low.contains("oom")
+                                            || low.contains("out of memory")
+                                            || low.contains("fatal")
+                                        {
+                                            p.red
+                                        } else {
+                                            p.muted
+                                        };
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(line)
+                                                    .small()
+                                                    .monospace()
+                                                    .color(color),
+                                            )
+                                            .wrap()
+                                            .selectable(true),
+                                        );
+                                    }
+                                });
+                        });
+                });
+            }
         },
     );
 

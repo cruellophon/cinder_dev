@@ -9,7 +9,6 @@ futures-util.workspace = true
 harness-models = { path = "../harness-models" }
 harness-net = { path = "../harness-net" }
 harness-store = { path = "../harness-store" }
-regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

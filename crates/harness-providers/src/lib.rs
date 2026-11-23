@@ -167,7 +167,7 @@ async fn complete_single(
                                 "Local model backend changed unexpectedly during recovery."
                             );
                         }
-                        complete_openai_compat(
+                        let retry_resp = complete_openai_compat(
                             gate,
                             store,
                             &format!("{next_endpoint}/v1/chat/completions"),
@@ -176,7 +176,17 @@ async fn complete_single(
                             effective_req,
                             "local_inference",
                         )
-                        .await?
+                        .await;
+                        match retry_resp {
+                            Ok(ok) => ok,
+                            Err(retry_err) => {
+                                let post_status = server_mgr.server_status().await;
+                                if let Some(diag) = post_status.last_error {
+                                    anyhow::bail!("{retry_err} ({diag})");
+                                }
+                                return Err(retry_err);
+                            }
+                        }
                     }
                     Err(e) => return Err(e),
                 }
@@ -879,6 +889,7 @@ async fn complete_ollama_loopback(
         }
         if any_delta && last_flush.elapsed() >= Duration::from_millis(75) {
             let (clean_so_far, tag_th) = extract_think_tags_streaming(&raw_content);
+            let clean_preview = strip_live_inline_tool_markup(&clean_so_far);
             let combined_th = match (raw_thinking.trim().is_empty(), tag_th) {
                 (true, Some(t)) => t,
                 (false, Some(t)) => format!("{}\n\n{t}", raw_thinking.trim()),
@@ -886,7 +897,7 @@ async fn complete_ollama_loopback(
                 (true, None) => String::new(),
             };
             store
-                .update_activity_deltas(&combined_th, &clean_so_far)
+                .update_activity_deltas(&combined_th, clean_preview)
                 .await;
             last_flush = Instant::now();
         }
@@ -904,7 +915,7 @@ async fn complete_ollama_loopback(
         );
     }
 
-    let (clean_content, tag_thinking) = extract_think_tags(&raw_content);
+    let (mut clean_content, tag_thinking) = extract_think_tags(&raw_content);
     let msg_thinking = if raw_thinking.trim().is_empty() {
         None
     } else {
@@ -918,7 +929,12 @@ async fn complete_ollama_loopback(
     };
 
     if tool_calls.is_empty() && !req.tools.is_empty() {
-        tool_calls = extract_fallback_tool_calls(&clean_content);
+        let allowed: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        let (stripped, extracted) = extract_fallback_tool_calls_and_clean(&clean_content, &allowed);
+        if !extracted.is_empty() {
+            clean_content = stripped;
+            tool_calls = extracted;
+        }
     }
 
     Ok(CompletionResponse {
@@ -1072,7 +1088,7 @@ impl OpenAiStreamAccumulator {
         req: &CompletionRequest,
         latency_ms: u64,
     ) -> CompletionResponse {
-        let (clean_content, tag_thinking) = extract_think_tags(&self.raw_content);
+        let (mut clean_content, tag_thinking) = extract_think_tags(&self.raw_content);
         let reasoning_clean = {
             let trimmed = self.reasoning_out.trim();
             if trimmed.is_empty() {
@@ -1115,7 +1131,13 @@ impl OpenAiStreamAccumulator {
             .collect();
 
         if tool_calls.is_empty() && !req.tools.is_empty() {
-            tool_calls = extract_fallback_tool_calls(&clean_content);
+            let allowed: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+            let (stripped, extracted) =
+                extract_fallback_tool_calls_and_clean(&clean_content, &allowed);
+            if !extracted.is_empty() {
+                clean_content = stripped;
+                tool_calls = extracted;
+            }
         }
 
         CompletionResponse {
@@ -1192,8 +1214,9 @@ async fn drive_sse_stream(
         }
 
         if any_delta && last_flush.elapsed() >= Duration::from_millis(45) {
+            let clean_preview = strip_live_inline_tool_markup(&latest_text);
             store
-                .update_activity_deltas(&latest_thought, &latest_text)
+                .update_activity_deltas(&latest_thought, clean_preview)
                 .await;
             last_flush = Instant::now();
         }
@@ -1220,8 +1243,9 @@ async fn drive_sse_stream(
     }
 
     if saw_sse_data {
+        let clean_preview = strip_live_inline_tool_markup(&latest_text);
         store
-            .update_activity_deltas(&latest_thought, &latest_text)
+            .update_activity_deltas(&latest_thought, clean_preview)
             .await;
     }
 
@@ -3178,22 +3202,511 @@ pub fn extract_think_tags_streaming(raw: &str) -> (String, Option<String>) {
     extract_think_tags(raw)
 }
 
-fn extract_fallback_tool_calls(text: &str) -> Vec<ToolCallRequest> {
-    let mut calls = Vec::new();
-    let re = regex::Regex::new(r"(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>").unwrap();
-    for cap in re.captures_iter(text) {
-        if let Ok(val) = serde_json::from_str::<Value>(&cap[1]) {
-            if let Some(name) = val["name"].as_str() {
-                calls.push(ToolCallRequest {
-                    id: Uuid::new_v4().to_string(),
-                    name: name.to_string(),
-                    arguments: val.get("arguments").cloned().unwrap_or_else(|| json!({})),
-                    thought_signature: None,
-                });
+pub fn parse_gemma_like_args_to_json(body: &str) -> Option<Value> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Some(json!({}));
+    }
+    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+        return Some(val);
+    }
+
+    let bytes = trimmed.as_bytes();
+    let mut out = String::with_capacity(trimmed.len() + 32);
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let rem = &trimmed[i..];
+        if rem.starts_with("<|\"|>") {
+            i += "<|\"|>".len();
+            let after = &trimmed[i..];
+            let end_rel = after.find("<|\"|>")?;
+            let literal = &after[..end_rel];
+            let quoted = serde_json::to_string(literal).ok()?;
+            out.push_str(&quoted);
+            i += end_rel + "<|\"|>".len();
+            continue;
+        }
+
+        let ch = rem.chars().next()?;
+        if ch == '"' {
+            out.push('"');
+            i += 1;
+            while i < bytes.len() {
+                let c = trimmed[i..].chars().next()?;
+                out.push(c);
+                i += c.len_utf8();
+                if c == '\\' && i < bytes.len() {
+                    let esc = trimmed[i..].chars().next()?;
+                    out.push(esc);
+                    i += esc.len_utf8();
+                } else if c == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let prev_non_ws = out.chars().rev().find(|c| !c.is_whitespace());
+            let mut end = i + ch.len_utf8();
+            while end < bytes.len() {
+                let nc = trimmed[end..].chars().next()?;
+                if nc.is_ascii_alphanumeric() || nc == '_' {
+                    end += nc.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let ident = &trimmed[i..end];
+            let next_non_ws = trimmed[end..].chars().find(|c| !c.is_whitespace());
+            if matches!(prev_non_ws, Some('{') | Some(',')) && next_non_ws == Some(':') {
+                out.push('"');
+                out.push_str(ident);
+                out.push('"');
+                i = end;
+                continue;
+            }
+            out.push_str(ident);
+            i = end;
+            continue;
+        }
+
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    serde_json::from_str::<Value>(&out).ok()
+}
+
+fn extract_balanced_json_object(src: &str, open_brace_idx: usize) -> Option<usize> {
+    if !src.get(open_brace_idx..)?.starts_with('{') {
+        return None;
+    }
+    let bytes = src.as_bytes();
+    let mut i = open_brace_idx;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        let rem = &src[i..];
+        if rem.starts_with("<|\"|>") {
+            i += "<|\"|>".len();
+            let rel_end = src[i..].find("<|\"|>")?;
+            i += rel_end + "<|\"|>".len();
+            continue;
+        }
+        let ch = rem.chars().next()?;
+        if ch == '"' {
+            i += 1;
+            while i < bytes.len() {
+                let c = src[i..].chars().next()?;
+                i += c.len_utf8();
+                if c == '\\' && i < bytes.len() {
+                    let esc = src[i..].chars().next()?;
+                    i += esc.len_utf8();
+                } else if c == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '{' {
+            depth += 1;
+        } else if ch == '}' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(i + 1);
             }
         }
+        i += ch.len_utf8();
     }
-    calls
+    None
+}
+
+fn is_valid_inline_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+fn normalize_inline_tool_arguments(val: Option<&Value>) -> Value {
+    match val {
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str::<Value>(t)
+                    .ok()
+                    .or_else(|| parse_gemma_like_args_to_json(t))
+                    .unwrap_or_else(|| json!({ "raw": s }))
+            }
+        }
+        Some(Value::Null) | None => json!({}),
+        Some(other) => other.clone(),
+    }
+}
+
+fn parse_json_tool_object(val: &Value) -> Option<(String, Value)> {
+    if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
+        let args = normalize_inline_tool_arguments(
+            val.get("arguments").or_else(|| val.get("parameters")),
+        );
+        return Some((name.trim().to_string(), args));
+    }
+    if let Some(func) = val.get("function").and_then(|v| v.as_object()) {
+        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+            let args = normalize_inline_tool_arguments(
+                func.get("arguments").or_else(|| func.get("parameters")),
+            );
+            return Some((name.trim().to_string(), args));
+        }
+    }
+    None
+}
+
+fn consume_optional_close_tag(src: &str, mut idx: usize, close_tags: &[&str]) -> usize {
+    let ws = src[idx..]
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(src.len() - idx);
+    let after_ws = idx + ws;
+    for tag in close_tags {
+        if src[after_ws..].starts_with(tag) {
+            idx = after_ws + tag.len();
+            return idx;
+        }
+    }
+    idx
+}
+
+fn strip_markdown_code_fence(s: &str) -> &str {
+    let t = s.trim();
+    if let Some(after_ticks) = t.strip_prefix("```") {
+        let body = if let Some(nl) = after_ticks.find('\n') {
+            &after_ticks[nl + 1..]
+        } else {
+            after_ticks
+        };
+        let body = body.trim();
+        return body.strip_suffix("```").unwrap_or(body).trim();
+    }
+    t
+}
+
+pub fn strip_live_inline_tool_markup(s: &str) -> &str {
+    const OPEN_MARKERS: [&str; 7] = [
+        "<|tool_call|>",
+        "<tool_call>",
+        "<function_call>",
+        "<｜tool▁calls▁begin｜>",
+        "<｜tool▁call▁begin｜>",
+        "<|tool_calls_begin|>",
+        "<|tool_call_begin|>",
+    ];
+    let mut earliest: Option<usize> = None;
+    for marker in OPEN_MARKERS {
+        if let Some(pos) = s.find(marker) {
+            earliest = Some(earliest.map_or(pos, |e| e.min(pos)));
+        }
+    }
+    match earliest {
+        Some(pos) => s[..pos].trim_end(),
+        None => s,
+    }
+}
+
+/// Extract inline fallback tool calls across Gemma (`<|tool_call|>call:...`),
+/// Qwen/Hermes (`<tool_call>{...}</tool_call>`), and DeepSeek
+/// (`<｜tool▁call▁begin｜>...<｜tool▁call▁end｜>`) formats, stripping matched
+/// raw markup from the returned assistant content.
+pub fn extract_fallback_tool_calls_and_clean(
+    text: &str,
+    allowed_tool_names: &[&str],
+) -> (String, Vec<ToolCallRequest>) {
+    let is_allowed = |name: &str| -> bool {
+        is_valid_inline_tool_name(name)
+            && (allowed_tool_names.is_empty() || allowed_tool_names.iter().any(|&a| a == name))
+    };
+
+    let mut spans: Vec<(usize, usize, ToolCallRequest)> = Vec::new();
+
+    // 1. Gemma 3/4 inline format: `<|tool_call|>call:<name>{...}<|tool_call|>` (or JSON inside tag)
+    const GEMMA_OPEN: &str = "<|tool_call|>";
+    let mut pos = 0usize;
+    while let Some(rel) = text[pos..].find(GEMMA_OPEN) {
+        let start = pos + rel;
+        let after_open = start + GEMMA_OPEN.len();
+        let ws = text[after_open..]
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(text.len() - after_open);
+        let body_start = after_open + ws;
+        let rem = &text[body_start..];
+        let after_call = rem.strip_prefix("call:").unwrap_or(rem);
+        let after_call_abs = body_start + (rem.len() - after_call.len());
+
+        let mut matched_span_end: Option<usize> = None;
+        if after_call.starts_with('{') {
+            if let Some(obj_end_rel) = extract_balanced_json_object(after_call, 0) {
+                if let Some(val) = parse_gemma_like_args_to_json(&after_call[..obj_end_rel]) {
+                    if let Some((name, args)) = parse_json_tool_object(&val) {
+                        let span_end = consume_optional_close_tag(
+                            text,
+                            after_call_abs + obj_end_rel,
+                            &["<|/tool_call|>", "<|tool_call|>"],
+                        );
+                        matched_span_end = Some(span_end);
+                        if is_allowed(&name) {
+                            spans.push((
+                                start,
+                                span_end,
+                                ToolCallRequest {
+                                    id: Uuid::new_v4().to_string(),
+                                    name,
+                                    arguments: args,
+                                    thought_signature: None,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+        } else if let Some(brace_rel) = after_call.find('{') {
+            let name = after_call[..brace_rel].trim();
+            if is_valid_inline_tool_name(name) {
+                if let Some(obj_end_rel) = extract_balanced_json_object(after_call, brace_rel) {
+                    if let Some(args) =
+                        parse_gemma_like_args_to_json(&after_call[brace_rel..obj_end_rel])
+                    {
+                        let span_end = consume_optional_close_tag(
+                            text,
+                            after_call_abs + obj_end_rel,
+                            &["<|/tool_call|>", "<|tool_call|>"],
+                        );
+                        matched_span_end = Some(span_end);
+                        if is_allowed(name) {
+                            spans.push((
+                                start,
+                                span_end,
+                                ToolCallRequest {
+                                    id: Uuid::new_v4().to_string(),
+                                    name: name.to_string(),
+                                    arguments: args,
+                                    thought_signature: None,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        pos = matched_span_end.unwrap_or(after_open);
+    }
+
+    // 2. Qwen / Hermes / Llama / Mistral XML tags: `<tool_call>...</tool_call>` & `<function_call>...</function_call>`
+    for (open_tag, close_tag) in [
+        ("<tool_call>", "</tool_call>"),
+        ("<function_call>", "</function_call>"),
+    ] {
+        let mut pos = 0usize;
+        while let Some(rel) = text[pos..].find(open_tag) {
+            let start = pos + rel;
+            let after_open = start + open_tag.len();
+            let next_open_rel = text[after_open..].find(open_tag);
+            let close_rel = text[after_open..].find(close_tag);
+
+            let (block_end, span_end) = match (close_rel, next_open_rel) {
+                (Some(cr), Some(no)) if cr < no => {
+                    (after_open + cr, after_open + cr + close_tag.len())
+                }
+                (Some(cr), None) => (after_open + cr, after_open + cr + close_tag.len()),
+                (None, None) => (text.len(), text.len()),
+                _ => {
+                    pos = after_open;
+                    continue;
+                }
+            };
+
+            let inner = &text[after_open..block_end];
+            let mut extracted_here: Vec<ToolCallRequest> = Vec::new();
+            let mut idx = 0usize;
+            while let Some(brace_rel) = inner[idx..].find('{') {
+                let brace_abs = idx + brace_rel;
+                let Some(obj_end) = extract_balanced_json_object(inner, brace_abs) else {
+                    break;
+                };
+                let prefix_before_brace = inner[idx..brace_abs].trim();
+                let gemma_name = prefix_before_brace
+                    .strip_prefix("call:")
+                    .unwrap_or(prefix_before_brace)
+                    .trim();
+
+                let json_slice = &inner[brace_abs..obj_end];
+                if let Some(val) = parse_gemma_like_args_to_json(json_slice) {
+                    if let Some((name, args)) = parse_json_tool_object(&val) {
+                        if is_allowed(&name) {
+                            extracted_here.push(ToolCallRequest {
+                                id: Uuid::new_v4().to_string(),
+                                name,
+                                arguments: args,
+                                thought_signature: None,
+                            });
+                        }
+                    } else if is_allowed(gemma_name) {
+                        extracted_here.push(ToolCallRequest {
+                            id: Uuid::new_v4().to_string(),
+                            name: gemma_name.to_string(),
+                            arguments: val,
+                            thought_signature: None,
+                        });
+                    }
+                }
+                idx = obj_end;
+            }
+
+            if !extracted_here.is_empty() {
+                for req in extracted_here {
+                    spans.push((start, span_end, req));
+                }
+            }
+            pos = span_end;
+        }
+    }
+
+    // 3. DeepSeek R1/V3 inline tokens: `<｜tool▁call▁begin｜>...<｜tool▁sep｜><name>...<｜tool▁call▁end｜>`
+    for (open_tok, sep_tok, close_tok, calls_end_tok) in [
+        (
+            "<｜tool▁call▁begin｜>",
+            "<｜tool▁sep｜>",
+            "<｜tool▁call▁end｜>",
+            "<｜tool▁calls▁end｜>",
+        ),
+        (
+            "<|tool_call_begin|>",
+            "<|tool_sep|>",
+            "<|tool_call_end|>",
+            "<|tool_calls_end|>",
+        ),
+    ] {
+        let mut pos = 0usize;
+        while let Some(rel) = text[pos..].find(open_tok) {
+            let start = pos + rel;
+            let after_open = start + open_tok.len();
+            let (block_end, span_end) = if let Some(cr) = text[after_open..].find(close_tok) {
+                (after_open + cr, after_open + cr + close_tok.len())
+            } else if let Some(ce) = text[after_open..].find(calls_end_tok) {
+                (after_open + ce, after_open + ce)
+            } else {
+                (text.len(), text.len())
+            };
+
+            let inner = &text[after_open..block_end];
+            let payload_src = if let Some(sep_idx) = inner.find(sep_tok) {
+                &inner[sep_idx + sep_tok.len()..]
+            } else {
+                inner
+            };
+            let trimmed_payload = payload_src.trim_start();
+            let name_len = trimmed_payload
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+                .unwrap_or(trimmed_payload.len());
+            let name = &trimmed_payload[..name_len];
+            let arg_body = strip_markdown_code_fence(&trimmed_payload[name_len..]);
+            let parsed_args = if arg_body.is_empty() {
+                Some(json!({}))
+            } else if let Some(brace_rel) = arg_body.find('{') {
+                extract_balanced_json_object(arg_body, brace_rel)
+                    .and_then(|end| parse_gemma_like_args_to_json(&arg_body[brace_rel..end]))
+            } else {
+                parse_gemma_like_args_to_json(arg_body)
+            };
+
+            if is_allowed(name) {
+                if let Some(args) = parsed_args {
+                    spans.push((
+                        start,
+                        span_end,
+                        ToolCallRequest {
+                            id: Uuid::new_v4().to_string(),
+                            name: name.to_string(),
+                            arguments: args,
+                            thought_signature: None,
+                        },
+                    ));
+                }
+            }
+            pos = span_end.max(after_open);
+        }
+    }
+
+    if spans.is_empty() {
+        return (text.to_string(), Vec::new());
+    }
+
+    spans.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    // Keep overlapping spans that share the exact same [start, end) (e.g. multi-call XML block)
+    // and discard nested/partially overlapping spans with a strictly smaller/crossed start.
+    let mut accepted_spans: Vec<(usize, usize)> = Vec::new();
+    let mut tool_calls: Vec<ToolCallRequest> = Vec::with_capacity(spans.len());
+    let mut last_end = 0usize;
+    let mut last_exact_span: Option<(usize, usize)> = None;
+    for (s, e, req) in spans {
+        if last_exact_span == Some((s, e)) {
+            tool_calls.push(req);
+            continue;
+        }
+        if s < last_end {
+            continue;
+        }
+        accepted_spans.push((s, e));
+        last_exact_span = Some((s, e));
+        last_end = e;
+        tool_calls.push(req);
+    }
+
+    let mut stitched = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (s, e) in accepted_spans {
+        if s > cursor {
+            stitched.push_str(&text[cursor..s]);
+        }
+        cursor = e;
+    }
+    if cursor < text.len() {
+        stitched.push_str(&text[cursor..]);
+    }
+
+    for wrapper in [
+        "<｜tool▁calls▁begin｜>",
+        "<｜tool▁calls▁end｜>",
+        "<|tool_calls_begin|>",
+        "<|tool_calls_end|>",
+    ] {
+        if stitched.contains(wrapper) {
+            stitched = stitched.replace(wrapper, "");
+        }
+    }
+
+    // Collapse runs of 3+ consecutive newlines caused by stripping tool blocks.
+    let mut collapsed = String::with_capacity(stitched.len());
+    let mut empty_run = 0usize;
+    for line in stitched.lines() {
+        if line.trim().is_empty() {
+            empty_run += 1;
+            if empty_run <= 1 && !collapsed.is_empty() {
+                collapsed.push('\n');
+            }
+        } else {
+            empty_run = 0;
+            if !collapsed.is_empty() {
+                collapsed.push('\n');
+            }
+            collapsed.push_str(line.trim_end());
+        }
+    }
+
+    (collapsed.trim().to_string(), tool_calls)
 }
 
 #[cfg(test)]
@@ -3707,5 +4220,54 @@ mod tests {
         assert_eq!(resp.tool_calls[0].arguments, json!({ "path": "Cargo.toml" }));
         assert_eq!(resp.prompt_tokens, 30);
         assert_eq!(resp.completion_tokens, 18);
+    }
+
+    #[test]
+    fn extracts_gemma_qwen_and_deepseek_inline_tool_calls_and_cleans_text() {
+        let gemma = "Let me check that file.\n<|tool_call|>call:read_file{path:<|\"|>src/main.rs<|\"|>,start_line:1}<|tool_call|>";
+        let (clean_g, calls_g) =
+            extract_fallback_tool_calls_and_clean(gemma, &["read_file", "list_dir"]);
+        assert_eq!(clean_g, "Let me check that file.");
+        assert_eq!(calls_g.len(), 1);
+        assert_eq!(calls_g[0].name, "read_file");
+        assert_eq!(calls_g[0].arguments["path"], "src/main.rs");
+        assert_eq!(calls_g[0].arguments["start_line"], 1);
+
+        let gemma_nested = "<|tool_call|>call:submit_plan{plan_title:<|\"|>Site<|\"|>,plan_steps:[{description:<|\"|>Step 1<|\"|>,file_path:<|\"|>a.rs<|\"|>}]}<|tool_call|>";
+        let (clean_gn, calls_gn) =
+            extract_fallback_tool_calls_and_clean(gemma_nested, &["submit_plan"]);
+        assert!(clean_gn.is_empty());
+        assert_eq!(calls_gn.len(), 1);
+        assert_eq!(calls_gn[0].name, "submit_plan");
+        assert_eq!(calls_gn[0].arguments["plan_steps"][0]["file_path"], "a.rs");
+
+        let qwen = "Scanning files...\n<tool_call>\n{\"name\":\"list_dir\",\"arguments\":{\"path\":\"src\"}}\n</tool_call>\n<tool_call>\n{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"Cargo.toml\\\"}\"}\n</tool_call>";
+        let (clean_q, calls_q) =
+            extract_fallback_tool_calls_and_clean(qwen, &["list_dir", "read_file"]);
+        assert_eq!(clean_q, "Scanning files...");
+        assert_eq!(calls_q.len(), 2);
+        assert_eq!(calls_q[0].name, "list_dir");
+        assert_eq!(calls_q[0].arguments, json!({ "path": "src" }));
+        assert_eq!(calls_q[1].name, "read_file");
+        assert_eq!(calls_q[1].arguments, json!({ "path": "Cargo.toml" }));
+
+        let deepseek = "Searching repository.\n<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>grep_search\n```json\n{\"query\":\"TODO\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+        let (clean_d, calls_d) = extract_fallback_tool_calls_and_clean(deepseek, &["grep_search"]);
+        assert_eq!(clean_d, "Searching repository.");
+        assert_eq!(calls_d.len(), 1);
+        assert_eq!(calls_d[0].name, "grep_search");
+        assert_eq!(calls_d[0].arguments, json!({ "query": "TODO" }));
+    }
+
+    #[test]
+    fn inline_tool_parser_respects_allowlist_and_live_stripper() {
+        let disallowed =
+            "Documentation example:\n<tool_call>{\"name\":\"unknown_tool\",\"arguments\":{}}</tool_call>";
+        let (clean, calls) = extract_fallback_tool_calls_and_clean(disallowed, &["read_file"]);
+        assert!(calls.is_empty());
+        assert_eq!(clean, disallowed);
+
+        let streaming = "Checking now.\n<|tool_call|>call:read_file{path:<|\"|>Cargo.toml";
+        assert_eq!(strip_live_inline_tool_markup(streaming), "Checking now.");
     }
 }

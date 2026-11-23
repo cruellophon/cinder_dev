@@ -5,12 +5,12 @@ use harness_store::{probe_storage_drives, DriveInfo};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::sync::{watch, RwLock};
 use uuid::Uuid;
@@ -187,6 +187,10 @@ pub struct ServerStatus {
     pub vram_bytes: u64,
     #[serde(default)]
     pub has_mmproj: bool,
+    #[serde(default)]
+    pub recent_logs: Vec<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 pub fn probe_hardware() -> HardwareReport {
@@ -561,6 +565,143 @@ pub fn assess_vram_fit(
             estimated_total_mb,
             recommended_ngl: 12,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OomRiskLevel {
+    Safe,
+    VramTight,
+    HighOomRisk,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OomRiskAssessment {
+    pub level: OomRiskLevel,
+    pub summary: String,
+    pub detail: String,
+    pub estimated_total_mb: u64,
+    pub available_pool_mb: u64,
+}
+
+pub fn assess_oom_risk(
+    fit: &VramFitAssessment,
+    ctx_size: u32,
+    requested_gpu_layers: i32,
+    vram_total_mb: u64,
+    system_ram_mb: u64,
+) -> OomRiskAssessment {
+    if vram_total_mb == 0 {
+        let usable_ram_mb = (system_ram_mb * 80) / 100;
+        if system_ram_mb > 0 && fit.estimated_total_mb > usable_ram_mb {
+            return OomRiskAssessment {
+                level: OomRiskLevel::HighOomRisk,
+                summary: "RAM OOM Risk".into(),
+                detail: format!(
+                    "Estimated ~{} MB ({} MB weights + {} MB KV cache @ {} ctx) exceeds safe system RAM headroom (~{} MB). Lower context size or choose a smaller quant.",
+                    fit.estimated_total_mb,
+                    fit.weights_mb,
+                    fit.kv_cache_mb,
+                    ctx_size,
+                    usable_ram_mb
+                ),
+                estimated_total_mb: fit.estimated_total_mb,
+                available_pool_mb: usable_ram_mb,
+            };
+        }
+        if system_ram_mb > 0 && fit.estimated_total_mb > (system_ram_mb * 65) / 100 {
+            return OomRiskAssessment {
+                level: OomRiskLevel::VramTight,
+                summary: "Tight RAM".into(),
+                detail: format!(
+                    "Estimated ~{} MB uses most of available system RAM ({} MB total) @ {} ctx.",
+                    fit.estimated_total_mb, system_ram_mb, ctx_size
+                ),
+                estimated_total_mb: fit.estimated_total_mb,
+                available_pool_mb: usable_ram_mb,
+            };
+        }
+        return OomRiskAssessment {
+            level: OomRiskLevel::Safe,
+            summary: "Memory OK".into(),
+            detail: format!(
+                "Estimated ~{} MB fits comfortably in {} MB system RAM.",
+                fit.estimated_total_mb, system_ram_mb
+            ),
+            estimated_total_mb: fit.estimated_total_mb,
+            available_pool_mb: usable_ram_mb,
+        };
+    }
+
+    let usable_vram_mb = (vram_total_mb * 90) / 100;
+    let usable_ram_mb = (system_ram_mb * 80) / 100;
+    let combined_pool_mb = if system_ram_mb > 0 {
+        usable_vram_mb + usable_ram_mb
+    } else {
+        usable_vram_mb
+    };
+
+    if system_ram_mb > 0 && fit.estimated_total_mb > combined_pool_mb {
+        return OomRiskAssessment {
+            level: OomRiskLevel::HighOomRisk,
+            summary: "High OOM Risk".into(),
+            detail: format!(
+                "Estimated ~{} MB ({} MB weights + {} MB KV cache @ {} ctx) exceeds combined GPU+RAM headroom (~{} MB). Lower context size or choose a smaller quant.",
+                fit.estimated_total_mb,
+                fit.weights_mb,
+                fit.kv_cache_mb,
+                ctx_size,
+                combined_pool_mb
+            ),
+            estimated_total_mb: fit.estimated_total_mb,
+            available_pool_mb: combined_pool_mb,
+        };
+    }
+
+    if requested_gpu_layers >= 99
+        && fit.estimated_total_mb > vram_total_mb
+        && fit.tier == FitTier::CpuHeavy
+    {
+        return OomRiskAssessment {
+            level: OomRiskLevel::HighOomRisk,
+            summary: "VRAM OOM Risk".into(),
+            detail: format!(
+                "Estimated ~{} MB with NGL {} far exceeds {} MB VRAM (Serve & Use caps NGL to {} to protect VRAM). Reduce context size or NGL if loading fails.",
+                fit.estimated_total_mb,
+                requested_gpu_layers,
+                vram_total_mb,
+                fit.recommended_ngl
+            ),
+            estimated_total_mb: fit.estimated_total_mb,
+            available_pool_mb: combined_pool_mb,
+        };
+    }
+
+    if fit.estimated_total_mb > usable_vram_mb
+        || (ctx_size >= 32768 && fit.estimated_total_mb > (vram_total_mb * 82) / 100)
+    {
+        return OomRiskAssessment {
+            level: OomRiskLevel::VramTight,
+            summary: "Tight VRAM".into(),
+            detail: format!(
+                "Estimated ~{} MB vs ~{} MB usable VRAM (@ {} ctx). Partial RAM spill or slower tokens possible.",
+                fit.estimated_total_mb, usable_vram_mb, ctx_size
+            ),
+            estimated_total_mb: fit.estimated_total_mb,
+            available_pool_mb: combined_pool_mb,
+        };
+    }
+
+    OomRiskAssessment {
+        level: OomRiskLevel::Safe,
+        summary: "Memory OK".into(),
+        detail: format!(
+            "Estimated ~{} MB fits comfortably within {} MB VRAM / {} MB RAM headroom.",
+            fit.estimated_total_mb, vram_total_mb, system_ram_mb
+        ),
+        estimated_total_mb: fit.estimated_total_mb,
+        available_pool_mb: combined_pool_mb,
     }
 }
 
@@ -1387,10 +1528,89 @@ struct OllamaTagModel {
     name: String,
 }
 
+const MAX_SERVER_LOG_LINES: usize = 40;
+
+fn truncate_chars_with_ellipsis(s: &str, max_chars: usize) -> String {
+    let mut count = 0usize;
+    for (idx, _) in s.char_indices() {
+        if count == max_chars {
+            return format!("{}…", s[..idx].trim_end());
+        }
+        count += 1;
+    }
+    s.to_string()
+}
+
+pub fn push_server_log_line(buf: &mut VecDeque<String>, raw_line: &str) {
+    let cleaned = raw_line.trim_end_matches(&['\r', '\n'][..]).trim_end();
+    if cleaned.trim().is_empty() {
+        return;
+    }
+    let line = truncate_chars_with_ellipsis(cleaned, 320);
+    while buf.len() >= MAX_SERVER_LOG_LINES {
+        buf.pop_front();
+    }
+    buf.push_back(line);
+}
+
+pub fn summarize_recent_server_logs(lines: &[String]) -> Option<String> {
+    if lines.is_empty() {
+        return None;
+    }
+    const ERROR_KEYWORDS: [&str; 14] = [
+        "error",
+        "failed",
+        "oom",
+        "out of memory",
+        "alloc",
+        "cuda",
+        "vulkan",
+        "invalid",
+        "cannot",
+        "fatal",
+        "unable",
+        "unknown",
+        "ggml_assert",
+        "not enough",
+    ];
+    let error_matches: Vec<&String> = lines
+        .iter()
+        .filter(|line| {
+            let low = line.to_ascii_lowercase();
+            ERROR_KEYWORDS.iter().any(|kw| low.contains(kw))
+        })
+        .collect();
+    let chosen: Vec<&str> = if !error_matches.is_empty() {
+        error_matches
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(|s| s.as_str())
+            .collect()
+    } else {
+        lines
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(|s| s.as_str())
+            .collect()
+    };
+    let joined = chosen.join(" | ");
+    if joined.trim().is_empty() {
+        None
+    } else {
+        Some(truncate_chars_with_ellipsis(&joined, 320))
+    }
+}
+
 pub struct ServerManager {
     engines_dir: PathBuf,
     install_state: Arc<RwLock<(EngineStatusKind, String, f64)>>,
     running: Arc<RwLock<Option<ManagedProcess>>>,
+    recent_logs: Arc<RwLock<VecDeque<String>>>,
+    last_error: Arc<RwLock<Option<String>>>,
 }
 
 struct ManagedProcess {
@@ -1419,6 +1639,8 @@ impl ServerManager {
                 0.0,
             ))),
             running: Arc::new(RwLock::new(None)),
+            recent_logs: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_SERVER_LOG_LINES))),
+            last_error: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -1684,7 +1906,17 @@ impl ServerManager {
         let mut guard = self.running.write().await;
         if let Some(proc) = guard.as_mut() {
             if let Some(child) = proc.child.as_mut() {
-                if let Ok(Some(_)) = child.try_wait() {
+                if let Ok(Some(exit)) = child.try_wait() {
+                    let logs_snapshot: Vec<String> =
+                        self.recent_logs.read().await.iter().cloned().collect();
+                    let exit_desc = exit.to_string();
+                    let err_msg = match summarize_recent_server_logs(&logs_snapshot) {
+                        Some(tail) => {
+                            format!("llama-server exited unexpectedly ({exit_desc}): {tail}")
+                        }
+                        None => format!("llama-server exited unexpectedly ({exit_desc})"),
+                    };
+                    *self.last_error.write().await = Some(err_msg.clone());
                     *guard = None;
                     return ServerStatus {
                         running: false,
@@ -1703,9 +1935,14 @@ impl ServerManager {
                         loaded_models: Vec::new(),
                         vram_bytes: 0,
                         has_mmproj: false,
+                        recent_logs: logs_snapshot,
+                        last_error: Some(err_msg),
                     };
                 }
             }
+            let recent_logs: Vec<String> =
+                self.recent_logs.read().await.iter().cloned().collect();
+            let last_error = self.last_error.read().await.clone();
             return ServerStatus {
                 running: true,
                 backend: proc.backend,
@@ -1723,9 +1960,13 @@ impl ServerManager {
                 loaded_models: vec![proc.model_name.clone()],
                 vram_bytes: 0,
                 has_mmproj: proc.has_mmproj,
+                recent_logs,
+                last_error,
             };
         }
 
+        let recent_logs: Vec<String> = self.recent_logs.read().await.iter().cloned().collect();
+        let last_error = self.last_error.read().await.clone();
         ServerStatus {
             running: false,
             backend: ActiveServerBackend::None,
@@ -1743,6 +1984,8 @@ impl ServerManager {
             loaded_models: Vec::new(),
             vram_bytes: 0,
             has_mmproj: false,
+            recent_logs,
+            last_error,
         }
     }
 
@@ -1845,6 +2088,7 @@ impl ServerManager {
                 let _ = child.wait().await;
             }
         }
+        *self.last_error.write().await = None;
         Ok(())
     }
 
@@ -1897,6 +2141,7 @@ impl ServerManager {
             }
         }
 
+        *self.last_error.write().await = None;
         Ok(unloaded)
     }
 
@@ -1910,6 +2155,8 @@ impl ServerManager {
         expose_local_api: bool,
     ) -> anyhow::Result<ServerStatus> {
         self.stop_server().await?;
+        self.recent_logs.write().await.clear();
+        *self.last_error.write().await = None;
 
         let bin = self.llama_server_binary();
         if bin.exists() && model.is_valid_gguf {
@@ -1942,17 +2189,23 @@ impl ServerManager {
                 effective_ngl,
                 token.as_deref(),
                 mmproj_opt.as_deref(),
+                Arc::clone(&self.recent_logs),
             )
             .await;
 
             let (child, has_mmproj) = match launch_res {
                 Ok(child) => (child, mmproj_opt.is_some()),
                 Err(first_err) if mmproj_opt.is_some() => {
-                    eprintln!(
-                        "[cinder] llama-server failed to start with --mmproj for '{}': {first_err}; retrying without --mmproj",
-                        model.name
-                    );
-                    let child = spawn_and_wait_llama_server(
+                    {
+                        let mut guard = self.recent_logs.write().await;
+                        push_server_log_line(
+                            &mut guard,
+                            &format!(
+                                "[cinder] Launch with --mmproj failed ({first_err}); retrying without --mmproj..."
+                            ),
+                        );
+                    }
+                    match spawn_and_wait_llama_server(
                         gate,
                         &bin,
                         model,
@@ -1961,11 +2214,21 @@ impl ServerManager {
                         effective_ngl,
                         token.as_deref(),
                         None,
+                        Arc::clone(&self.recent_logs),
                     )
-                    .await?;
-                    (child, false)
+                    .await
+                    {
+                        Ok(child) => (child, false),
+                        Err(err) => {
+                            *self.last_error.write().await = Some(err.to_string());
+                            return Err(err);
+                        }
+                    }
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    *self.last_error.write().await = Some(e.to_string());
+                    return Err(e);
+                }
             };
 
             let endpoint = format!("http://127.0.0.1:{port}");
@@ -2067,7 +2330,9 @@ impl ServerManager {
             }
         }
 
-        anyhow::bail!("llama-server is not installed yet and local Ollama did not start. Install llama-server in Settings → Local Engine & HF Hub.");
+        let msg = "llama-server is not installed yet and local Ollama did not start. Install llama-server in Settings → Local Engine & HF Hub.".to_string();
+        *self.last_error.write().await = Some(msg.clone());
+        anyhow::bail!("{msg}");
     }
 
     pub async fn check_idle_unload(&self, gate: &NetworkGate, idle_unload_minutes: u64) -> bool {
@@ -2140,6 +2405,7 @@ async fn spawn_and_wait_llama_server(
     effective_ngl: i32,
     token: Option<&str>,
     mmproj_opt: Option<&Path>,
+    recent_logs: Arc<RwLock<VecDeque<String>>>,
 ) -> anyhow::Result<Child> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args([
@@ -2191,15 +2457,41 @@ async fn spawn_and_wait_llama_server(
             cmd.env("LD_LIBRARY_PATH", combined);
         }
     }
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     configure_no_window_tokio(&mut cmd);
 
     let mut child = cmd.spawn()?;
+    if let Some(stderr) = child.stderr.take() {
+        let buf = Arc::clone(&recent_logs);
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut guard = buf.write().await;
+                push_server_log_line(&mut guard, &line);
+            }
+        });
+    }
+    if let Some(stdout) = child.stdout.take() {
+        let buf = Arc::clone(&recent_logs);
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut guard = buf.write().await;
+                push_server_log_line(&mut guard, &line);
+            }
+        });
+    }
+
     let health_url = format!("http://127.0.0.1:{port}/health");
 
     for _ in 0..120 {
         if let Ok(Some(exit)) = child.try_wait() {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            let logs_snapshot: Vec<String> = recent_logs.read().await.iter().cloned().collect();
+            if let Some(tail) = summarize_recent_server_logs(&logs_snapshot) {
+                anyhow::bail!("llama-server exited prematurely with status {exit} — {tail}");
+            }
             anyhow::bail!("llama-server exited prematurely with status {exit}");
         }
         if let Ok(req) = gate.request(Method::GET, &health_url, "local_server_health") {
@@ -2213,6 +2505,14 @@ async fn spawn_and_wait_llama_server(
     }
 
     let _ = child.kill().await;
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let logs_snapshot: Vec<String> = recent_logs.read().await.iter().cloned().collect();
+    if let Some(tail) = summarize_recent_server_logs(&logs_snapshot) {
+        anyhow::bail!(
+            "Timed out waiting for llama-server to load {} — {tail}",
+            model.name
+        );
+    }
     anyhow::bail!("Timed out waiting for llama-server to load {}", model.name)
 }
 
@@ -2880,5 +3180,61 @@ Graphics/Displays:
             .await;
         assert_eq!(gate.mode(), PrivacyMode::Hybrid);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_log_ring_buffer_truncates_utf8_and_summarizes_errors() {
+        let mut buf = VecDeque::new();
+        push_server_log_line(&mut buf, "   \r\n");
+        assert!(buf.is_empty());
+
+        let long_utf8 = format!("{}é", "a".repeat(330));
+        push_server_log_line(&mut buf, &long_utf8);
+        assert_eq!(buf.len(), 1);
+        assert!(buf[0].ends_with('…'));
+        assert!(buf[0].is_char_boundary(buf[0].len()));
+
+        for i in 0..MAX_SERVER_LOG_LINES + 5 {
+            push_server_log_line(&mut buf, &format!("line {i}\r"));
+        }
+        assert_eq!(buf.len(), MAX_SERVER_LOG_LINES);
+        assert!(!buf.iter().any(|l| l.ends_with('\r')));
+        assert_eq!(buf.back().map(String::as_str), Some("line 44"));
+
+        let logs = vec![
+            "ggml_cuda_init: found 1 CUDA devices".to_string(),
+            "llama_kv_cache_init: size = 2048 MiB".to_string(),
+            "ggml_backend_cuda_buffer_type_alloc_buffer: failed to allocate 14200.00 MiB".to_string(),
+            "error: out of memory loading weights".to_string(),
+        ];
+        let summary = summarize_recent_server_logs(&logs).unwrap();
+        assert!(summary.contains("failed to allocate"));
+        assert!(summary.contains("out of memory"));
+
+        let benign = vec!["srv: listening".to_string(), "ready".to_string()];
+        assert_eq!(
+            summarize_recent_server_logs(&benign).as_deref(),
+            Some("srv: listening | ready")
+        );
+        assert_eq!(summarize_recent_server_logs(&[]), None);
+    }
+
+    #[test]
+    fn assess_oom_risk_identifies_safe_tight_and_high_risk_configs() {
+        let small = assess_vram_fit(4 * 1024 * 1024 * 1024, 8192, 12_288);
+        let safe_res = assess_oom_risk(&small, 8192, 99, 12_288, 32_768);
+        assert_eq!(safe_res.level, OomRiskLevel::Safe);
+
+        let tight_model = assess_vram_fit(10 * 1024 * 1024 * 1024, 65_536, 12_288);
+        let tight_res = assess_oom_risk(&tight_model, 65_536, 36, 12_288, 65_536);
+        assert_eq!(tight_res.level, OomRiskLevel::VramTight);
+
+        let huge_model = assess_vram_fit(40 * 1024 * 1024 * 1024, 32_768, 12_288);
+        let oom_res = assess_oom_risk(&huge_model, 32_768, 99, 12_288, 16_384);
+        assert_eq!(oom_res.level, OomRiskLevel::HighOomRisk);
+
+        let cpu_huge = assess_vram_fit(20 * 1024 * 1024 * 1024, 8192, 0);
+        let cpu_oom = assess_oom_risk(&cpu_huge, 8192, 0, 0, 16_384);
+        assert_eq!(cpu_oom.level, OomRiskLevel::HighOomRisk);
     }
 }

@@ -1752,6 +1752,16 @@ impl BackendHandle {
                 h.toast("Local model not found.", true);
                 return;
             };
+            let oom = harness_models::assess_oom_risk(
+                &model.vram_fit,
+                snap.settings.local_ctx_size,
+                snap.settings.local_gpu_layers,
+                hw.primary_vram_mb,
+                hw.system_ram_mb,
+            );
+            if oom.level == harness_models::OomRiskLevel::HighOomRisk {
+                h.toast(format!("⚠ {}: {}", oom.summary, oom.detail), true);
+            }
             match h
                 .server_mgr
                 .start_local_model(
@@ -1774,7 +1784,10 @@ impl BackendHandle {
                     h.toast(format!("Serving {} on loopback", model.name), false);
                     h.emit_snapshot(true).await;
                 }
-                Err(e) => h.toast(e.to_string(), true),
+                Err(e) => {
+                    h.toast(e.to_string(), true);
+                    h.emit_snapshot(false).await;
+                }
             }
         });
     }

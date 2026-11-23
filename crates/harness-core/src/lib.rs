@@ -3950,75 +3950,6 @@ pub(crate) fn sanitize_plan_markdown(raw: &str) -> String {
     out.trim().to_string()
 }
 
-fn gemma_tool_args_to_json(body: &str) -> Option<Value> {
-    let bytes = body.as_bytes();
-    let mut out = String::with_capacity(body.len() + 32);
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        let rem = &body[i..];
-        if rem.starts_with("<|\"|>") {
-            i += "<|\"|>".len();
-            let after = &body[i..];
-            let end_rel = after.find("<|\"|>")?;
-            let literal = &after[..end_rel];
-            let quoted = serde_json::to_string(literal).ok()?;
-            out.push_str(&quoted);
-            i += end_rel + "<|\"|>".len();
-            continue;
-        }
-
-        let ch = rem.chars().next()?;
-        if ch == '"' {
-            out.push('"');
-            i += 1;
-            while i < bytes.len() {
-                let c = body[i..].chars().next()?;
-                out.push(c);
-                i += c.len_utf8();
-                if c == '\\' && i < bytes.len() {
-                    let esc = body[i..].chars().next()?;
-                    out.push(esc);
-                    i += esc.len_utf8();
-                } else if c == '"' {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        if ch.is_ascii_alphabetic() || ch == '_' {
-            let prev_non_ws = out.chars().rev().find(|c| !c.is_whitespace());
-            let mut end = i + ch.len_utf8();
-            while end < bytes.len() {
-                let nc = body[end..].chars().next()?;
-                if nc.is_ascii_alphanumeric() || nc == '_' {
-                    end += nc.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            let ident = &body[i..end];
-            let next_non_ws = body[end..].chars().find(|c| !c.is_whitespace());
-            if matches!(prev_non_ws, Some('{') | Some(',')) && next_non_ws == Some(':') {
-                out.push('"');
-                out.push_str(ident);
-                out.push('"');
-                i = end;
-                continue;
-            }
-            out.push_str(ident);
-            i = end;
-            continue;
-        }
-
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-
-    serde_json::from_str::<Value>(&out).ok()
-}
-
 /// Parse Gemma-style `<|tool_call|>call:submit_plan{...}<|tool_call|>` if the model emitted an inline tool call as text.
 pub(crate) fn try_parse_inline_submit_plan(model_id: &str, raw: &str) -> Option<PlanArtifact> {
     let mut rest = raw;
@@ -4033,10 +3964,7 @@ pub(crate) fn try_parse_inline_submit_plan(model_id: &str, raw: &str) -> Option<
             let trimmed_args = args_src.trim();
             if let Some(open_brace) = trimmed_args.find('{') {
                 let json_slice = &trimmed_args[open_brace..];
-                if let Ok(val) = serde_json::from_str::<Value>(json_slice) {
-                    return Some(build_plan_artifact(model_id, &val));
-                }
-                if let Some(val) = gemma_tool_args_to_json(json_slice) {
+                if let Some(val) = harness_providers::parse_gemma_like_args_to_json(json_slice) {
                     return Some(build_plan_artifact(model_id, &val));
                 }
             }

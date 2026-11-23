@@ -1243,7 +1243,6 @@ dependencies = [
  "harness-models",
  "harness-net",
  "harness-store",
- "regex",
  "reqwest",
  "serde",
  "serde_json",
