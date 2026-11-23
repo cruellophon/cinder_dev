@@ -45,178 +45,90 @@
             <p>This is what Cinder looks like in action. A true 4-column command center.</p>
         </div>
 
-        <div class="workbench-app">
-            <!-- Sidebar: Projects & Navigation -->
-            <div class="app-sidebar">
-                <div class="sidebar-top">
-                    <div class="nav-icon active" title="Chats & Sessions">💬</div>
-                    <div class="nav-icon" title="Project Files">📁</div>
-                    <div class="nav-icon" title="Search Index">🔍</div>
-                    <div class="nav-icon" title="Settings">⚙️</div>
-                </div>
-                <div class="sidebar-bottom">
-                    <div class="user-avatar" title="Cinder Engine Active">🔥</div>
-                </div>
+        <div class="workbench-preview">
+            <!-- Sidebar: Navigation -->
+            <div class="sidebar">
+                <div class="sidebar-icon active" title="Chat">💬</div>
+                <div class="sidebar-icon" title="Files">📁</div>
+                <div class="sidebar-icon" title="Search">🔍</div>
+                <div class="sidebar-icon" title="Settings">⚙️</div>
             </div>
 
-            <!-- Column 1: Conversations & History Sidebar -->
-            <div class="app-conv-pane">
-                <div class="pane-header">
-                    <span>PROJECTS</span>
-                    <button class="icon-btn">+</button>
+            <!-- Chat / Conv Pane -->
+            <div class="chat-pane">
+                <div class="chat-header">
+                    <span>CINDER PILOT</span>
+                    <span style="color: #4ade80;">● LIVE</span>
                 </div>
-                <div class="project-group">
-                    <div class="project-item active">
-                        <span class="folder-icon">📂</span> Project_Bumbo
+                <div class="chat-messages">
+                    <div class="message user">
+                        <strong>You:</strong> can you make sure the website actually reflects how you look? no fluff.
                     </div>
-                    <div class="conv-list">
-                        <div class="conv-item active">
-                            <span class="status-dot"></span> website-redesign-v2
+                    <div class="message cinder">
+                        <strong>Cinder:</strong>
+                        <div class="thought-trace">
+                            🧠 Thought Trace (Depth: Deep)<br>
+                            1. Verified workspace state.<br>
+                            2. Overhauling website markup & CSS to match 4-column UI.<br>
+                            3. Executing precise layout match.
                         </div>
-                        <div class="conv-item">
-                            <span class="status-dot offline"></span> harness-refactor
-                        </div>
-                        <div class="conv-item">
-                            <span class="status-dot offline"></span> vision-ocr-pipeline
-                        </div>
+                        <p style="margin-top: 8px;">Done. The workbench below reflects the exact UI layout.</p>
+                        <div class="review-action">📋 Implementation Plan: Approved & Executed</div>
                     </div>
                 </div>
             </div>
 
-            <!-- Column 2: Chat & Thought Trace Panel -->
-            <div class="app-chat-pane">
-                <div class="pane-header chat-header-bar">
-                    <div class="chat-title">
-                        <span class="agent-badge">CINDER PILOT</span>
-                        <span class="model-tag">gpt-4o / orchestrator</span>
-                    </div>
-                    <div class="header-actions">
-                        <span class="status-badge live">● LIVE</span>
-                    </div>
+            <!-- Editor Pane -->
+            <div class="editor-pane">
+                <div class="editor-tabs">
+                    <div class="tab active">index.html</div>
+                    <div class="tab">style.css</div>
+                    <div class="tab">main.rs</div>
                 </div>
-                
-                <div class="chat-stream">
-                    <div class="message user-msg">
-                        <div class="msg-author">You</div>
-                        <div class="msg-text">can you make sure the website actually reflects how you look? no fluff.</div>
-                    </div>
-
-                    <div class="message cinder-msg">
-                        <div class="msg-author">Cinder <span class="time">Just now</span></div>
-                        
-                        <!-- Thought Trace Box -->
-                        <div class="thought-trace-box">
-                            <div class="thought-header">
-                                <span class="thought-icon">🧠</span>
-                                <span>Thought Trace (Depth: Deep)</span>
-                                <span class="thought-toggle">v</span>
-                            </div>
-                            <div class="thought-body">
-                                <div>1. User noticed previous website mock was too generic.</div>
-                                <div>2. Inspecting exact UI components from workspace screenshots.</div>
-                                <div>3. Rebuilding website markup & CSS to match the 4-column Workbench layout, project lists, chat bubbles, and artifact cards.</div>
-                            </div>
-                        </div>
-
-                        <div class="msg-text">
-                            Understood. Overhauling the website markup now to match the exact 4-column workbench interface, project sidebar, and structured artifact review view.
-                        </div>
-
-                        <!-- Review / Approval Card -->
-                        <div class="artifact-preview-card">
-                            <div class="card-top">
-                                <span class="card-icon">📋</span>
-                                <span class="card-title">Implementation Plan: Align Website UI</span>
-                                <span class="badge-approved">Ready</span>
-                            </div>
-                            <div class="card-desc">
-                                Overhaul `website/index.html` and `website/style.css` to render the exact Workbench cockpit UI.
-                            </div>
-                            <div class="card-footer">
-                                <button class="btn-review-action">Review & Execute</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="chat-input-area">
-                    <div class="input-wrapper">
-                        <input type="text" placeholder="Type a message or command to Cinder..." disabled>
-                        <button class="send-btn">↑</button>
-                    </div>
+                <div class="editor-content">
+                    <pre><span style="color:#569cd6">&lt;div</span> <span style="color:#9cdcfe">class</span>=<span style="color:#ce9178">"workbench-preview"</span><span style="color:#569cd6">&gt;</span>
+    <span style="color:#6a9955">&lt;!-- 4-Column Cinder Cockpit --&gt;</span>
+    <span style="color:#569cd6">&lt;div</span> <span style="color:#9cdcfe">class</span>=<span style="color:#ce9178">"sidebar"</span><span style="color:#569cd6">&gt;</span>...<span style="color:#569cd6">&lt;/div&gt;</span>
+    <span style="color:#569cd6">&lt;div</span> <span style="color:#9cdcfe">class</span>=<span style="color:#ce9178">"chat-pane"</span><span style="color:#569cd6">&gt;</span>...<span style="color:#569cd6">&lt;/div&gt;</span>
+    <span style="color:#569cd6">&lt;div</span> <span style="color:#9cdcfe">class</span>=<span style="color:#ce9178">"editor-pane"</span><span style="color:#569cd6">&gt;</span>...<span style="color:#569cd6">&lt;/div&gt;</span>
+    <span style="color:#569cd6">&lt;div</span> <span style="color:#9cdcfe">class</span>=<span style="color:#ce9178">"file-tree-pane"</span><span style="color:#569cd6">&gt;</span>...<span style="color:#569cd6">&lt;/div&gt;</span>
+<span style="color:#569cd6">&lt;/div&gt;</span></pre>
                 </div>
             </div>
 
-            <!-- Column 3: Artifacts / Editor Workspace -->
-            <div class="app-editor-pane">
-                <div class="editor-tabs-bar">
-                    <div class="tab-item active">
-                        <span class="file-icon">🌐</span> index.html
-                        <span class="close-tab">×</span>
-                    </div>
-                    <div class="tab-item">
-                        <span class="file-icon">🎨</span> style.css
-                        <span class="close-tab">×</span>
-                    </div>
-                    <div class="tab-item">
-                        <span class="file-icon">🦀</span> main.rs
-                        <span class="close-tab">×</span>
-                    </div>
-                </div>
-
-                <div class="editor-code-view">
-                    <pre><span class="line-num">1</span><span class="code-keyword">&lt;div</span> <span class="code-attr">class</span>=<span class="code-str">"workbench-app"</span><span class="code-keyword">&gt;</span>
-<span class="line-num">2</span>    <span class="code-comment">&lt;!-- 4-Column Exact Layout Match --&gt;</span>
-<span class="line-num">3</span>    <span class="code-keyword">&lt;div</span> <span class="code-attr">class</span>=<span class="code-str">"app-sidebar"</span><span class="code-keyword">&gt;</span>...<span class="code-keyword">&lt;/div&gt;</span>
-<span class="line-num">4</span>    <span class="code-keyword">&lt;div</span> <span class="code-attr">class</span>=<span class="code-str">"app-conv-pane"</span><span class="code-keyword">&gt;</span>...<span class="code-keyword">&lt;/div&gt;</span>
-<span class="line-num">5</span>    <span class="code-keyword">&lt;div</span> <span class="code-attr">class</span>=<span class="code-str">"app-chat-pane"</span><span class="code-keyword">&gt;</span>...<span class="code-keyword">&lt;/div&gt;</span>
-<span class="line-num">6</span>    <span class="code-keyword">&lt;div</span> <span class="code-attr">class</span>=<span class="code-str">"app-editor-pane"</span><span class="code-keyword">&gt;</span>...<span class="code-keyword">&lt;/div&gt;</span>
-<span class="line-num">7</span><span class="code-keyword">&lt;/div&gt;</span></pre>
-                </div>
-            </div>
-
-            <!-- Column 4: File Tree / Inspector -->
-            <div class="app-filetree-pane">
-                <div class="pane-header">WORKSPACE</div>
-                <div class="tree-root">
-                    <div class="tree-item folder open">
-                        <span>▼</span> 📂 Project_Bumbo
-                    </div>
-                    <div class="tree-sub">
-                        <div class="tree-item folder"><span>▶</span> 📁 bins</div>
-                        <div class="tree-item folder"><span>▶</span> 📁 crates</div>
-                        <div class="tree-item folder"><span>▼</span> 📁 website</div>
-                        <div class="tree-sub">
-                            <div class="tree-item file active">📄 index.html</div>
-                            <div class="tree-item file">📄 style.css</div>
-                            <div class="tree-item folder"><span>▶</span> 📁 assets</div>
-                        </div>
-                        <div class="tree-item file">📄 CHANGELOG.md</div>
-                        <div class="tree-item file">📄 README.md</div>
-                    </div>
-                </div>
+            <!-- File Tree Pane -->
+            <div class="file-tree-pane">
+                <div class="file-tree-header">Workspace</div>
+                <div class="file-item folder">📂 Project_Bumbo</div>
+                <div class="file-item" style="padding-left: 12px;">📁 bins/</div>
+                <div class="file-item" style="padding-left: 12px;">📁 crates/</div>
+                <div class="file-item folder" style="padding-left: 12px; color: var(--text);">📂 website/</div>
+                <div class="file-item active" style="padding-left: 24px; color: var(--primary);">📄 index.html</div>
+                <div class="file-item" style="padding-left: 24px;">📄 style.css</div>
+                <div class="file-item" style="padding-left: 12px;">📄 CHANGELOG.md</div>
+                <div class="file-item" style="padding-left: 12px;">📄 README.md</div>
             </div>
         </div>
     </section>
 
-    <section id="pilot" class="features-grid-section">
+    <section id="pilot" class="feature-section" style="max-width: 1200px; margin: 0 auto;">
         <div class="section-header">
             <h2>Pilot + Engine Architecture</h2>
-            <p>Engineered for maximum reliability, speed, and absolute user control.</p>
+            <p>Engineered for absolute reliability, speed, and safety.</p>
         </div>
         <div class="grid">
             <div class="card">
-                <div class="card-icon-box">🧠</div>
+                <div class="icon">🧠</div>
                 <h3>The Pilot (Cinder)</h3>
                 <p>Autonomous agentic loop with persistent memory, multi-step planning, self-correction via `verify_workspace`, and vision support.</p>
             </div>
             <div class="card">
-                <div class="card-icon-box">⚡</div>
+                <div class="icon">⚡</div>
                 <h3>The Engine (Rust Core)</h3>
                 <p>High-performance backend managing tool dispatch, strict sandbox boundaries, cryptographic ledger, and local RAG retrieval.</p>
             </div>
             <div class="card">
-                <div class="card-icon-box">🛡️</div>
+                <div class="icon">🛡️</div>
                 <h3>Human-in-the-Loop</h3>
                 <p>No destructive file write or command execution occurs without explicit review and approval in the Workbench UI.</p>
             </div>
