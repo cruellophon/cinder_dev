@@ -1,7 +1,7 @@
 use crate::backend::{BackendHandle, OpenedFilePayload, UiSnapshot};
 use harness_models::{HfModelSummary, HfRepoDetails};
 use harness_providers::ProviderVerifyStatus;
-use harness_store::{AgentMode, ProviderKind};
+use harness_store::{AgentMode, PlanStatus, ProviderKind};
 use harness_tools::{IndexStats, KnowledgeSearchHit, McpProbeResult, WorkspaceFileNode};
 use image::GenericImageView;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -285,6 +285,7 @@ pub struct GuiState {
     pub show_model_popover: bool,
     pub attach_ws_filter: String,
     pub is_generating: bool,
+    pub turn_started_at: Option<Instant>,
 
     // Editor & Terminal
     pub editor_tabs: Vec<EditorTab>,
@@ -411,6 +412,7 @@ impl GuiState {
             show_model_popover: false,
             attach_ws_filter: String::new(),
             is_generating: false,
+            turn_started_at: None,
             editor_tabs: Vec::new(),
             active_tab_path: None,
             editor_find_open: false,
@@ -497,6 +499,44 @@ impl GuiState {
                 .as_ref()
                 .map(|s| s.live_activity.active)
                 .unwrap_or(false)
+    }
+
+    pub fn sync_turn_timer(&mut self) {
+        if self.is_busy() {
+            if self.turn_started_at.is_none() {
+                self.turn_started_at = Some(Instant::now());
+            }
+        } else {
+            self.turn_started_at = None;
+        }
+    }
+
+    pub fn format_elapsed_since_turn_start(&self) -> Option<String> {
+        let secs = self.turn_started_at?.elapsed().as_secs();
+        if secs < 60 {
+            Some(format!("{secs}s"))
+        } else {
+            Some(format!("{}m {:02}s", secs / 60, secs % 60))
+        }
+    }
+
+    pub fn approve_active_plan_optimistically(&mut self, session_id: &str) {
+        if let Some(ref mut snap_mut) = self.snap {
+            if let Some(ref mut sess_mut) = snap_mut.active_session {
+                if sess_mut.id == session_id {
+                    if let Some(ref mut ap) = sess_mut.active_plan {
+                        ap.status = PlanStatus::Approved;
+                    }
+                    for msg in &mut sess_mut.messages {
+                        if let Some(ref mut pa) = msg.plan_artifact {
+                            if pa.status == PlanStatus::AwaitingReview {
+                                pa.status = PlanStatus::Approved;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn switch_main_view(&mut self, view: MainView, record_history: bool) {

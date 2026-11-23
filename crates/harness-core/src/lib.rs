@@ -2403,18 +2403,35 @@ pub async fn handle_plan_review_action(
     let active_model = snapshot.settings.active_model_id.clone();
 
     if matches!(action, "execute" | "approve") {
-        let edited_ref = edited_markdown.as_deref();
-        let plan_md = ctx
+        let cleaned_edit = edited_markdown
+            .as_deref()
+            .map(sanitize_plan_markdown)
+            .filter(|s| !s.trim().is_empty());
+        let edited_ref = cleaned_edit.as_deref();
+        let updated_plan = ctx
             .store
             .update(|s| {
                 if let Some(sess) = s.sessions.iter_mut().find(|x| x.id == session_id) {
                     sess.mode = AgentMode::Agent;
-                    return sync_session_plan_status(sess, PlanStatus::Approved, edited_ref);
+                    let title = sess
+                        .active_plan
+                        .as_ref()
+                        .map(|p| p.title.clone())
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| "Implementation Plan".into());
+                    let md = sync_session_plan_status(sess, PlanStatus::Approved, edited_ref)?;
+                    return Some((title, md));
                 }
                 None
             })
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("No active plan found to execute."))?;
+            .await?;
+        let Some((plan_title, plan_md)) = updated_plan else {
+            anyhow::bail!("No active plan found to execute.");
+        };
+        if edited_ref.is_some() {
+            let _ = upsert_session_artifact(ctx.store, session_id, &plan_title, "plan", &plan_md)
+                .await;
+        }
 
         let prompt = format!(
             "The implementation plan has been reviewed and approved. Execute it step by step inside the active workspace and run `verify_workspace` at the end.\n\nApproved Plan:\n{plan_md}"
@@ -2452,14 +2469,33 @@ pub async fn handle_plan_review_action(
     let note = feedback
         .filter(|f| !f.trim().is_empty())
         .unwrap_or_else(|| "Please revise the plan.".into());
-    let edited_ref = edited_markdown.as_deref();
-    ctx.store
+    let cleaned_edit = edited_markdown
+        .as_deref()
+        .map(sanitize_plan_markdown)
+        .filter(|s| !s.trim().is_empty());
+    let edited_ref = cleaned_edit.as_deref();
+    let changed_plan = ctx
+        .store
         .update(|s| {
             if let Some(sess) = s.sessions.iter_mut().find(|x| x.id == session_id) {
-                sync_session_plan_status(sess, PlanStatus::ChangesRequested, edited_ref);
+                let title = sess
+                    .active_plan
+                    .as_ref()
+                    .map(|p| p.title.clone())
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| "Implementation Plan".into());
+                return sync_session_plan_status(sess, PlanStatus::ChangesRequested, edited_ref)
+                    .map(|md| (title, md));
             }
+            None
         })
         .await?;
+    if edited_ref.is_some() {
+        if let Some((plan_title, plan_md)) = changed_plan {
+            let _ = upsert_session_artifact(ctx.store, session_id, &plan_title, "plan", &plan_md)
+                .await;
+        }
+    }
 
     let prompt = format!(
         "Please revise the plan based on this review feedback and resubmit via `submit_plan`:\n{note}"
@@ -3739,6 +3775,57 @@ async fn run_agent_loop(
         }
     }
 
+    let mut fallback_plan: Option<PlanArtifact> = None;
+    if current_mode == AgentMode::Plan
+        && !ctx.store.is_aborted()
+        && !final_content.trim().is_empty()
+    {
+        if let Some(parsed) = try_parse_inline_submit_plan(&active_model_id, &final_content) {
+            final_content = sanitize_plan_markdown(&final_content);
+            if final_content.trim().is_empty() {
+                final_content =
+                    format!("Submitted implementation plan **{}** for review.", parsed.title);
+            }
+            if let Ok(art) = upsert_session_artifact(
+                ctx.store,
+                session_id,
+                &parsed.title,
+                "plan",
+                &parsed.markdown,
+            )
+            .await
+            {
+                last_artifact_id = Some(art.id);
+            }
+            fallback_plan = Some(parsed);
+        } else if final_content.lines().count() >= 4
+            || final_content.contains("##")
+            || final_content.contains("1.")
+        {
+            final_content = sanitize_plan_markdown(&final_content);
+            if !final_content.trim().is_empty() {
+                let plan = build_fallback_plan_from_notes(
+                    &active_model_id,
+                    "Implementation Plan",
+                    &final_content,
+                    PlanStatus::AwaitingReview,
+                );
+                if let Ok(art) = upsert_session_artifact(
+                    ctx.store,
+                    session_id,
+                    &plan.title,
+                    "plan",
+                    &plan.markdown,
+                )
+                .await
+                {
+                    last_artifact_id = Some(art.id);
+                }
+                fallback_plan = Some(plan);
+            }
+        }
+    }
+
     let assistant_msg = ChatMessage {
         id: Uuid::new_v4().to_string(),
         role: "assistant".into(),
@@ -3759,7 +3846,7 @@ async fn run_agent_loop(
         } else {
             None
         },
-        plan_artifact: None,
+        plan_artifact: fallback_plan.clone(),
         orchestrator_phases: mode_phases,
         attached_files: Vec::new(),
         attachments: Vec::new(),
@@ -3771,6 +3858,9 @@ async fn run_agent_loop(
         .store
         .update(|s| {
             if let Some(sess) = s.sessions.iter_mut().find(|x| x.id == session_id) {
+                if let Some(ref fp) = fallback_plan {
+                    sess.active_plan = Some(fp.clone());
+                }
                 sess.messages.push(assistant_msg);
                 sess.updated_at = Utc::now();
                 return Some(sess.clone());
@@ -3783,19 +3873,231 @@ async fn run_agent_loop(
     Ok(updated)
 }
 
+/// Remove leaked Gemma `<|tool_call|>...<|tool_call|>` blocks and `<think>` traces from Markdown.
+pub(crate) fn sanitize_plan_markdown(raw: &str) -> String {
+    let (without_think, _) = harness_providers::extract_think_tags(raw);
+    let mut cleaned = String::with_capacity(without_think.len());
+    let mut rest = without_think.as_str();
+    while let Some(start) = rest.find("<|tool_call|>") {
+        cleaned.push_str(&rest[..start]);
+        let after_start = &rest[start + "<|tool_call|>".len()..];
+        if let Some(end) = after_start.find("<|tool_call|>") {
+            rest = &after_start[end + "<|tool_call|>".len()..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    cleaned.push_str(rest);
+    let cleaned = cleaned.replace("<|\"|>", "\"");
+
+    // Collapse runs of 3+ blank lines to a single blank line
+    let mut out = String::with_capacity(cleaned.len());
+    let mut blank_run = 0usize;
+    for line in cleaned.lines() {
+        let trimmed_end = line.trim_end();
+        if trimmed_end.trim().is_empty() {
+            blank_run += 1;
+            if blank_run <= 1 && !out.is_empty() {
+                out.push('\n');
+            }
+        } else {
+            blank_run = 0;
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(trimmed_end);
+        }
+    }
+    out.trim().to_string()
+}
+
+fn gemma_tool_args_to_json(body: &str) -> Option<Value> {
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len() + 32);
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let rem = &body[i..];
+        if rem.starts_with("<|\"|>") {
+            i += "<|\"|>".len();
+            let after = &body[i..];
+            let end_rel = after.find("<|\"|>")?;
+            let literal = &after[..end_rel];
+            let quoted = serde_json::to_string(literal).ok()?;
+            out.push_str(&quoted);
+            i += end_rel + "<|\"|>".len();
+            continue;
+        }
+
+        let ch = rem.chars().next()?;
+        if ch == '"' {
+            out.push('"');
+            i += 1;
+            while i < bytes.len() {
+                let c = body[i..].chars().next()?;
+                out.push(c);
+                i += c.len_utf8();
+                if c == '\\' && i < bytes.len() {
+                    let esc = body[i..].chars().next()?;
+                    out.push(esc);
+                    i += esc.len_utf8();
+                } else if c == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let prev_non_ws = out.chars().rev().find(|c| !c.is_whitespace());
+            let mut end = i + ch.len_utf8();
+            while end < bytes.len() {
+                let nc = body[end..].chars().next()?;
+                if nc.is_ascii_alphanumeric() || nc == '_' {
+                    end += nc.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let ident = &body[i..end];
+            let next_non_ws = body[end..].chars().find(|c| !c.is_whitespace());
+            if matches!(prev_non_ws, Some('{') | Some(',')) && next_non_ws == Some(':') {
+                out.push('"');
+                out.push_str(ident);
+                out.push('"');
+                i = end;
+                continue;
+            }
+            out.push_str(ident);
+            i = end;
+            continue;
+        }
+
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    serde_json::from_str::<Value>(&out).ok()
+}
+
+/// Parse Gemma-style `<|tool_call|>call:submit_plan{...}<|tool_call|>` if the model emitted an inline tool call as text.
+pub(crate) fn try_parse_inline_submit_plan(model_id: &str, raw: &str) -> Option<PlanArtifact> {
+    let mut rest = raw;
+    while let Some(tc_start) = rest.find("<|tool_call|>") {
+        let after = &rest[tc_start + "<|tool_call|>".len()..];
+        let end_rel = after.find("<|tool_call|>").unwrap_or(after.len());
+        let block = after[..end_rel].trim();
+        if let Some(args_src) = block
+            .strip_prefix("call:submit_plan")
+            .or_else(|| block.strip_prefix("submit_plan"))
+        {
+            let trimmed_args = args_src.trim();
+            if let Some(open_brace) = trimmed_args.find('{') {
+                let json_slice = &trimmed_args[open_brace..];
+                if let Ok(val) = serde_json::from_str::<Value>(json_slice) {
+                    return Some(build_plan_artifact(model_id, &val));
+                }
+                if let Some(val) = gemma_tool_args_to_json(json_slice) {
+                    return Some(build_plan_artifact(model_id, &val));
+                }
+            }
+        }
+        if end_rel == after.len() {
+            break;
+        }
+        rest = &after[end_rel + "<|tool_call|>".len()..];
+    }
+    None
+}
+
+pub(crate) fn extract_plan_title_from_markdown(md: &str, default_title: &str) -> String {
+    for line in md.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let stripped = t.trim_start_matches('#').trim();
+        if t.starts_with('#') && !stripped.is_empty() && stripped.len() <= 96 {
+            return stripped.trim_end_matches(':').trim().to_string();
+        }
+        if let Some(rest) = t.strip_prefix("- **Title**:").or_else(|| t.strip_prefix("**Title**:")) {
+            let clean = rest.trim().trim_matches('*').trim();
+            if !clean.is_empty() && clean.len() <= 96 {
+                return clean.to_string();
+            }
+        }
+    }
+    default_title.to_string()
+}
+
+pub(crate) fn build_fallback_plan_from_notes(
+    model_id: &str,
+    default_title: &str,
+    notes: &str,
+    status: PlanStatus,
+) -> PlanArtifact {
+    let clean_md = sanitize_plan_markdown(notes);
+    let title = extract_plan_title_from_markdown(&clean_md, default_title);
+    let summary_text: String = clean_md
+        .lines()
+        .find(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .unwrap_or("Execute requested task in workspace.")
+        .trim()
+        .chars()
+        .take(180)
+        .collect();
+    PlanArtifact {
+        id: Uuid::new_v4().to_string(),
+        title,
+        summary: summary_text,
+        steps: vec![PlanStep {
+            step_number: 1,
+            description: clean_md.clone(),
+            files_touched: Vec::new(),
+            verification: None,
+        }],
+        markdown: clean_md,
+        status,
+        model_id: model_id.to_string(),
+        created_at: Utc::now(),
+    }
+}
+
 pub(crate) fn build_plan_artifact(model_id: &str, args: &Value) -> PlanArtifact {
-    let title = args["title"]
+    let title_raw = args["title"]
         .as_str()
-        .unwrap_or("Implementation Plan")
-        .to_string();
-    let summary = args["summary"].as_str().unwrap_or("").to_string();
+        .or_else(|| args["plan_title"].as_str())
+        .unwrap_or("Implementation Plan");
+    let title = sanitize_plan_markdown(title_raw);
+    let title = if title.is_empty() {
+        "Implementation Plan".to_string()
+    } else {
+        title
+    };
+    let summary_raw = args["summary"]
+        .as_str()
+        .or_else(|| args["plan_summary"].as_str())
+        .unwrap_or("");
+    let summary = sanitize_plan_markdown(summary_raw);
     let mut steps = Vec::new();
 
-    if let Some(arr) = args["steps"].as_array() {
+    let raw_steps = args["steps"]
+        .as_array()
+        .or_else(|| args["plan_steps"].as_array());
+    if let Some(arr) = raw_steps {
         for (i, st) in arr.iter().enumerate() {
             let step_number = st["step_number"].as_u64().unwrap_or((i + 1) as u64) as usize;
-            let description = st["description"].as_str().unwrap_or("").to_string();
-            let files_touched: Vec<String> = st["files_touched"]
+            let description = sanitize_plan_markdown(
+                st["description"]
+                    .as_str()
+                    .or_else(|| st["step"].as_str())
+                    .unwrap_or(""),
+            );
+            let mut files_touched: Vec<String> = st["files_touched"]
                 .as_array()
                 .map(|a| {
                     a.iter()
@@ -3803,6 +4105,13 @@ pub(crate) fn build_plan_artifact(model_id: &str, args: &Value) -> PlanArtifact 
                         .collect()
                 })
                 .unwrap_or_default();
+            if files_touched.is_empty() {
+                if let Some(fp) = st["file_path"].as_str() {
+                    if !fp.trim().is_empty() {
+                        files_touched.push(fp.trim().to_string());
+                    }
+                }
+            }
             let verification = st["verification"].as_str().map(|s| s.to_string());
             steps.push(PlanStep {
                 step_number,
@@ -3823,13 +4132,28 @@ pub(crate) fn build_plan_artifact(model_id: &str, args: &Value) -> PlanArtifact 
             md.push_str(&format!("   - Verify: `{v}`\n"));
         }
     }
+    if let Some(top_files) = args["files_touched"].as_array() {
+        let items: Vec<&str> = top_files.iter().filter_map(|v| v.as_str()).collect();
+        if !items.is_empty() {
+            md.push_str("\n## Files Touched\n");
+            for f in items {
+                md.push_str(&format!("- `{f}`\n"));
+            }
+        }
+    }
+    if let Some(ver) = args["verification"].as_str() {
+        let clean_ver = sanitize_plan_markdown(ver);
+        if !clean_ver.is_empty() {
+            md.push_str(&format!("\n## Verification\n{clean_ver}\n"));
+        }
+    }
 
     PlanArtifact {
         id: Uuid::new_v4().to_string(),
         title,
         summary,
         steps,
-        markdown: md,
+        markdown: md.trim().to_string(),
         status: PlanStatus::AwaitingReview,
         model_id: model_id.to_string(),
         created_at: Utc::now(),
@@ -4532,5 +4856,34 @@ mod tests {
             );
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_plan_markdown_strips_gemma_tool_calls_and_think_tags() {
+        let raw = "<think>internal reasoning</think>\n\n### My Plan\n1. Update `index.html`\n\n<|tool_call|>call:submit_plan{plan_title:<|\"|>Demo<|\"|>}<|tool_call|>\n";
+        let cleaned = sanitize_plan_markdown(raw);
+        assert!(!cleaned.contains("<think>"));
+        assert!(!cleaned.contains("<|tool_call|>"));
+        assert!(!cleaned.contains("call:submit_plan"));
+        assert!(cleaned.contains("### My Plan"));
+        assert!(cleaned.contains("1. Update `index.html`"));
+    }
+
+    #[test]
+    fn try_parse_inline_submit_plan_extracts_gemma_plan_cleanly() {
+        let raw = "Actually let me submit this:\n<|tool_call|>call:submit_plan{plan_title:<|\"|>Cinder Website Overhaul<|\"|>,plan_summary:<|\"|>Rewrite the landing page with \"Pilot + Engine\" flow.<|\"|>,plan_steps:[{description:<|\"|>Draft HTML structure<|\"|>,file_path:<|\"|>website/index.html<|\"|>},{description:<|\"|>Refine CSS layout<|\"|>,file_path:<|\"|>website/style.css<|\"|>}],files_touched:[<|\"|>website/index.html<|\"|>,<|\"|>website/style.css<|\"|>],verification:<|\"|>Visual check<|\"|>}<|tool_call|>";
+        let plan = try_parse_inline_submit_plan("local::gemma4:12b", raw)
+            .expect("should parse Gemma inline call:submit_plan");
+        assert_eq!(plan.title, "Cinder Website Overhaul");
+        assert_eq!(
+            plan.summary,
+            "Rewrite the landing page with \"Pilot + Engine\" flow."
+        );
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].files_touched, vec!["website/index.html"]);
+        assert!(plan.markdown.contains("# Cinder Website Overhaul"));
+        assert!(plan.markdown.contains("## Files Touched"));
+        assert!(plan.markdown.contains("## Verification"));
+        assert!(!plan.markdown.contains("<|tool_call|>"));
     }
 }

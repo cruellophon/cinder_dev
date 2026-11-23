@@ -426,6 +426,7 @@ impl CinderApp {
                 self.state.show_cmd_palette = false;
                 self.state.close_transient_popovers();
                 self.state.show_settings_modal = false;
+                self.state.prompt_modal = crate::app_state::PromptModal::None;
                 self.state.dragging_explorer_item = None;
             }
 

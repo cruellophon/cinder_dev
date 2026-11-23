@@ -6,7 +6,7 @@ use crate::theme::{
     badge, copy_to_clipboard, danger_button, empty_state_block, input_frame, primary_button,
     secondary_button, CinderPalette,
 };
-use harness_store::FileChangeStatus;
+use harness_store::{FileChangeStatus, PlanStatus};
 use std::sync::Arc;
 
 pub fn render_inspector_view(
@@ -62,7 +62,14 @@ pub fn render_inspector_view(
                         };
                     }
                 } else {
+                    let mut execute_plan_sid: Option<String> = None;
                     for art in &sess.artifacts {
+                        let can_approve_plan = art.kind == "plan"
+                            && sess.active_plan.as_ref().is_some_and(|pl| {
+                                pl.status == PlanStatus::AwaitingReview
+                                    && (pl.title.eq_ignore_ascii_case(&art.title)
+                                        || sess.artifacts.iter().filter(|a| a.kind == "plan").count() == 1)
+                            });
                         p.card_frame().show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
@@ -71,6 +78,11 @@ pub fn render_inspector_view(
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
+                                        if can_approve_plan
+                                            && primary_button(ui, p, "Approve & Execute").clicked()
+                                        {
+                                            execute_plan_sid = Some(sess.id.clone());
+                                        }
                                         if secondary_button(ui, p, "Delete").clicked() {
                                             backend.delete_artifact(sess.id.clone(), art.id.clone());
                                         }
@@ -161,6 +173,11 @@ pub fn render_inspector_view(
                             }
                         });
                         ui.add_space(8.0);
+                    }
+                    if let Some(sid) = execute_plan_sid {
+                        state.is_generating = true;
+                        state.approve_active_plan_optimistically(&sid);
+                        backend.plan_action(sid, "execute".into(), None, None);
                     }
                 }
             }

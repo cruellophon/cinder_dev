@@ -10,6 +10,19 @@ use egui::{CornerRadius, Frame, Margin, Stroke};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Clamp a floating modal window size to fit safely inside the current viewport.
+pub(crate) fn compute_modal_bounds(
+    screen: egui::Vec2,
+    ideal_w: f32,
+    ideal_h: f32,
+) -> (f32, f32) {
+    let avail_w = (screen.x - 48.0).max(200.0);
+    let avail_h = (screen.y - 64.0).max(180.0);
+    let w = ideal_w.min(avail_w).max(280.0_f32.min(avail_w));
+    let h = ideal_h.min(avail_h).max(200.0_f32.min(avail_h));
+    (w, h)
+}
+
 pub fn render_modals_and_toasts(
     ctx: &egui::Context,
     state: &mut GuiState,
@@ -553,9 +566,14 @@ fn render_prompt_modal(
         } => {
             let mut open = true;
             let mut done = false;
+            let (modal_w, modal_h) =
+                compute_modal_bounds(ctx.screen_rect().size(), 580.0, 460.0);
+            let editor_h = (modal_h - 124.0).max(110.0);
             egui::Window::new("New Session Artifact")
                 .open(&mut open)
                 .collapsible(false)
+                .resizable(false)
+                .fixed_size([modal_w, modal_h])
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
@@ -563,7 +581,7 @@ fn render_prompt_modal(
                             ui.add(
                                 egui::TextEdit::singleline(&mut title)
                                     .hint_text("Title")
-                                    .desired_width(220.0)
+                                    .desired_width((modal_w - 170.0).max(140.0))
                                     .frame(false),
                             );
                         });
@@ -577,13 +595,20 @@ fn render_prompt_modal(
                     });
                     ui.add_space(6.0);
                     input_frame(p, false).show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut content)
-                                .desired_rows(8)
-                                .desired_width(420.0)
-                                .hint_text("Markdown content...")
-                                .frame(false),
-                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("new_art_scroll")
+                            .min_scrolled_height(editor_h)
+                            .max_height(editor_h)
+                            .show(ui, |ui| {
+                                ui.set_min_height((editor_h - 8.0).max(80.0));
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut content)
+                                        .desired_width(f32::INFINITY)
+                                        .font(egui::TextStyle::Monospace)
+                                        .hint_text("Markdown content...")
+                                        .frame(false),
+                                );
+                            });
                     });
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -625,18 +650,31 @@ fn render_prompt_modal(
         PromptModal::EditPlan { mut markdown } => {
             let mut open = true;
             let mut done = false;
+            let mut approved_sid: Option<String> = None;
+            let (modal_w, modal_h) =
+                compute_modal_bounds(ctx.screen_rect().size(), 680.0, 560.0);
+            let editor_h = (modal_h - 88.0).max(120.0);
             egui::Window::new("Edit Implementation Plan")
                 .open(&mut open)
                 .collapsible(false)
+                .resizable(false)
+                .fixed_size([modal_w, modal_h])
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     input_frame(p, false).show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut markdown)
-                                .desired_rows(12)
-                                .desired_width(520.0)
-                                .frame(false),
-                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("edit_plan_scroll")
+                            .min_scrolled_height(editor_h)
+                            .max_height(editor_h)
+                            .show(ui, |ui| {
+                                ui.set_min_height((editor_h - 8.0).max(90.0));
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut markdown)
+                                        .desired_width(f32::INFINITY)
+                                        .font(egui::TextStyle::Monospace)
+                                        .frame(false),
+                                );
+                            });
                     });
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -648,6 +686,7 @@ fn render_prompt_modal(
                                 .map(|s| s.id.clone())
                             {
                                 state.is_generating = true;
+                                approved_sid = Some(sid.clone());
                                 backend.plan_action(
                                     sid,
                                     "execute".into(),
@@ -657,11 +696,18 @@ fn render_prompt_modal(
                             }
                             done = true;
                         }
+                        if secondary_button(ui, p, "Open in Artifacts").clicked() {
+                            state.open_stage_tab(StageTab::Artifacts);
+                            done = true;
+                        }
                         if secondary_button(ui, p, "Cancel").clicked() {
                             done = true;
                         }
                     });
                 });
+            if let Some(sid) = approved_sid {
+                state.approve_active_plan_optimistically(&sid);
+            }
             if done || !open {
                 state.prompt_modal = PromptModal::None;
             } else {
@@ -671,19 +717,30 @@ fn render_prompt_modal(
         PromptModal::RequestPlanChanges { mut feedback } => {
             let mut open = true;
             let mut done = false;
+            let (modal_w, modal_h) =
+                compute_modal_bounds(ctx.screen_rect().size(), 500.0, 280.0);
+            let editor_h = (modal_h - 88.0).max(96.0);
             egui::Window::new("Request Plan Changes")
                 .open(&mut open)
                 .collapsible(false)
+                .resizable(false)
+                .fixed_size([modal_w, modal_h])
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     input_frame(p, false).show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut feedback)
-                                .desired_rows(5)
-                                .desired_width(420.0)
-                                .hint_text("Describe changes to the plan...")
-                                .frame(false),
-                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("req_plan_changes_scroll")
+                            .min_scrolled_height(editor_h)
+                            .max_height(editor_h)
+                            .show(ui, |ui| {
+                                ui.set_min_height((editor_h - 8.0).max(70.0));
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut feedback)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("Describe changes to the plan...")
+                                        .frame(false),
+                                );
+                            });
                     });
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -717,17 +774,19 @@ fn render_prompt_modal(
         }
         PromptModal::LightboxImage { title, cache_key } => {
             let mut open = true;
+            let (modal_w, modal_h) =
+                compute_modal_bounds(ctx.screen_rect().size(), 760.0, 540.0);
             egui::Window::new(title)
                 .open(&mut open)
                 .collapsible(false)
-                .default_size([760.0, 540.0])
+                .fixed_size([modal_w, modal_h])
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     if let Some(tex) = state.textures.get(&cache_key) {
                         egui::ScrollArea::both().show(ui, |ui| {
                             ui.add(
                                 egui::Image::new(tex)
-                                    .max_size(egui::vec2(720.0, 480.0))
+                                    .max_size(egui::vec2(modal_w - 32.0, modal_h - 48.0))
                                     .corner_radius(CornerRadius::same(8)),
                             );
                         });
@@ -764,4 +823,22 @@ fn render_toast_overlay(ctx: &egui::Context, state: &mut GuiState, p: &CinderPal
                     ui.label(egui::RichText::new(msg).color(p.text));
                 });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_modal_bounds;
+
+    #[test]
+    fn compute_modal_bounds_clamps_to_small_and_large_viewports() {
+        let (lw, lh) = compute_modal_bounds(egui::vec2(1600.0, 1000.0), 680.0, 560.0);
+        assert_eq!((lw, lh), (680.0, 560.0));
+
+        let (sw, sh) = compute_modal_bounds(egui::vec2(540.0, 420.0), 680.0, 560.0);
+        assert!(sw <= 540.0 - 48.0, "width {sw} should fit within 540px viewport");
+        assert!(sh <= 420.0 - 64.0, "height {sh} should fit within 420px viewport");
+
+        let (tw, th) = compute_modal_bounds(egui::vec2(260.0, 220.0), 680.0, 560.0);
+        assert!(tw >= 200.0 && th >= 180.0);
+    }
 }

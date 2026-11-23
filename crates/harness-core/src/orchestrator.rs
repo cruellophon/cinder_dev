@@ -1,20 +1,25 @@
 use crate::{
-    active_tools_for_context, apply_thinking_effort, build_pending_tool_approval,
-    build_pending_user_question, build_plan_artifact, build_step_contingent_question,
-    build_system_prompt, complete_cancellable, execute_tool_with_checkpoint,
-    format_step_thought_trace, handle_delegate_research_tool, handle_delegate_vision_tool,
-    snapshot_history_for_paused_tool, upsert_artifact_from_tool, upsert_session_artifact,
-    HarnessContext,
+    active_tools_for_context, apply_thinking_effort, build_fallback_plan_from_notes,
+    build_pending_tool_approval, build_pending_user_question, build_plan_artifact,
+    build_step_contingent_question, build_system_prompt, complete_cancellable,
+    execute_tool_with_checkpoint, format_step_thought_trace, handle_delegate_research_tool,
+    handle_delegate_vision_tool, snapshot_history_for_paused_tool, try_parse_inline_submit_plan,
+    upsert_artifact_from_tool, upsert_session_artifact, HarnessContext,
 };
 use chrono::Utc;
 use harness_providers::{CompletionRequest, ProviderMessage};
 use harness_store::{
-    AgentMode, ChatMessage, OrchestratorPhaseRecord, PendingToolApproval, PlanArtifact, PlanStatus,
-    PlanStep, RiskTier, Session, ToolCallRecord,
+    AgentMode, AppSettings, ChatMessage, OrchestratorPhaseRecord, PendingToolApproval, PlanArtifact,
+    PlanStatus, RiskTier, Session, ToolCallRecord,
 };
 use harness_tools::classify_tool_risk;
 use std::path::Path;
 use uuid::Uuid;
+
+fn friendly_model_label(settings: &AppSettings, model_id: &str) -> String {
+    let fallback = model_id.strip_prefix("local::").unwrap_or(model_id);
+    settings.resolve_model_alias(model_id, fallback).to_string()
+}
 
 pub async fn resolve_reachable_model(
     ctx: &HarnessContext<'_>,
@@ -193,17 +198,10 @@ pub async fn run_orchestrator_turn(
         resolve_reachable_model(ctx, &orch_cfg.executor_model_id, &planner_model).await?
     };
 
-    // --- PHASE 1: PLANNER ---
-    ctx.store
-        .set_activity(
-            Some(session_id),
-            "orchestrator_planner",
-            &format!("Orchestrator Phase 1/2 · Planner ({planner_model}) investigating workspace..."),
-            1,
-            2,
-        )
-        .await;
+    let planner_label = friendly_model_label(&snapshot.settings, &planner_model);
+    let executor_label = friendly_model_label(&snapshot.settings, &executor_model);
 
+    // --- PHASE 1: PLANNER ---
     let enabled_modules = &snapshot.settings.ui.enabled_modules;
     let thinking_effort = &snapshot.settings.ui.thinking_effort;
     let base_plan_sys = format!(
@@ -228,6 +226,7 @@ pub async fn run_orchestrator_turn(
     let mut planner_tokens = 0u64;
     let mut planner_latency = 0u64;
     let mut produced_plan: Option<PlanArtifact> = None;
+    let mut plan_artifact_id: Option<String> = None;
     let mut planner_notes = String::new();
 
     for step in 0..4usize {
@@ -235,6 +234,30 @@ pub async fn run_orchestrator_turn(
             planner_notes = "[Generation stopped by user]".into();
             break;
         }
+        let step_verb = if step == 3 {
+            "drafting plan..."
+        } else if step == 0 {
+            "investigating workspace..."
+        } else {
+            "analyzing findings..."
+        };
+        ctx.store
+            .set_activity_stream(
+                Some(session_id),
+                "orchestrator_planner",
+                &format!(
+                    "Orchestrator Phase 1/2 · Planner ({planner_label}) · Turn {} — {step_verb}",
+                    step + 1
+                ),
+                step + 1,
+                4,
+                &planner_model,
+                &accumulated_thoughts.join("\n\n"),
+                "",
+                &all_tools,
+            )
+            .await;
+
         let req = CompletionRequest {
             model_id: planner_model.clone(),
             system_prompt: plan_sys.clone(),
@@ -282,6 +305,24 @@ pub async fn run_orchestrator_turn(
         });
 
         for tc in &resp.tool_calls {
+            ctx.store
+                .set_activity_stream(
+                    Some(session_id),
+                    "orchestrator_planner",
+                    &format!(
+                        "Orchestrator Phase 1/2 · Planner ({planner_label}) · Turn {} · Running `{}`...",
+                        step + 1,
+                        tc.name
+                    ),
+                    step + 1,
+                    4,
+                    &planner_model,
+                    &accumulated_thoughts.join("\n\n"),
+                    "",
+                    &all_tools,
+                )
+                .await;
+
             if tc.name == "write_artifact" {
                 let (rec, msg_txt) = upsert_artifact_from_tool(ctx.store, session_id, tc).await;
                 all_tools.push(rec);
@@ -300,14 +341,17 @@ pub async fn run_orchestrator_turn(
                 if !orch_cfg.review_before_execute {
                     plan.status = PlanStatus::Approved;
                 }
-                let _ = upsert_session_artifact(
+                if let Ok(art) = upsert_session_artifact(
                     ctx.store,
                     session_id,
                     &plan.title,
                     "plan",
                     &plan.markdown,
                 )
-                .await;
+                .await
+                {
+                    plan_artifact_id = Some(art.id);
+                }
                 produced_plan = Some(plan.clone());
                 all_tools.push(ToolCallRecord {
                     id: tc.id.clone(),
@@ -435,6 +479,23 @@ pub async fn run_orchestrator_turn(
                 tool_calls: Vec::new(),
                 images: Vec::new(),
             });
+            ctx.store
+                .set_activity_stream(
+                    Some(session_id),
+                    "orchestrator_planner",
+                    &format!(
+                        "Orchestrator Phase 1/2 · Planner ({planner_label}) · Turn {} · Completed `{}`",
+                        step + 1,
+                        tc.name
+                    ),
+                    step + 1,
+                    4,
+                    &planner_model,
+                    &accumulated_thoughts.join("\n\n"),
+                    "",
+                    &all_tools,
+                )
+                .await;
         }
 
         if produced_plan.is_some() {
@@ -442,37 +503,41 @@ pub async fn run_orchestrator_turn(
         }
     }
 
-    let mut plan = produced_plan.unwrap_or_else(|| PlanArtifact {
-        id: Uuid::new_v4().to_string(),
-        title: "Orchestrator Plan".into(),
-        summary: if planner_notes.trim().is_empty() {
-            "Execute requested task in workspace.".into()
-        } else {
-            planner_notes.chars().take(180).collect()
-        },
-        steps: vec![PlanStep {
-            step_number: 1,
-            description: if planner_notes.trim().is_empty() {
-                prompt_with_context.to_string()
+    let plan_status = if orch_cfg.review_before_execute {
+        PlanStatus::AwaitingReview
+    } else {
+        PlanStatus::Approved
+    };
+    let mut plan = produced_plan
+        .or_else(|| try_parse_inline_submit_plan(&planner_model, &planner_notes))
+        .unwrap_or_else(|| {
+            let source_notes = if planner_notes.trim().is_empty() {
+                prompt_with_context
             } else {
-                planner_notes.clone()
-            },
-            files_touched: Vec::new(),
-            verification: None,
-        }],
-        markdown: if planner_notes.trim().is_empty() {
-            prompt_with_context.to_string()
-        } else {
-            planner_notes.clone()
-        },
-        status: if orch_cfg.review_before_execute {
-            PlanStatus::AwaitingReview
-        } else {
-            PlanStatus::Approved
-        },
-        model_id: planner_model.clone(),
-        created_at: Utc::now(),
-    });
+                &planner_notes
+            };
+            build_fallback_plan_from_notes(
+                &planner_model,
+                "Orchestrator Plan",
+                source_notes,
+                plan_status,
+            )
+        });
+    plan.status = plan_status;
+
+    if plan_artifact_id.is_none() && !ctx.store.is_aborted() && !plan.markdown.trim().is_empty() {
+        if let Ok(art) = upsert_session_artifact(
+            ctx.store,
+            session_id,
+            &plan.title,
+            "plan",
+            &plan.markdown,
+        )
+        .await
+        {
+            plan_artifact_id = Some(art.id);
+        }
+    }
 
     let planner_phase = OrchestratorPhaseRecord {
         phase: "planner".into(),
@@ -487,7 +552,7 @@ pub async fn run_orchestrator_turn(
             id: Uuid::new_v4().to_string(),
             role: "assistant".into(),
             content: format!(
-                "Orchestrator Planner (`{planner_model}`) prepared **{}**. Review and click **Proceed & Execute Plan** to hand off to `{executor_model}`.",
+                "Orchestrator Planner (**{planner_label}**) prepared **{}**. Review and click **Approve & Execute Plan** to hand off to **{executor_label}**.",
                 plan.title
             ),
             thinking: if accumulated_thoughts.is_empty() {
@@ -506,7 +571,7 @@ pub async fn run_orchestrator_turn(
             orchestrator_phases: vec![planner_phase],
             attached_files,
             attachments: Vec::new(),
-            artifact_id: None,
+            artifact_id: plan_artifact_id,
             created_at: Utc::now(),
         };
         let updated = ctx
@@ -530,7 +595,7 @@ pub async fn run_orchestrator_turn(
         .set_activity(
             Some(session_id),
             "orchestrator_executor",
-            &format!("Orchestrator Phase 2/2 · Executor ({executor_model}) executing plan..."),
+            &format!("Orchestrator Phase 2/2 · Executor ({executor_label}) executing plan..."),
             2,
             2,
         )
@@ -586,7 +651,10 @@ pub async fn run_orchestrator_turn(
             .set_activity_stream(
                 Some(session_id),
                 "orchestrator_executor",
-                &format!("Executor ({executor_model}) step {}/{max_exec_steps}...", step + 1),
+                &format!(
+                    "Orchestrator Phase 2/2 · Executor ({executor_label}) · Turn {}...",
+                    step + 1
+                ),
                 step + 1,
                 max_exec_steps,
                 &executor_model,
@@ -805,6 +873,24 @@ pub async fn run_orchestrator_turn(
                 break;
             }
 
+            ctx.store
+                .set_activity_stream(
+                    Some(session_id),
+                    "orchestrator_executor",
+                    &format!(
+                        "Orchestrator Phase 2/2 · Executor ({executor_label}) · Turn {} · Running `{}`...",
+                        step + 1,
+                        tc.name
+                    ),
+                    step + 1,
+                    max_exec_steps,
+                    &executor_model,
+                    &accumulated_thoughts.join("\n\n"),
+                    &exec_content,
+                    &all_tools,
+                )
+                .await;
+
             let exec_res = execute_tool_with_checkpoint(
                 ctx,
                 session_id,
@@ -845,6 +931,23 @@ pub async fn run_orchestrator_turn(
                 tool_calls: Vec::new(),
                 images: Vec::new(),
             });
+            ctx.store
+                .set_activity_stream(
+                    Some(session_id),
+                    "orchestrator_executor",
+                    &format!(
+                        "Orchestrator Phase 2/2 · Executor ({executor_label}) · Turn {} · Completed `{}`",
+                        step + 1,
+                        tc.name
+                    ),
+                    step + 1,
+                    max_exec_steps,
+                    &executor_model,
+                    &accumulated_thoughts.join("\n\n"),
+                    &exec_content,
+                    &all_tools,
+                )
+                .await;
         }
 
         if let Some(pending) = paused {
@@ -859,7 +962,7 @@ pub async fn run_orchestrator_turn(
                 id: Uuid::new_v4().to_string(),
                 role: "assistant".into(),
                 content: format!(
-                    "Orchestrator Executor (`{executor_model}`) requires review before running `{}`.",
+                    "Orchestrator Executor (**{executor_label}**) requires review before running `{}`.",
                     pending.tool_name
                 ),
                 thinking: if accumulated_thoughts.is_empty() {
@@ -882,7 +985,7 @@ pub async fn run_orchestrator_turn(
                 orchestrator_phases: vec![planner_phase, exec_phase],
                 attached_files,
                 attachments: Vec::new(),
-                artifact_id: None,
+                artifact_id: plan_artifact_id.clone(),
                 created_at: Utc::now(),
             };
             let updated = ctx
@@ -922,7 +1025,7 @@ pub async fn run_orchestrator_turn(
             role: "assistant".into(),
             content: if exec_content.trim().is_empty() {
                 format!(
-                    "Orchestrator Executor (`{executor_model}`) paused after {max_exec_steps} autonomous steps — select additional step contingent below to continue."
+                    "Orchestrator Executor (**{executor_label}**) paused after {max_exec_steps} autonomous steps — select additional step contingent below to continue."
                 )
             } else {
                 format!(
@@ -953,7 +1056,7 @@ pub async fn run_orchestrator_turn(
             },
             attached_files,
             attachments: Vec::new(),
-            artifact_id: None,
+            artifact_id: plan_artifact_id.clone(),
             created_at: Utc::now(),
         };
         let updated = ctx
@@ -1014,7 +1117,7 @@ pub async fn run_orchestrator_turn(
         },
         attached_files,
         attachments: Vec::new(),
-        artifact_id: None,
+        artifact_id: plan_artifact_id,
         created_at: Utc::now(),
     };
 

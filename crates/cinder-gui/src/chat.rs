@@ -44,6 +44,32 @@ fn draw_working_dots(ui: &mut egui::Ui, p: &CinderPalette) {
     }
 }
 
+fn paint_live_shimmer_bar(ui: &mut egui::Ui, p: &CinderPalette) {
+    let avail_w = ui.available_width().max(80.0);
+    let (track, _) = ui.allocate_exact_size(egui::vec2(avail_w, 3.5), egui::Sense::hover());
+    if !ui.is_rect_visible(track) {
+        return;
+    }
+    let painter = ui.painter();
+    painter.rect_filled(track, CornerRadius::same(2), p.bg_hover);
+
+    let t = ui.input(|i| i.time) as f32;
+    let cycle = (t * 0.85).fract();
+    let glow_w = (avail_w * 0.28).clamp(36.0, 140.0);
+    let travel = avail_w + glow_w;
+    let x0 = (track.left() - glow_w + cycle * travel).max(track.left());
+    let x1 = (track.left() + cycle * travel).min(track.right());
+    if x1 > x0 {
+        let seg = egui::Rect::from_min_max(
+            egui::pos2(x0, track.top()),
+            egui::pos2(x1, track.bottom()),
+        );
+        painter.rect_filled(seg, CornerRadius::same(2), p.accent);
+    }
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(50));
+}
+
 pub fn render_chat_column(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
@@ -61,6 +87,11 @@ pub fn render_chat_column(
         });
         return;
     };
+
+    state.sync_turn_timer();
+    if state.is_busy() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(80));
+    }
 
     let is_standalone = sess.workspace_path.trim().is_empty();
     let ws_name = if is_standalone {
@@ -368,6 +399,7 @@ pub fn render_chat_column(
                 }
 
                 if state.is_busy() {
+                    let elapsed = state.format_elapsed_since_turn_start();
                     Frame::new()
                         .fill(p.bg_elev)
                         .stroke(animated_working_stroke(ui, p))
@@ -385,7 +417,12 @@ pub fn render_chat_column(
                                 } else {
                                     snap.live_activity.detail.trim_end_matches('.')
                                 };
-                                ui.label(egui::RichText::new(detail).color(p.accent_hot));
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(detail).color(p.accent_hot),
+                                    )
+                                    .truncate(),
+                                );
                                 draw_working_dots(ui, p);
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -393,6 +430,14 @@ pub fn render_chat_column(
                                         if danger_button(ui, p, "Stop").clicked() {
                                             state.is_generating = false;
                                             backend.abort_turn();
+                                        }
+                                        if let Some(ref el) = elapsed {
+                                            ui.label(
+                                                egui::RichText::new(el)
+                                                    .small()
+                                                    .monospace()
+                                                    .color(p.muted),
+                                            );
                                         }
                                     },
                                 );
@@ -615,6 +660,8 @@ pub fn render_chat_column(
     } else {
         // Editorial Scrollable Message Stream
         let busy = state.is_busy();
+        let live_elapsed = state.format_elapsed_since_turn_start();
+        let mut mark_plan_approved = false;
         egui::ScrollArea::vertical()
             .id_salt(("chat_stream_scroll", &sess.id))
             .max_height(stream_max_h)
@@ -874,8 +921,23 @@ pub fn render_chat_column(
                                                 pcol,
                                                 p.bg_card,
                                             );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if secondary_button(
+                                                        ui,
+                                                        p,
+                                                        "Open in Artifacts",
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        state.open_stage_tab(StageTab::Artifacts);
+                                                    }
+                                                },
+                                            );
                                         });
                                         if plan.status == PlanStatus::AwaitingReview {
+                                            ui.add_space(4.0);
                                             ui.horizontal(|ui| {
                                                 if primary_button(
                                                     ui,
@@ -885,6 +947,7 @@ pub fn render_chat_column(
                                                 .clicked()
                                                 {
                                                     state.is_generating = true;
+                                                    mark_plan_approved = true;
                                                     backend.plan_action(
                                                         sess.id.clone(),
                                                         "execute".into(),
@@ -1049,6 +1112,61 @@ pub fn render_chat_column(
                             .inner_margin(Margin::symmetric(4, 6))
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    let (orb_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(18.0, 18.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    draw_cinder_orb_animated(ui, orb_rect.center(), 7.5, p);
+                                    ui.label(
+                                        egui::RichText::new("Cinder")
+                                            .small()
+                                            .strong()
+                                            .color(p.text),
+                                    );
+                                    let raw_mid = if act.active_model.is_empty() {
+                                        &snap.settings.active_model_id
+                                    } else {
+                                        &act.active_model
+                                    };
+                                    let live_model_label =
+                                        resolve_model_display_name(&snap, raw_mid);
+                                    if !live_model_label.is_empty() {
+                                        badge(ui, &live_model_label, p.muted, p.bg_card);
+                                    }
+                                    if act.step > 0 {
+                                        let turn_meta = if act.completed_tools.is_empty() {
+                                            format!("Turn {}", act.step)
+                                        } else {
+                                            format!(
+                                                "Turn {} · {} steps",
+                                                act.step,
+                                                act.completed_tools.len()
+                                            )
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(turn_meta)
+                                                .small()
+                                                .color(p.muted),
+                                        );
+                                    }
+                                    if let Some(ref el) = live_elapsed {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(el)
+                                                        .small()
+                                                        .monospace()
+                                                        .color(p.muted),
+                                                );
+                                            },
+                                        );
+                                    }
+                                });
+                                ui.add_space(4.0);
+
                                 let (live_clean_content, live_leaked_th) =
                                     harness_providers::extract_think_tags_streaming(&act.partial_content);
                                 let live_combined_th = match (
@@ -1064,6 +1182,89 @@ pub fn render_chat_column(
                                 };
                                 let has_th = !live_combined_th.trim().is_empty();
                                 let has_tools = !act.completed_tools.is_empty();
+                                let has_content = !live_clean_content.trim().is_empty();
+
+                                if !has_content {
+                                    let stage_caption = act
+                                        .detail
+                                        .rsplit_once('—')
+                                        .or_else(|| act.detail.rsplit_once('·'))
+                                        .map(|(_, tail)| tail.trim().trim_end_matches('.'))
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or(match act.phase.as_str() {
+                                            "orchestrator_planner" => {
+                                                "Inspecting workspace & drafting plan"
+                                            }
+                                            "orchestrator_executor" => {
+                                                "Executing approved steps in workspace"
+                                            }
+                                            "summarizing" => "Synthesizing response",
+                                            _ => "Processing context & generating",
+                                        });
+                                    Frame::new()
+                                        .fill(p.bg_card)
+                                        .stroke(Stroke::new(1.0_f32, p.border))
+                                        .corner_radius(CornerRadius::same(10))
+                                        .inner_margin(Margin::symmetric(12, 9))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 6.0;
+                                                if act.phase.starts_with("orchestrator_") {
+                                                    let in_exec =
+                                                        act.phase == "orchestrator_executor";
+                                                    badge(
+                                                        ui,
+                                                        if in_exec {
+                                                            "✓ 1. Planner"
+                                                        } else {
+                                                            "● 1. Planner"
+                                                        },
+                                                        if in_exec { p.green } else { p.accent_hot },
+                                                        p.bg_elev,
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new("→")
+                                                            .small()
+                                                            .color(p.muted),
+                                                    );
+                                                    badge(
+                                                        ui,
+                                                        if in_exec {
+                                                            "● 2. Executor"
+                                                        } else {
+                                                            "○ 2. Executor"
+                                                        },
+                                                        if in_exec { p.accent_hot } else { p.muted },
+                                                        p.bg_elev,
+                                                    );
+                                                } else {
+                                                    let phase_tag = match act.phase.as_str() {
+                                                        "summarizing" => "SUMMARIZING",
+                                                        "thinking" => "WORKING",
+                                                        "" => "ACTIVE",
+                                                        other => other,
+                                                    };
+                                                    badge(
+                                                        ui,
+                                                        phase_tag,
+                                                        p.accent_hot,
+                                                        p.bg_elev,
+                                                    );
+                                                }
+                                                ui.label(
+                                                    egui::RichText::new(stage_caption)
+                                                        .small()
+                                                        .color(p.text),
+                                                );
+                                                draw_working_dots(ui, p);
+                                            });
+                                            ui.add_space(6.0);
+                                            paint_live_shimmer_bar(ui, p);
+                                        });
+                                    ui.add_space(6.0);
+                                }
+
                                 if has_th || has_tools {
                                     let live_scope = format!("live_{}", sess.id);
                                     if let Some(open_rel) = render_activity_and_thought_trace(
@@ -1082,39 +1283,7 @@ pub fn render_chat_column(
                                     ui.add_space(6.0);
                                 }
 
-                                let has_content = !live_clean_content.trim().is_empty();
-                                if !has_content && !has_th && !has_tools {
-                                    let wait_detail = if act.detail.trim().is_empty() {
-                                        "Waiting for response".to_string()
-                                    } else {
-                                        act.detail.trim_end_matches('.').to_string()
-                                    };
-                                    Frame::new()
-                                        .fill(p.bg_elev)
-                                        .stroke(animated_working_stroke(ui, p))
-                                        .corner_radius(CornerRadius::same(8))
-                                        .inner_margin(Margin::symmetric(12, 8))
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                let (ind_rect, _) = ui.allocate_exact_size(
-                                                    egui::vec2(14.0, 14.0),
-                                                    egui::Sense::hover(),
-                                                );
-                                                draw_working_indicator(
-                                                    ui,
-                                                    ind_rect.center(),
-                                                    5.2,
-                                                    p,
-                                                );
-                                                ui.label(
-                                                    egui::RichText::new(wait_detail)
-                                                        .small()
-                                                        .color(p.muted),
-                                                );
-                                                draw_working_dots(ui, p);
-                                            });
-                                        });
-                                } else if has_content {
+                                if has_content {
                                     ui.push_id(("live_md", &sess.id), |ui| {
                                         render_markdown(
                                             ui,
@@ -1130,6 +1299,10 @@ pub fn render_chat_column(
                     }
                 });
             });
+        if mark_plan_approved {
+            state.approve_active_plan_optimistically(&sess.id);
+            ctx.request_repaint();
+        }
     }
 
     if let Some(prompt) = hero_clicked_prompt {
