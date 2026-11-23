@@ -1,13 +1,15 @@
-use crate::app_state::{fmt_bytes, ForgeTab, GuiState, MainView, SettingsTab};
-use crate::backend::BackendHandle;
+use crate::app_state::{
+    fmt_bytes, ForgeTab, GuiState, MainView, QuotasTabFilter, SettingsTab,
+};
+use crate::backend::{BackendHandle, KeysPatch};
 use crate::icons::{icon_button, Icon};
 use crate::theme::{
     badge, danger_button, empty_state_block, ghost_button, input_frame, pane_header,
     primary_button, secondary_button, segmented_control, setting_group, underline_tab,
     CinderPalette,
 };
-use harness_models::{DownloadStatus, FitTier};
-use harness_store::QuotaTier;
+use harness_models::{DownloadStatus, FitTier, VramFitAssessment};
+use harness_store::{ModelQuotaSnapshot, ProviderKind, QuotaTier};
 use std::sync::Arc;
 
 pub fn render_forge_page(
@@ -61,7 +63,7 @@ pub fn render_forge_page(
     });
 
     let avail_w = ui.available_width();
-    let col_w = (avail_w - 48.0).clamp(360.0, 920.0);
+    let col_w = (avail_w - 48.0).clamp(360.0, 1140.0);
     let side_pad = ((avail_w - col_w) * 0.5).max(24.0);
 
     egui::ScrollArea::vertical()
@@ -111,14 +113,6 @@ fn short_path_tail(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
-fn fit_tier_color(tier: FitTier, p: &CinderPalette) -> egui::Color32 {
-    match tier {
-        FitTier::FitsInVram => p.green,
-        FitTier::PartialOffload => p.amber,
-        FitTier::CpuHeavy => p.red,
-    }
-}
-
 fn fmt_compact_count(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -148,25 +142,237 @@ fn infer_gguf_quant(filename: &str) -> String {
     "GGUF".into()
 }
 
-fn square_tile_grid_layout(grid_w: f32) -> (usize, f32, f32) {
-    let w = grid_w.floor().max(200.0);
+pub(crate) fn concise_vram_badge(
+    vram_fit: &VramFitAssessment,
+    p: &CinderPalette,
+) -> (String, egui::Color32) {
+    match vram_fit.tier {
+        FitTier::FitsInVram => ("100% GPU".to_string(), p.green),
+        FitTier::PartialOffload => (
+            format!("Hybrid GPU · {}L", vram_fit.recommended_ngl),
+            p.amber,
+        ),
+        FitTier::CpuHeavy => ("CPU Heavy".to_string(), p.red),
+    }
+}
+
+pub(crate) fn model_tile_grid_layout(grid_w: f32) -> (usize, f32, f32, f32) {
+    let w = grid_w.floor().max(240.0);
     let gap = 12.0_f32;
-    let cols = if w >= 820.0 {
-        4
-    } else if w >= 580.0 {
-        3
-    } else if w >= 380.0 {
-        2
-    } else {
-        1
-    };
-    let raw_side = ((w - gap * ((cols - 1) as f32)) / (cols as f32)).floor();
-    let tile_side = if cols == 1 {
-        raw_side.clamp(175.0, 280.0)
-    } else {
-        raw_side.max(175.0)
-    };
-    (cols, tile_side, gap)
+    let min_tile_w = 280.0_f32;
+    let cols = (((w + gap) / (min_tile_w + gap)).floor() as usize).clamp(1, 3);
+    let tile_w = ((w - gap * ((cols - 1) as f32)) / (cols as f32))
+        .floor()
+        .max(220.0);
+    let tile_h = 192.0_f32;
+    (cols, tile_w, tile_h, gap)
+}
+
+#[derive(Debug, Clone)]
+struct ModelTileBadge {
+    label: String,
+    color: egui::Color32,
+    tooltip: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ModelTileProgress {
+    fraction: f32,
+    color: egui::Color32,
+    right_label: String,
+}
+
+#[derive(Debug, Clone)]
+struct ModelTileSpec {
+    title: String,
+    title_tooltip: String,
+    subtitle: Option<String>,
+    badges: Vec<ModelTileBadge>,
+    progress: Option<ModelTileProgress>,
+    meta_lines: Vec<(String, String)>,
+    border_highlight: Option<egui::Color32>,
+}
+
+fn render_model_tile(
+    ui: &mut egui::Ui,
+    p: &CinderPalette,
+    tile_w: f32,
+    tile_h: f32,
+    spec: &ModelTileSpec,
+    add_actions: impl FnOnce(&mut egui::Ui),
+) {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(tile_w, tile_h), egui::Sense::hover());
+
+    if ui.is_rect_visible(rect) {
+        let stroke = if let Some(hl) = spec.border_highlight {
+            egui::Stroke::new(1.2_f32, hl)
+        } else if resp.hovered() {
+            egui::Stroke::new(1.0_f32, p.border_strong)
+        } else {
+            egui::Stroke::new(1.0_f32, p.border)
+        };
+        ui.painter().rect(
+            rect,
+            egui::CornerRadius::same(9),
+            p.bg_card,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let inner = rect.shrink(12.0);
+    let bot_h = 26.0_f32;
+    let divider_gap = 7.0_f32;
+    let top_rect = egui::Rect::from_min_max(
+        inner.min,
+        egui::pos2(
+            inner.right(),
+            (inner.bottom() - bot_h - divider_gap).max(inner.top() + 44.0),
+        ),
+    );
+    let bot_rect = egui::Rect::from_min_max(
+        egui::pos2(inner.left(), (inner.bottom() - bot_h).max(top_rect.bottom() + 2.0)),
+        inner.max,
+    );
+
+    let mut top_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(top_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    top_ui.set_clip_rect(top_rect.intersect(ui.clip_rect()));
+    top_ui.set_width(top_rect.width());
+    top_ui.set_max_width(top_rect.width());
+    top_ui.spacing_mut().item_spacing.y = 5.0;
+
+    // 1. Single-line title (with hover tooltip)
+    let title_resp = top_ui.add(
+        egui::Label::new(egui::RichText::new(&spec.title).strong().color(p.text)).truncate(),
+    );
+    if !spec.title_tooltip.is_empty() {
+        title_resp.on_hover_text(&spec.title_tooltip);
+    }
+
+    // 2. Optional muted subtitle (alias canonical name, HF author, or model ID)
+    if let Some(ref sub) = spec.subtitle {
+        if !sub.trim().is_empty() {
+            top_ui
+                .add(
+                    egui::Label::new(egui::RichText::new(sub).small().color(p.muted)).truncate(),
+                )
+                .on_hover_text(sub);
+        }
+    }
+
+    // 3. Non-clipping wrapped badges row
+    if !spec.badges.is_empty() {
+        top_ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            for b in &spec.badges {
+                let r = ui.scope(|ui| badge(ui, &b.label, b.color, p.bg_elev)).response;
+                if let Some(ref tip) = b.tooltip {
+                    r.on_hover_text(tip);
+                }
+            }
+        });
+    }
+
+    // 4. Optional sleek quota / capacity progress bar
+    if let Some(ref prog) = spec.progress {
+        top_ui.horizontal(|ui| {
+            let lbl_w = 64.0_f32;
+            let bar_w = (top_rect.width() - lbl_w - 8.0).max(50.0);
+            let (bar_r, _) =
+                ui.allocate_exact_size(egui::vec2(bar_w, 6.0), egui::Sense::hover());
+            if ui.is_rect_visible(bar_r) {
+                ui.painter()
+                    .rect_filled(bar_r, egui::CornerRadius::same(3), p.bg_sidebar);
+                let frac = prog.fraction.clamp(0.0, 1.0);
+                if frac > 0.005 {
+                    let fill_r = egui::Rect::from_min_size(
+                        bar_r.min,
+                        egui::vec2(bar_r.width() * frac, bar_r.height()),
+                    );
+                    ui.painter()
+                        .rect_filled(fill_r, egui::CornerRadius::same(3), prog.color);
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(&prog.right_label)
+                        .small()
+                        .strong()
+                        .color(prog.color),
+                );
+            });
+        });
+    }
+
+    // 5. Compact metadata lines
+    for (line, tip) in spec.meta_lines.iter().take(2) {
+        if !line.trim().is_empty() {
+            let r = top_ui.add(
+                egui::Label::new(egui::RichText::new(line).small().color(p.muted)).truncate(),
+            );
+            if !tip.trim().is_empty() {
+                r.on_hover_text(tip);
+            }
+        }
+    }
+
+    // Hairline divider above pinned action bar
+    if ui.is_rect_visible(bot_rect) {
+        let div_y = bot_rect.top() - 4.0;
+        ui.painter().line_segment(
+            [
+                egui::pos2(inner.left(), div_y),
+                egui::pos2(inner.right(), div_y),
+            ],
+            egui::Stroke::new(1.0_f32, p.border),
+        );
+    }
+
+    let mut bot_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(bot_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    bot_ui.set_clip_rect(bot_rect.intersect(ui.clip_rect()));
+    bot_ui.set_width(bot_rect.width());
+    add_actions(&mut bot_ui);
+}
+
+fn provider_pill_style(provider: ProviderKind, p: &CinderPalette) -> (&'static str, egui::Color32) {
+    match provider {
+        ProviderKind::GoogleGemini => ("Gemini", p.green),
+        ProviderKind::Anthropic => ("Claude", p.amber),
+        ProviderKind::OpenRouter => ("OpenRouter", p.purple),
+        ProviderKind::OpenAiCompat => ("Custom API", p.accent_hot),
+        ProviderKind::LocalLlama | ProviderKind::LocalOllama => ("Local", p.accent_hot),
+    }
+}
+
+pub(crate) fn partition_quotas_tab(
+    quotas: &[ModelQuotaSnapshot],
+) -> (
+    Vec<&ModelQuotaSnapshot>,
+    Vec<&ModelQuotaSnapshot>,
+    Vec<&ModelQuotaSnapshot>,
+) {
+    let mut avail = Vec::new();
+    let mut paid = Vec::new();
+    let mut unavail = Vec::new();
+    for q in quotas {
+        if q.requires_payment {
+            paid.push(q);
+        } else if q.reachable {
+            avail.push(q);
+        } else {
+            unavail.push(q);
+        }
+    }
+    (avail, paid, unavail)
 }
 
 fn render_hub_subcard_row(
@@ -228,14 +434,14 @@ fn render_left_title_with_badges(
     );
 }
 
-fn render_local_model_square_tile(
+fn render_local_model_tile(
     ui: &mut egui::Ui,
     backend: &Arc<BackendHandle>,
     snap: &crate::backend::UiSnapshot,
     p: &CinderPalette,
     m: &harness_models::LocalModelEntry,
-    tile_side: f32,
-    _vram_total_mb: u64,
+    tile_w: f32,
+    tile_h: f32,
 ) {
     let is_active = snap.settings.active_model_id == m.id;
     let is_serving = snap.server_status.running
@@ -245,183 +451,122 @@ fn render_local_model_square_tile(
             .as_deref()
             .map(|n| n == m.name)
             .unwrap_or(false);
-    let fit_col = fit_tier_color(m.vram_fit.tier, p);
-
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(tile_side, tile_side), egui::Sense::hover());
-
-    if ui.is_rect_visible(rect) {
-        let stroke = if is_serving {
-            egui::Stroke::new(1.0_f32, p.green)
-        } else if is_active {
-            egui::Stroke::new(1.0_f32, p.accent)
-        } else if resp.hovered() {
-            egui::Stroke::new(1.0_f32, p.border_strong)
-        } else {
-            egui::Stroke::new(1.0_f32, p.border)
-        };
-        ui.painter().rect(
-            rect,
-            egui::CornerRadius::same(8),
-            p.bg_card,
-            stroke,
-            egui::StrokeKind::Inside,
-        );
-    }
-
-    let inner = rect.shrink(11.0);
-    let bot_h = 26.0_f32;
-    let divider_gap = 7.0_f32;
-    let top_rect = egui::Rect::from_min_max(
-        inner.min,
-        egui::pos2(
-            inner.right(),
-            (inner.bottom() - bot_h - divider_gap).max(inner.top() + 40.0),
-        ),
-    );
-    let bot_rect = egui::Rect::from_min_max(
-        egui::pos2(inner.left(), (inner.bottom() - bot_h).max(top_rect.bottom() + 2.0)),
-        inner.max,
-    );
 
     let (base_name, source_opt) = split_model_display_name(&m.name);
-
-    let mut top_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(top_rect)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-    );
-    top_ui.set_clip_rect(top_rect.intersect(ui.clip_rect()));
-    top_ui.set_width(top_rect.width());
-    top_ui.set_max_width(top_rect.width());
-    top_ui.spacing_mut().item_spacing.y = 5.0;
-
-    // Row 1: Single-line left-aligned truncated title
-    top_ui
-        .add(egui::Label::new(egui::RichText::new(base_name).strong().color(p.text)).truncate())
-        .on_hover_text(&m.name);
-
-    // Row 2: Clipped horizontal badges (source/quant + embedding/live)
-    top_ui.allocate_ui_with_layout(
-        egui::vec2(top_rect.width(), 20.0),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.set_clip_rect(ui.available_rect_before_wrap().intersect(top_rect));
-            ui.spacing_mut().item_spacing.x = 4.0;
-            if is_serving {
-                badge(ui, "Serving", p.green, p.bg_elev);
-            } else if is_active && !m.is_embedding {
-                badge(ui, "Active", p.accent_hot, p.bg_elev);
-            }
-            if let Some(src) = source_opt {
-                badge(ui, src, p.muted, p.bg_elev);
-            } else {
-                badge(ui, &m.quant, p.muted, p.bg_elev);
-            }
-            if m.is_embedding {
-                badge(ui, "Embedding", p.purple, p.bg_elev);
-            }
-        },
-    );
-
-    // Row 3: Consistent VRAM fit badge matching app-wide card pills
-    top_ui
-        .allocate_ui_with_layout(
-            egui::vec2(top_rect.width(), 20.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.set_clip_rect(ui.available_rect_before_wrap().intersect(top_rect));
-                badge(ui, &m.vram_fit.label, fit_col, p.bg_elev);
-            },
-        )
-        .response
-        .on_hover_text(&m.vram_fit.label);
-
-    // Row 4: Size & memory footprint (left-aligned, single-line truncated)
-    top_ui.add(
-        egui::Label::new(
-            egui::RichText::new(format!(
-                "{} · est {} MB",
-                fmt_bytes(m.size_bytes),
-                m.vram_fit.estimated_total_mb
-            ))
-            .small()
-            .color(p.muted),
-        )
-        .truncate(),
-    );
-
-    // Row 5: Layers & file basename (left-aligned, single-line truncated, full path on hover)
-    let tail = short_path_tail(&m.gguf_path);
-    top_ui
-        .add(
-            egui::Label::new(
-                egui::RichText::new(format!("NGL {} · {}", m.vram_fit.recommended_ngl, tail))
-                    .small()
-                    .color(p.muted),
-            )
-            .truncate(),
-        )
-        .on_hover_text(&m.gguf_path);
-
-    // Divider above pinned bottom action bar
-    if ui.is_rect_visible(bot_rect) {
-        let div_y = bot_rect.top() - 4.0;
-        ui.painter().line_segment(
-            [
-                egui::pos2(inner.left(), div_y),
-                egui::pos2(inner.right(), div_y),
-            ],
-            egui::Stroke::new(1.0_f32, p.border),
-        );
-    }
-
-    let mut bot_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(bot_rect)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-    bot_ui.set_clip_rect(bot_rect.intersect(ui.clip_rect()));
-    bot_ui.set_width(bot_rect.width());
-
-    if m.is_embedding {
-        bot_ui.add(
-            egui::Label::new(
-                egui::RichText::new("RAG / Embedding model")
-                    .small()
-                    .color(p.muted),
-            )
-            .truncate(),
-        );
+    let display_title = snap
+        .settings
+        .resolve_model_alias(&m.id, base_name)
+        .to_string();
+    let subtitle = if display_title != base_name {
+        Some(base_name.to_string())
     } else {
-        bot_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let serve_lbl = if tile_side < 192.0 {
-                "Serve"
-            } else {
-                "Serve & Use"
-            };
-            if primary_button(ui, p, serve_lbl).clicked() {
-                backend.start_local_model(m.id.clone());
-            }
-            let use_lbl = if is_active { "Active" } else { "Use" };
-            let btn_res = if is_active {
-                ghost_button(
-                    ui,
-                    p,
-                    egui::RichText::new(use_lbl).color(p.accent_hot),
-                )
-            } else {
-                secondary_button(ui, p, use_lbl)
-            };
-            if btn_res.clicked() {
-                let id = m.id.clone();
-                backend.update_settings(move |s| {
-                    s.active_model_id = id;
-                });
-            }
+        None
+    };
+
+    let mut badges = Vec::new();
+    if is_serving {
+        badges.push(ModelTileBadge {
+            label: "Serving".into(),
+            color: p.green,
+            tooltip: None,
+        });
+    } else if is_active && !m.is_embedding {
+        badges.push(ModelTileBadge {
+            label: "Active".into(),
+            color: p.accent_hot,
+            tooltip: None,
         });
     }
+    if let Some(src) = source_opt {
+        badges.push(ModelTileBadge {
+            label: src.to_string(),
+            color: p.muted,
+            tooltip: None,
+        });
+    } else {
+        badges.push(ModelTileBadge {
+            label: m.quant.clone(),
+            color: p.muted,
+            tooltip: None,
+        });
+    }
+    if m.is_embedding {
+        badges.push(ModelTileBadge {
+            label: "Embedding".into(),
+            color: p.purple,
+            tooltip: None,
+        });
+    }
+    let (vram_short, vram_col) = concise_vram_badge(&m.vram_fit, p);
+    badges.push(ModelTileBadge {
+        label: vram_short,
+        color: vram_col,
+        tooltip: Some(m.vram_fit.label.clone()),
+    });
+
+    let tail = short_path_tail(&m.gguf_path);
+    let spec = ModelTileSpec {
+        title: display_title,
+        title_tooltip: format!("{} ({})", m.name, m.id),
+        subtitle,
+        badges,
+        progress: None,
+        meta_lines: vec![
+            (
+                format!(
+                    "{} · est {} MB VRAM · NGL {}",
+                    fmt_bytes(m.size_bytes),
+                    m.vram_fit.estimated_total_mb,
+                    m.vram_fit.recommended_ngl
+                ),
+                m.vram_fit.label.clone(),
+            ),
+            (tail.to_string(), m.gguf_path.clone()),
+        ],
+        border_highlight: if is_serving {
+            Some(p.green)
+        } else if is_active {
+            Some(p.accent)
+        } else {
+            None
+        },
+    };
+
+    render_model_tile(ui, p, tile_w, tile_h, &spec, |ui| {
+        if m.is_embedding {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("RAG / Embedding model")
+                        .small()
+                        .color(p.muted),
+                )
+                .truncate(),
+            );
+        } else {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if primary_button(ui, p, "Serve & Use").clicked() {
+                    backend.start_local_model(m.id.clone());
+                }
+                let use_lbl = if is_active { "Active" } else { "Use" };
+                let btn_res = if is_active {
+                    ghost_button(
+                        ui,
+                        p,
+                        egui::RichText::new(use_lbl).color(p.accent_hot),
+                    )
+                } else {
+                    secondary_button(ui, p, use_lbl)
+                };
+                if btn_res.clicked() {
+                    let id = m.id.clone();
+                    backend.update_settings(move |s| {
+                        s.active_model_id = id;
+                    });
+                }
+            });
+        }
+    });
 }
 
 fn render_vault_tab(
@@ -510,7 +655,7 @@ fn render_vault_tab(
                     state.switch_main_view(MainView::Forge(ForgeTab::Hub), true);
                 }
             } else {
-                let (cols, tile_side, gap) = square_tile_grid_layout(ui.available_width());
+                let (cols, tile_w, tile_h, gap) = model_tile_grid_layout(ui.available_width());
 
                 for (row_idx, row_models) in snap.local_models.chunks(cols).enumerate() {
                     if row_idx > 0 {
@@ -519,14 +664,14 @@ fn render_vault_tab(
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = gap;
                         for m in row_models {
-                            render_local_model_square_tile(
+                            render_local_model_tile(
                                 ui,
                                 backend,
                                 snap,
                                 p,
                                 m,
-                                tile_side,
-                                vram_total_mb,
+                                tile_w,
+                                tile_h,
                             );
                         }
                     });
@@ -811,7 +956,6 @@ fn render_hub_tab(
                     if idx > 0 {
                         ui.add_space(6.0);
                     }
-                    let fit_col = fit_tier_color(f.vram_fit.tier, p);
                     let short_name = short_path_tail(&f.filename);
                     let quant = infer_gguf_quant(short_name);
                     let is_downloading = snap.downloads.iter().any(|d| {
@@ -844,14 +988,15 @@ fn render_hub_tab(
                             ui,
                             ui.available_width(),
                             22.0,
-                            260.0,
+                            210.0,
                             short_name,
                             Some(&f.filename),
                             false,
                             p,
                             |ui| {
+                                let (vram_short, vram_col) = concise_vram_badge(&f.vram_fit, p);
                                 badge(ui, &quant, p.muted, p.bg_elev);
-                                badge(ui, &f.vram_fit.label, fit_col, p.bg_elev);
+                                badge(ui, &vram_short, vram_col, p.bg_elev);
                             },
                         );
                     });
@@ -860,7 +1005,7 @@ fn render_hub_tab(
         );
     }
 
-    // Hugging Face Search Results as 2-line structured subcards
+    // Hugging Face Search Results using the same unified model tile grid as Local Vault
     if !state.hf_results.is_empty() {
         ui.add_space(16.0);
         setting_group(
@@ -873,55 +1018,109 @@ fn render_hub_tab(
                     .hf_repo_details
                     .as_ref()
                     .map(|d| d.repo_id.as_str())
-                    .unwrap_or("");
-                for (idx, res) in state.hf_results.iter().enumerate() {
-                    if idx > 0 {
-                        ui.add_space(6.0);
+                    .unwrap_or("")
+                    .to_string();
+                let results = state.hf_results.clone();
+                let (cols, tile_w, tile_h, gap) = model_tile_grid_layout(ui.available_width());
+
+                for (row_idx, row_items) in results.chunks(cols).enumerate() {
+                    if row_idx > 0 {
+                        ui.add_space(gap);
                     }
-                    let is_inspected = inspected_repo == res.repo_id;
-                    let subtitle = format!(
-                        "Public Hugging Face repository · {} downloads · {} likes · Click Inspect Files to check quantizations",
-                        res.downloads, res.likes
-                    );
-                    render_hub_subcard_row(ui, p, &subtitle, |ui| {
-                        let btn_lbl = if is_inspected {
-                            "Inspecting"
-                        } else {
-                            "Inspect Files"
-                        };
-                        let clicked = if is_inspected {
-                            primary_button(ui, p, btn_lbl).clicked()
-                        } else {
-                            secondary_button(ui, p, btn_lbl).clicked()
-                        };
-                        if clicked {
-                            backend.inspect_hf_repo(res.repo_id.clone());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        for res in row_items {
+                            let is_inspected = inspected_repo == res.repo_id;
+                            let short_repo = res
+                                .repo_id
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&res.repo_id)
+                                .to_string();
+                            let owner = if !res.author.trim().is_empty() {
+                                res.author.clone()
+                            } else {
+                                res.repo_id
+                                    .split('/')
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_string()
+                            };
+                            let interesting_tags: Vec<&str> = res
+                                .tags
+                                .iter()
+                                .map(String::as_str)
+                                .filter(|t| {
+                                    !t.eq_ignore_ascii_case("gguf")
+                                        && !t.starts_with("region:")
+                                        && !t.starts_with("endpoints_")
+                                        && !t.starts_with("arxiv:")
+                                        && !t.starts_with("base_model:")
+                                })
+                                .take(4)
+                                .collect();
+                            let tags_str = if interesting_tags.is_empty() {
+                                "GGUF weights repository".to_string()
+                            } else {
+                                interesting_tags.join(" · ")
+                            };
+                            let updated_str = res
+                                .last_modified
+                                .as_deref()
+                                .and_then(|s| s.get(..10))
+                                .map(|d| format!("Updated {d} · {}", res.repo_id))
+                                .unwrap_or_else(|| res.repo_id.clone());
+
+                            let spec = ModelTileSpec {
+                                title: short_repo,
+                                title_tooltip: res.repo_id.clone(),
+                                subtitle: if owner.is_empty() { None } else { Some(owner) },
+                                badges: vec![
+                                    ModelTileBadge {
+                                        label: "GGUF".into(),
+                                        color: p.muted,
+                                        tooltip: None,
+                                    },
+                                    ModelTileBadge {
+                                        label: format!("↓ {}", fmt_compact_count(res.downloads)),
+                                        color: p.green,
+                                        tooltip: Some(format!("{} total downloads", res.downloads)),
+                                    },
+                                    ModelTileBadge {
+                                        label: format!("★ {}", fmt_compact_count(res.likes)),
+                                        color: p.amber,
+                                        tooltip: Some(format!("{} likes", res.likes)),
+                                    },
+                                ],
+                                progress: None,
+                                meta_lines: vec![
+                                    (tags_str, res.tags.join(", ")),
+                                    (updated_str, res.repo_id.clone()),
+                                ],
+                                border_highlight: if is_inspected { Some(p.accent) } else { None },
+                            };
+
+                            render_model_tile(ui, p, tile_w, tile_h, &spec, |ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let btn_lbl = if is_inspected {
+                                            "Inspecting"
+                                        } else {
+                                            "Inspect Files"
+                                        };
+                                        let clicked = if is_inspected {
+                                            primary_button(ui, p, btn_lbl).clicked()
+                                        } else {
+                                            secondary_button(ui, p, btn_lbl).clicked()
+                                        };
+                                        if clicked {
+                                            backend.inspect_hf_repo(res.repo_id.clone());
+                                        }
+                                    },
+                                );
+                            });
                         }
-                        render_left_title_with_badges(
-                            ui,
-                            ui.available_width(),
-                            22.0,
-                            225.0,
-                            &res.repo_id,
-                            None,
-                            false,
-                            p,
-                            |ui| {
-                                badge(ui, "GGUF Repo", p.muted, p.bg_elev);
-                                badge(
-                                    ui,
-                                    &format!("↓ {}", fmt_compact_count(res.downloads)),
-                                    p.green,
-                                    p.bg_elev,
-                                );
-                                badge(
-                                    ui,
-                                    &format!("★ {}", fmt_compact_count(res.likes)),
-                                    p.amber,
-                                    p.bg_elev,
-                                );
-                            },
-                        );
                     });
                 }
             },
@@ -954,7 +1153,7 @@ fn render_quotas_tab(
         ui,
         p,
         "Quota Tier & Reachability",
-        "Monitor provider reachability and daily quota limits across configured cloud models.",
+        "Probe configured cloud APIs for live reachability, free/paid tier access, and daily limits.",
         |ui| {
             ui.horizontal(|ui| {
                 if let Some(next_tier) = segmented_control(
@@ -971,10 +1170,10 @@ fn render_quotas_tab(
                     backend.set_quota_tier(next_tier);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if primary_button(ui, p, "Probe Google API").clicked() {
-                        backend.sync_google();
+                    if primary_button(ui, p, "Probe All Providers").clicked() {
+                        backend.save_keys(KeysPatch::default(), true);
                     }
-                    if secondary_button(ui, p, "Manage API Keys & Auto-Switch in Settings →")
+                    if secondary_button(ui, p, "Manage API Keys & Aliases in Settings →")
                         .clicked()
                     {
                         state.open_settings(SettingsTab::Models);
@@ -1011,7 +1210,7 @@ fn render_quotas_tab(
         ui,
         p,
         "Cloud Model Quotas",
-        "Estimated remaining daily capacity and request rate limits.",
+        "Models that are free/reachable can be selected in Chat; paid or unreachable models are filed under separate tabs.",
         |ui| {
             if snap.cloud_quotas.is_empty() {
                 empty_state_block(
@@ -1024,50 +1223,203 @@ fn render_quotas_tab(
                 )
                 .then(|| state.open_settings(SettingsTab::Models));
             } else {
-                for (idx, q) in snap.cloud_quotas.iter().enumerate() {
-                    if idx > 0 {
-                        ui.add_space(6.0);
-                    }
-                    p.subcard_frame().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
+                let (avail_list, paid_list, unavail_list) =
+                    partition_quotas_tab(&snap.cloud_quotas);
+                let avail_lbl = format!("Available ({})", avail_list.len());
+                let paid_lbl = format!("Paid / Credits ({})", paid_list.len());
+                let unavail_lbl = format!("Unreachable ({})", unavail_list.len());
+
+                if let Some(next_tab) = segmented_control(
+                    ui,
+                    p,
+                    "forge_quotas_filter_tab",
+                    state.quotas_filter,
+                    &[
+                        (QuotasTabFilter::Available, avail_lbl.as_str()),
+                        (QuotasTabFilter::Paid, paid_lbl.as_str()),
+                        (QuotasTabFilter::Unreachable, unavail_lbl.as_str()),
+                    ],
+                ) {
+                    state.quotas_filter = next_tab;
+                }
+                ui.add_space(10.0);
+
+                let active_bucket: Vec<&ModelQuotaSnapshot> = match state.quotas_filter {
+                    QuotasTabFilter::Available => avail_list,
+                    QuotasTabFilter::Paid => paid_list,
+                    QuotasTabFilter::Unreachable => unavail_list,
+                };
+
+                if active_bucket.is_empty() {
+                    let (title, hint) = match state.quotas_filter {
+                        QuotasTabFilter::Available => (
+                            "No available cloud models yet",
+                            "Add an API key in Settings and click Probe All Providers to discover reachable models.",
+                        ),
+                        QuotasTabFilter::Paid => (
+                            "No payment-gated models detected",
+                            "OpenRouter or provider models requiring paid credits will be separated into this tab automatically.",
+                        ),
+                        QuotasTabFilter::Unreachable => (
+                            "No unreachable models",
+                            "Models missing an API key or failing live verification appear here.",
+                        ),
+                    };
+                    empty_state_block(ui, p, Icon::Shield, title, hint, None);
+                } else {
+                    let (cols, tile_w, tile_h, gap) = model_tile_grid_layout(ui.available_width());
+                    for (row_idx, row_items) in active_bucket.chunks(cols).enumerate() {
+                        if row_idx > 0 {
+                            ui.add_space(gap);
+                        }
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(&q.display_name).strong().color(p.text));
-                            if q.reachable {
-                                badge(ui, "Reachable", p.green, p.bg_elev);
-                            } else {
-                                badge(ui, &q.reachability_reason, p.muted, p.bg_elev);
+                            ui.spacing_mut().item_spacing.x = gap;
+                            for q in row_items {
+                                let is_active = snap.settings.active_model_id == q.model_id;
+                                let resolved = snap
+                                    .settings
+                                    .resolve_model_alias(&q.model_id, &q.display_name)
+                                    .to_string();
+                                let subtitle = if resolved != q.display_name {
+                                    Some(format!("{} · {}", q.display_name, q.model_id))
+                                } else {
+                                    Some(q.model_id.clone())
+                                };
+                                let (prov_lbl, prov_col) = provider_pill_style(q.provider, p);
+                                let mut badges = vec![ModelTileBadge {
+                                    label: prov_lbl.into(),
+                                    color: prov_col,
+                                    tooltip: None,
+                                }];
+                                if q.requires_payment {
+                                    badges.push(ModelTileBadge {
+                                        label: "Paid Credits".into(),
+                                        color: p.amber,
+                                        tooltip: Some(q.reachability_reason.clone()),
+                                    });
+                                } else if q.reachable {
+                                    badges.push(ModelTileBadge {
+                                        label: "Reachable".into(),
+                                        color: p.green,
+                                        tooltip: Some(q.reachability_reason.clone()),
+                                    });
+                                } else {
+                                    badges.push(ModelTileBadge {
+                                        label: "Unreachable".into(),
+                                        color: p.red,
+                                        tooltip: Some(q.reachability_reason.clone()),
+                                    });
+                                }
+                                if is_active {
+                                    badges.push(ModelTileBadge {
+                                        label: "Active".into(),
+                                        color: p.accent_hot,
+                                        tooltip: None,
+                                    });
+                                }
+
+                                let prog_col = if q.remaining_daily_pct >= 50.0 {
+                                    p.green
+                                } else if q.remaining_daily_pct >= 20.0 {
+                                    p.amber
+                                } else {
+                                    p.red
+                                };
+                                let progress = if q.reachable && !q.requires_payment {
+                                    Some(ModelTileProgress {
+                                        fraction: (q.remaining_daily_pct as f32 / 100.0)
+                                            .clamp(0.0, 1.0),
+                                        color: prog_col,
+                                        right_label: format!("{:.0}% left", q.remaining_daily_pct),
+                                    })
+                                } else {
+                                    None
+                                };
+
+                                let meta_lines = if q.reachable && !q.requires_payment {
+                                    vec![
+                                        (
+                                            format!(
+                                                "Today: {} reqs · {} / {} tok",
+                                                q.rpd_used, q.tokens_today, q.daily_token_limit
+                                            ),
+                                            String::new(),
+                                        ),
+                                        (
+                                            format!(
+                                                "RPM {}/{} · Ctx {}k",
+                                                q.rpm_used,
+                                                q.rpm_limit,
+                                                q.context_window / 1000
+                                            ),
+                                            q.reachability_reason.clone(),
+                                        ),
+                                    ]
+                                } else {
+                                    vec![
+                                        (
+                                            q.reachability_reason.clone(),
+                                            q.reachability_reason.clone(),
+                                        ),
+                                        (
+                                            format!(
+                                                "Ctx {}k · RPD limit {}",
+                                                q.context_window / 1000,
+                                                q.rpd_limit
+                                            ),
+                                            q.model_id.clone(),
+                                        ),
+                                    ]
+                                };
+
+                                let spec = ModelTileSpec {
+                                    title: resolved,
+                                    title_tooltip: format!("{} ({})", q.display_name, q.model_id),
+                                    subtitle,
+                                    badges,
+                                    progress,
+                                    meta_lines,
+                                    border_highlight: if is_active { Some(p.accent) } else { None },
+                                };
+
+                                render_model_tile(ui, p, tile_w, tile_h, &spec, |ui| {
+                                    if q.reachable && !q.requires_payment {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let lbl = if is_active { "Active" } else { "Use" };
+                                                let btn = if is_active {
+                                                    ghost_button(
+                                                        ui,
+                                                        p,
+                                                        egui::RichText::new(lbl)
+                                                            .color(p.accent_hot),
+                                                    )
+                                                } else {
+                                                    secondary_button(ui, p, lbl)
+                                                };
+                                                if btn.clicked() {
+                                                    let id = q.model_id.clone();
+                                                    backend.update_settings(move |s| {
+                                                        s.active_model_id = id;
+                                                    });
+                                                }
+                                            },
+                                        );
+                                    } else {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new("Hidden from Chat pickers")
+                                                    .small()
+                                                    .color(p.muted),
+                                            )
+                                            .truncate(),
+                                        );
+                                    }
+                                });
                             }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{:.0}% remaining",
-                                            q.remaining_daily_pct
-                                        ))
-                                        .small()
-                                        .color(p.text),
-                                    );
-                                },
-                            );
                         });
-                        ui.add_space(4.0);
-                        ui.add(egui::ProgressBar::new(
-                            (q.remaining_daily_pct as f32 / 100.0).clamp(0.0, 1.0),
-                        ));
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Today: {} reqs · {} / {} tokens · RPM {}/{}",
-                                q.rpd_used,
-                                q.tokens_today,
-                                q.daily_token_limit,
-                                q.rpm_used,
-                                q.rpm_limit
-                            ))
-                            .small()
-                            .color(p.muted),
-                        );
-                    });
+                    }
                 }
             }
         },
@@ -1079,17 +1431,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn square_tile_grid_layout_keeps_squares_across_resize_widths() {
-        for (w, expected_cols) in [(350.0, 1), (460.0, 2), (660.0, 3), (920.0, 4)] {
-            let (cols, side, gap) = square_tile_grid_layout(w);
+    fn model_tile_grid_layout_fits_cards_without_clipping_across_widths() {
+        for (w, expected_cols) in [(350.0, 1), (600.0, 2), (920.0, 3), (1120.0, 3)] {
+            let (cols, tile_w, tile_h, gap) = model_tile_grid_layout(w);
             assert_eq!(cols, expected_cols, "width={w}");
-            assert!(side >= 175.0, "side={side} too small at w={w}");
-            let total_row_w = (cols as f32) * side + ((cols - 1) as f32) * gap;
+            assert!(tile_w >= 280.0, "tile_w={tile_w} too narrow at w={w}");
+            assert!(tile_h >= 180.0, "tile_h={tile_h}");
+            let total_row_w = (cols as f32) * tile_w + ((cols - 1) as f32) * gap;
             assert!(
                 total_row_w <= w + 0.5,
                 "row overflow: total_row_w={total_row_w} > w={w}"
             );
         }
+    }
+
+    #[test]
+    fn concise_vram_badge_and_quota_tab_partition_work() {
+        let p = CinderPalette::from_ui(&harness_store::UiCustomization::default());
+        let fit = VramFitAssessment {
+            tier: FitTier::PartialOffload,
+            label: "Hybrid GPU+RAM Offload · ~36 layers on GPU".into(),
+            weights_mb: 8000,
+            kv_cache_mb: 1024,
+            compute_buffer_mb: 512,
+            estimated_total_mb: 9536,
+            recommended_ngl: 36,
+        };
+        let (lbl, _col) = concise_vram_badge(&fit, &p);
+        assert_eq!(lbl, "Hybrid GPU · 36L");
+
+        let mk_q = |id: &str, reachable: bool, requires_payment: bool| ModelQuotaSnapshot {
+            model_id: id.into(),
+            display_name: id.into(),
+            provider: ProviderKind::OpenRouter,
+            context_window: 128_000,
+            supports_thinking: false,
+            supports_tools: true,
+            remaining_daily_pct: 100.0,
+            rpm_used: 0,
+            rpm_limit: 20,
+            tpm_used: 0,
+            tpm_limit: 200_000,
+            rpd_used: 0,
+            rpd_limit: 200,
+            tokens_today: 0,
+            daily_token_limit: 2_000_000,
+            prompt_tokens_today: 0,
+            completion_tokens_today: 0,
+            thinking_tokens_today: 0,
+            reset_in_seconds: 3600,
+            header_source: false,
+            reachable,
+            reachability_reason: String::new(),
+            antigravity_alias: None,
+            requires_payment,
+        };
+        let list = vec![
+            mk_q("free:free", true, false),
+            mk_q("paid-pro", false, true),
+            mk_q("broken", false, false),
+        ];
+        let (a, paid, u) = partition_quotas_tab(&list);
+        assert_eq!(a.len(), 1);
+        assert_eq!(paid.len(), 1);
+        assert_eq!(u.len(), 1);
     }
 
     #[test]

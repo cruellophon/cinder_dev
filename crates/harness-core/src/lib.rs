@@ -2717,14 +2717,18 @@ async fn run_agent_loop(
             break;
         }
 
+        let display_model = snapshot
+            .settings
+            .resolve_model_alias(&active_model_id, &active_model_id)
+            .to_string();
         ctx.store
             .set_activity_stream(
                 Some(session_id),
                 "thinking",
                 &format!(
-                    "[{}] Waiting for {} (step {}/{max_steps})...",
+                    "[{}] Waiting for {} (Turn {})...",
                     mode_label(current_mode).to_ascii_uppercase(),
-                    active_model_id,
+                    display_model,
                     step + 1
                 ),
                 step + 1,
@@ -2941,14 +2945,18 @@ async fn run_agent_loop(
                 accumulated_thoughts.push(th);
             }
             final_content = clean_resp_content;
+            let display_model = snapshot
+                .settings
+                .resolve_model_alias(&active_model_id, &active_model_id)
+                .to_string();
             ctx.store
                 .set_activity_stream(
                     Some(session_id),
                     "streaming",
                     &format!(
-                        "[{}] {} responded (step {}/{max_steps})",
+                        "[{}] {} responded (Turn {})",
                         mode_label(current_mode).to_ascii_uppercase(),
-                        active_model_id,
+                        display_model,
                         step + 1
                     ),
                     step + 1,
@@ -2982,14 +2990,18 @@ async fn run_agent_loop(
         }
         final_content.clear();
 
+        let display_model = snapshot
+            .settings
+            .resolve_model_alias(&active_model_id, &active_model_id)
+            .to_string();
         ctx.store
             .set_activity_stream(
                 Some(session_id),
                 "streaming",
                 &format!(
-                    "[{}] {} planned tool action (step {}/{max_steps})",
+                    "[{}] {} planned tool action (Turn {})",
                     mode_label(current_mode).to_ascii_uppercase(),
-                    active_model_id,
+                    display_model,
                     step + 1
                 ),
                 step + 1,

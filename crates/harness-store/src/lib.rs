@@ -123,6 +123,7 @@ impl BumboStore {
                 orchestrator: OrchestratorConfig::default(),
                 auto_switch_models: true,
                 fallback_to_local: false,
+                model_aliases: std::collections::BTreeMap::new(),
             },
             workspaces,
             sessions: vec![initial_session],
@@ -548,6 +549,7 @@ mod tests {
                 reachable: true,
                 reachability_reason: String::new(),
                 antigravity_alias: None,
+                requires_payment: false,
             };
             store
                 .update(|s| {

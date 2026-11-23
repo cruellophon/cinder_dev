@@ -399,6 +399,14 @@ pub async fn complete(
 
 pub fn classify_provider_error(err_str: &str) -> (bool, bool, &'static str) {
     let lower = err_str.to_ascii_lowercase();
+    if err_str.contains("HTTP 402")
+        || lower.contains("payment required")
+        || lower.contains("insufficient credits")
+        || lower.contains("credit balance is too low")
+        || lower.contains("requires more credits")
+    {
+        return (true, true, "requires paid credits / payment required");
+    }
     if lower.contains("limit: 0") || err_str.contains("HTTP 404") || err_str.contains("NOT_FOUND") {
         return (true, true, "0 quota / unavailable on current API tier");
     }
@@ -465,17 +473,19 @@ pub fn build_fallback_candidates(
     // 1. Preferred same-provider fallbacks first
     if failed_provider == ProviderKind::GoogleGemini {
         for pref in GEMINI_PRIORITY {
-            if catalog
-                .iter()
-                .any(|c| c.id == *pref && c.provider == ProviderKind::GoogleGemini && c.reachable)
-            {
+            if catalog.iter().any(|c| {
+                c.id == *pref
+                    && c.provider == ProviderKind::GoogleGemini
+                    && c.reachable
+                    && !c.requires_payment
+            }) {
                 push_unique(pref);
             }
         }
     }
     for c in catalog
         .iter()
-        .filter(|c| c.provider == failed_provider && c.reachable)
+        .filter(|c| c.provider == failed_provider && c.reachable && !c.requires_payment)
     {
         push_unique(&c.id);
     }
@@ -493,15 +503,20 @@ pub fn build_fallback_candidates(
         }
         if p == ProviderKind::GoogleGemini {
             for pref in GEMINI_PRIORITY {
-                if catalog
-                    .iter()
-                    .any(|c| c.id == *pref && c.provider == ProviderKind::GoogleGemini && c.reachable)
-                {
+                if catalog.iter().any(|c| {
+                    c.id == *pref
+                        && c.provider == ProviderKind::GoogleGemini
+                        && c.reachable
+                        && !c.requires_payment
+                }) {
                     push_unique(pref);
                 }
             }
         }
-        for c in catalog.iter().filter(|c| c.provider == p && c.reachable) {
+        for c in catalog
+            .iter()
+            .filter(|c| c.provider == p && c.reachable && !c.requires_payment)
+        {
             push_unique(&c.id);
         }
     }
@@ -1561,13 +1576,24 @@ struct GeminiModelRaw {
     supported_generation_methods: Option<Vec<String>>,
 }
 
-pub async fn probe_gemini_model_live(gate: &NetworkGate, api_key: &str, model_id: &str) -> bool {
+#[derive(Debug, Clone)]
+enum GeminiProbeOutcome {
+    Available,
+    PaymentRequired(String),
+    Unreachable(String),
+}
+
+async fn probe_gemini_model_status(
+    gate: &NetworkGate,
+    api_key: &str,
+    model_id: &str,
+) -> GeminiProbeOutcome {
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
         model_id
     );
     let Ok(builder) = gate.request(Method::POST, &url, "gemini_model_live_probe") else {
-        return false;
+        return GeminiProbeOutcome::Unreachable("Blocked by Strict Local privacy mode".into());
     };
     let req = builder
         .header("x-goog-api-key", api_key.trim())
@@ -1577,9 +1603,38 @@ pub async fn probe_gemini_model_live(gate: &NetworkGate, api_key: &str, model_id
         }));
 
     let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(4), req.send()).await else {
-        return false;
+        return GeminiProbeOutcome::Unreachable("Probe timed out / unreachable".into());
     };
-    resp.status().is_success()
+    let status = resp.status();
+    if status.is_success() {
+        return GeminiProbeOutcome::Available;
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let lower = body.to_ascii_lowercase();
+    if status.as_u16() == 402
+        || lower.contains("billing")
+        || lower.contains("paid tier")
+        || lower.contains("enable billing")
+        || (lower.contains("limit: 0") && lower.contains("free_tier"))
+    {
+        GeminiProbeOutcome::PaymentRequired(format!(
+            "HTTP {} · Requires paid billing tier",
+            status.as_u16()
+        ))
+    } else if lower.contains("limit: 0") {
+        GeminiProbeOutcome::PaymentRequired("Quota limit is 0 on free tier (paid plan required)".into())
+    } else if status.as_u16() == 404 {
+        GeminiProbeOutcome::Unreachable("HTTP 404 · Not available on this endpoint".into())
+    } else {
+        GeminiProbeOutcome::Unreachable(format!("HTTP {} · Unavailable", status.as_u16()))
+    }
+}
+
+pub async fn probe_gemini_model_live(gate: &NetworkGate, api_key: &str, model_id: &str) -> bool {
+    matches!(
+        probe_gemini_model_status(gate, api_key, model_id).await,
+        GeminiProbeOutcome::Available
+    )
 }
 
 pub async fn sync_google_models(
@@ -1638,29 +1693,47 @@ pub async fn sync_google_models(
                 rpd_limit: 5_000,
                 daily_token_limit: 15_000_000,
             }),
-            reachable: true,
-            reachability_reason: "Verified reachable via live probe".into(),
+            reachable: false,
+            reachability_reason: "Pending verification".into(),
             antigravity_alias: Some(display_name),
+            requires_payment: false,
         });
     }
 
-    let mut verified = Vec::new();
+    let mut probed = Vec::new();
     for chunk in candidates.chunks(6) {
         let checks = futures_util::future::join_all(
             chunk
                 .iter()
-                .map(|cand| probe_gemini_model_live(gate, api_key, &cand.id)),
+                .map(|cand| probe_gemini_model_status(gate, api_key, &cand.id)),
         )
         .await;
-        for (cand, ok) in chunk.iter().zip(checks.into_iter()) {
-            if ok {
-                verified.push(cand.clone());
+        for (cand, outcome) in chunk.iter().zip(checks.into_iter()) {
+            let mut entry = cand.clone();
+            match outcome {
+                GeminiProbeOutcome::Available => {
+                    entry.reachable = true;
+                    entry.requires_payment = false;
+                    entry.reachability_reason = "Verified reachable via live probe".into();
+                }
+                GeminiProbeOutcome::PaymentRequired(reason) => {
+                    entry.reachable = false;
+                    entry.requires_payment = true;
+                    entry.reachability_reason = reason;
+                }
+                GeminiProbeOutcome::Unreachable(reason) => {
+                    entry.reachable = false;
+                    entry.requires_payment = false;
+                    entry.reachability_reason = reason;
+                }
             }
+            probed.push(entry);
         }
     }
 
-    sort_gemini_models_by_priority(&mut verified);
-    Ok(verified)
+    sort_gemini_models_by_priority(&mut probed);
+    probed.sort_by(|a, b| b.reachable.cmp(&a.reachable));
+    Ok(probed)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1693,14 +1766,23 @@ pub async fn verify_and_discover_provider_models(
     } else {
         match sync_google_models(gate, &keys.gemini_api_key).await {
             Ok(list) => {
-                let count = list.len();
+                let reachable_count = list
+                    .iter()
+                    .filter(|m| m.reachable && !m.requires_payment)
+                    .count();
+                let paid_count = list.iter().filter(|m| m.requires_payment).count();
+                let message = if paid_count > 0 {
+                    format!("Verified · {reachable_count} reachable · {paid_count} paid")
+                } else {
+                    format!("Verified · {reachable_count} models reachable")
+                };
                 verified_map.insert("google_gemini".to_string(), list);
                 statuses.push(ProviderVerifyStatus {
                     provider: "google_gemini".into(),
                     configured: true,
                     verified: true,
-                    model_count: count,
-                    message: format!("Verified · {count} models reachable"),
+                    model_count: reachable_count,
+                    message,
                 });
             }
             Err(e) => {
@@ -1727,14 +1809,17 @@ pub async fn verify_and_discover_provider_models(
     } else {
         match sync_anthropic_models(gate, &keys.anthropic_api_key).await {
             Ok(list) => {
-                let count = list.len();
+                let reachable_count = list
+                    .iter()
+                    .filter(|m| m.reachable && !m.requires_payment)
+                    .count();
                 verified_map.insert("anthropic".to_string(), list);
                 statuses.push(ProviderVerifyStatus {
                     provider: "anthropic".into(),
                     configured: true,
                     verified: true,
-                    model_count: count,
-                    message: format!("Verified · {count} models reachable"),
+                    model_count: reachable_count,
+                    message: format!("Verified · {reachable_count} models reachable"),
                 });
             }
             Err(e) => {
@@ -1761,14 +1846,23 @@ pub async fn verify_and_discover_provider_models(
     } else {
         match sync_openrouter_models(gate, &keys.openrouter_api_key).await {
             Ok(list) => {
-                let count = list.len();
+                let reachable_count = list
+                    .iter()
+                    .filter(|m| m.reachable && !m.requires_payment)
+                    .count();
+                let paid_count = list.iter().filter(|m| m.requires_payment).count();
+                let message = if paid_count > 0 {
+                    format!("Verified · {reachable_count} reachable · {paid_count} paid")
+                } else {
+                    format!("Verified · {reachable_count} models reachable")
+                };
                 verified_map.insert("open_router".to_string(), list);
                 statuses.push(ProviderVerifyStatus {
                     provider: "open_router".into(),
                     configured: true,
                     verified: true,
-                    model_count: count,
-                    message: format!("Verified · {count} models reachable"),
+                    model_count: reachable_count,
+                    message,
                 });
             }
             Err(e) => {
@@ -1801,14 +1895,17 @@ pub async fn verify_and_discover_provider_models(
         .await
         {
             Ok(list) => {
-                let count = list.len();
+                let reachable_count = list
+                    .iter()
+                    .filter(|m| m.reachable && !m.requires_payment)
+                    .count();
                 verified_map.insert("open_ai_compat".to_string(), list);
                 statuses.push(ProviderVerifyStatus {
                     provider: "open_ai_compat".into(),
                     configured: true,
                     verified: true,
-                    model_count: count,
-                    message: format!("Verified · {count} models reachable"),
+                    model_count: reachable_count,
+                    message: format!("Verified · {reachable_count} models reachable"),
                 });
             }
             Err(e) => {
@@ -1826,6 +1923,11 @@ pub async fn verify_and_discover_provider_models(
     store
         .update(|s| {
             for (k, v) in verified_map {
+                for m in &v {
+                    if m.reachable && !m.requires_payment {
+                        s.blocked_models.remove(&m.id);
+                    }
+                }
                 if k == "google_gemini" {
                     s.blocked_models
                         .retain(|id, _| !id.starts_with("gemini-") && !id.starts_with("gemma-"));
@@ -1837,9 +1939,12 @@ pub async fn verify_and_discover_provider_models(
                 let (cat, _) = harness_store::compute_catalog_and_quotas(s);
                 let still_ok = cat
                     .iter()
-                    .any(|c| c.id == s.settings.active_model_id && c.reachable);
+                    .any(|c| c.id == s.settings.active_model_id && c.reachable && !c.requires_payment);
                 if !still_ok {
-                    if let Some(first_reachable) = cat.iter().find(|c| c.reachable) {
+                    if let Some(first_reachable) = cat
+                        .iter()
+                        .find(|c| c.reachable && !c.requires_payment)
+                    {
                         s.settings.active_model_id = first_reachable.id.clone();
                     }
                 }
@@ -1895,10 +2000,52 @@ async fn sync_anthropic_models(
                 reachable: true,
                 reachability_reason: "Verified reachable via live API".into(),
                 antigravity_alias: Some(display),
+                requires_payment: false,
             });
         }
     }
     Ok(out)
+}
+
+fn parse_openrouter_price(v: Option<&Value>) -> Option<f64> {
+    match v? {
+        Value::Number(n) => n.as_f64().filter(|x| x.is_finite()),
+        Value::String(s) => s.trim().parse::<f64>().ok().filter(|x| x.is_finite()),
+        _ => None,
+    }
+}
+
+pub fn evaluate_openrouter_account_has_credits(
+    auth_json: &Value,
+    credits_json: Option<&Value>,
+) -> bool {
+    let data = &auth_json["data"];
+    let mut has_paid_balance = if let Some(cj) = credits_json {
+        let total = cj["data"]["total_credits"].as_f64();
+        let used = cj["data"]["total_usage"].as_f64().unwrap_or(0.0);
+        match total {
+            Some(t) if t.is_finite() && used.is_finite() => (t - used) > 0.0001,
+            _ => !data["is_free_tier"].as_bool().unwrap_or(true),
+        }
+    } else {
+        !data["is_free_tier"].as_bool().unwrap_or(true)
+    };
+
+    if let Some(rem) = data["limit_remaining"].as_f64() {
+        if rem.is_finite() && rem <= 0.0001 {
+            has_paid_balance = false;
+        }
+    }
+    has_paid_balance
+}
+
+pub fn is_openrouter_model_free(id: &str, item: &Value) -> bool {
+    if id.ends_with(":free") {
+        return true;
+    }
+    let prompt_price = parse_openrouter_price(item["pricing"].get("prompt"));
+    let comp_price = parse_openrouter_price(item["pricing"].get("completion"));
+    matches!((prompt_price, comp_price), (Some(p), Some(c)) if p <= 0.0 && c <= 0.0)
 }
 
 async fn sync_openrouter_models(
@@ -1915,8 +2062,32 @@ async fn sync_openrouter_models(
         .send()
         .await?;
     if !auth_resp.status().is_success() {
-        anyhow::bail!("OpenRouter key rejected (HTTP {})", auth_resp.status());
+        let code = auth_resp.status();
+        if code.as_u16() == 402 {
+            anyhow::bail!("OpenRouter HTTP 402: Payment required");
+        }
+        anyhow::bail!("OpenRouter key rejected (HTTP {code})");
     }
+    let auth_json: Value = auth_resp.json().await.unwrap_or(Value::Null);
+
+    let credits_json: Option<Value> = match gate.request(
+        Method::GET,
+        "https://openrouter.ai/api/v1/credits",
+        "openrouter_credits_check",
+    ) {
+        Ok(builder) => match tokio::time::timeout(
+            Duration::from_secs(3),
+            builder.bearer_auth(api_key.trim()).send(),
+        )
+        .await
+        {
+            Ok(Ok(r)) if r.status().is_success() => r.json::<Value>().await.ok(),
+            _ => None,
+        },
+        Err(_) => None,
+    };
+
+    let has_credits = evaluate_openrouter_account_has_credits(&auth_json, credits_json.as_ref());
 
     let list_resp = gate
         .request(
@@ -1927,8 +2098,12 @@ async fn sync_openrouter_models(
         .bearer_auth(api_key.trim())
         .send()
         .await?;
+    if !list_resp.status().is_success() {
+        anyhow::bail!("OpenRouter models list failed (HTTP {})", list_resp.status());
+    }
     let val: Value = list_resp.json().await?;
-    let mut out = vec![ModelCatalogEntry {
+
+    let auto_entry = ModelCatalogEntry {
         id: "openrouter/auto".into(),
         display_name: "OpenRouter Auto".into(),
         provider: ProviderKind::OpenRouter,
@@ -1936,45 +2111,101 @@ async fn sync_openrouter_models(
         supports_thinking: false,
         supports_tools: true,
         supports_vision: false,
-        tier_note: "Verified via OpenRouter".into(),
+        tier_note: if has_credits {
+            "Verified via OpenRouter (credits active)".into()
+        } else {
+            "OpenRouter Auto (requires paid credits)".into()
+        },
         quota_limit: Some(ModelQuotaLimit {
             rpm_limit: 200,
             tpm_limit: 1_000_000,
             rpd_limit: 5_000,
             daily_token_limit: 20_000_000,
         }),
-        reachable: true,
-        reachability_reason: "Verified reachable via live API".into(),
+        reachable: has_credits,
+        reachability_reason: if has_credits {
+            "Verified reachable via live API".into()
+        } else {
+            "Requires paid OpenRouter credits".into()
+        },
         antigravity_alias: Some("OpenRouter Auto".into()),
-    }];
+        requires_payment: !has_credits,
+    };
 
-    for item in val["data"].as_array().cloned().unwrap_or_default().into_iter().take(25) {
-        if let Some(id) = item["id"].as_str() {
-            if id == "openrouter/auto" {
-                continue;
-            }
-            let name = item["name"].as_str().unwrap_or(id).to_string();
-            let ctx = item["context_length"].as_u64().unwrap_or(128_000);
-            out.push(ModelCatalogEntry {
-                id: id.to_string(),
-                display_name: name.clone(),
-                provider: ProviderKind::OpenRouter,
-                context_window: ctx,
-                supports_thinking: id.contains("thinking") || id.contains("r1"),
-                supports_tools: true,
-                supports_vision: false,
-                tier_note: "Verified via OpenRouter".into(),
-                quota_limit: Some(ModelQuotaLimit {
-                    rpm_limit: 200,
-                    tpm_limit: 1_000_000,
-                    rpd_limit: 5_000,
-                    daily_token_limit: 20_000_000,
-                }),
-                reachable: true,
-                reachability_reason: "Verified reachable via live API".into(),
-                antigravity_alias: Some(name),
-            });
+    let mut free_entries: Vec<ModelCatalogEntry> = Vec::new();
+    let mut paid_entries: Vec<ModelCatalogEntry> = Vec::new();
+
+    for item in val["data"].as_array().cloned().unwrap_or_default() {
+        let Some(id) = item["id"].as_str() else {
+            continue;
+        };
+        if id == "openrouter/auto" {
+            continue;
         }
+        let is_free = is_openrouter_model_free(id, &item);
+        if is_free && free_entries.len() >= 40 {
+            continue;
+        }
+        if !is_free && paid_entries.len() >= 40 {
+            continue;
+        }
+        if free_entries.len() >= 40 && paid_entries.len() >= 40 {
+            break;
+        }
+
+        let name = item["name"].as_str().unwrap_or(id).to_string();
+        let ctx = item["context_length"].as_u64().unwrap_or(128_000);
+        let reachable = is_free || has_credits;
+        let requires_payment = !is_free && !has_credits;
+        let reason = if is_free {
+            "Free tier · Verified reachable".to_string()
+        } else if has_credits {
+            "Verified reachable (paid credits active)".to_string()
+        } else {
+            "Requires paid OpenRouter credits".to_string()
+        };
+        let entry = ModelCatalogEntry {
+            id: id.to_string(),
+            display_name: name.clone(),
+            provider: ProviderKind::OpenRouter,
+            context_window: ctx,
+            supports_thinking: id.contains("thinking") || id.contains("r1"),
+            supports_tools: true,
+            supports_vision: false,
+            tier_note: if is_free {
+                "OpenRouter Free Tier".into()
+            } else if has_credits {
+                "Verified via OpenRouter".into()
+            } else {
+                "OpenRouter Paid Model".into()
+            },
+            quota_limit: Some(ModelQuotaLimit {
+                rpm_limit: if is_free { 20 } else { 200 },
+                tpm_limit: if is_free { 200_000 } else { 1_000_000 },
+                rpd_limit: if is_free { 200 } else { 5_000 },
+                daily_token_limit: if is_free { 2_000_000 } else { 20_000_000 },
+            }),
+            reachable,
+            reachability_reason: reason,
+            antigravity_alias: Some(name),
+            requires_payment,
+        };
+        if is_free {
+            free_entries.push(entry);
+        } else {
+            paid_entries.push(entry);
+        }
+    }
+
+    let mut out = Vec::new();
+    if has_credits {
+        out.push(auto_entry);
+        out.extend(free_entries);
+        out.extend(paid_entries);
+    } else {
+        out.extend(free_entries);
+        out.push(auto_entry);
+        out.extend(paid_entries);
     }
     Ok(out)
 }
@@ -2010,6 +2241,7 @@ async fn sync_openai_compat_models(
                 reachable: true,
                 reachability_reason: "Verified reachable via live API".into(),
                 antigravity_alias: Some(id.to_string()),
+                requires_payment: false,
             });
         }
     }
@@ -2428,6 +2660,41 @@ mod tests {
         let (sw6, blk6, _) =
             classify_provider_error("error sending request for url: connection closed before message completed");
         assert!(sw6 && !blk6);
+
+        let (sw7, blk7, r7) =
+            classify_provider_error("OpenRouter HTTP 402: Insufficient credits / payment required");
+        assert!(sw7 && blk7 && r7.contains("paid credits"));
+    }
+
+    #[test]
+    fn evaluates_openrouter_credits_and_free_models() {
+        let free_auth = json!({ "data": { "is_free_tier": true, "limit_remaining": null } });
+        assert!(!evaluate_openrouter_account_has_credits(&free_auth, None));
+
+        let paid_credits = json!({ "data": { "total_credits": 10.0, "total_usage": 2.5 } });
+        assert!(evaluate_openrouter_account_has_credits(
+            &free_auth,
+            Some(&paid_credits)
+        ));
+
+        let exhausted_key = json!({ "data": { "is_free_tier": false, "limit_remaining": 0.0 } });
+        assert!(!evaluate_openrouter_account_has_credits(
+            &exhausted_key,
+            Some(&paid_credits)
+        ));
+
+        assert!(is_openrouter_model_free(
+            "meta-llama/llama-3.3-70b-instruct:free",
+            &json!({ "pricing": { "prompt": "0", "completion": "0" } })
+        ));
+        assert!(is_openrouter_model_free(
+            "custom/zero-cost",
+            &json!({ "pricing": { "prompt": "0", "completion": "0.0" } })
+        ));
+        assert!(!is_openrouter_model_free(
+            "anthropic/claude-sonnet-4",
+            &json!({ "pricing": { "prompt": "0.000003", "completion": "0.000015" } })
+        ));
     }
 
     #[test]
@@ -2447,6 +2714,7 @@ mod tests {
                 reachable: true,
                 reachability_reason: String::new(),
                 antigravity_alias: None,
+                requires_payment: false,
             },
             ModelCatalogEntry {
                 id: "claude-sonnet-4-5".into(),
@@ -2461,6 +2729,7 @@ mod tests {
                 reachable: true,
                 reachability_reason: String::new(),
                 antigravity_alias: None,
+                requires_payment: false,
             },
         ];
         let locals = vec![LocalModelEntry {

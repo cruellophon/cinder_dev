@@ -53,6 +53,8 @@ pub struct ModelCatalogEntry {
     pub reachability_reason: String,
     #[serde(default)]
     pub antigravity_alias: Option<String>,
+    #[serde(default)]
+    pub requires_payment: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +149,8 @@ pub struct ModelQuotaSnapshot {
     pub reachability_reason: String,
     #[serde(default)]
     pub antigravity_alias: Option<String>,
+    #[serde(default)]
+    pub requires_payment: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -587,6 +591,21 @@ pub struct AppSettings {
     /// (off by default because it loads the GPU without asking).
     #[serde(default)]
     pub fallback_to_local: bool,
+    /// User-assigned custom display aliases mapped by model ID.
+    #[serde(default)]
+    pub model_aliases: std::collections::BTreeMap<String, String>,
+}
+
+impl AppSettings {
+    /// Returns the user-assigned alias for `model_id` if present and non-empty,
+    /// otherwise returns `fallback`.
+    pub fn resolve_model_alias<'a>(&'a self, model_id: &str, fallback: &'a str) -> &'a str {
+        self.model_aliases
+            .get(model_id)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback)
+    }
 }
 
 fn default_true() -> bool {

@@ -2152,6 +2152,7 @@ impl BackendHandle {
                 reachable: true,
                 reachability_reason: "Custom registered model".into(),
                 antigravity_alias: Some(disp),
+                requires_payment: false,
             };
             let _ = h
                 .store

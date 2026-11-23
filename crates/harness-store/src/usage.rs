@@ -92,6 +92,7 @@ pub fn default_google_pro_catalog(tier: QuotaTier) -> Vec<ModelCatalogEntry> {
             }),
             reachable: false,
             reachability_reason: String::new(),
+            requires_payment: false,
             antigravity_alias: Some("Gemini 3 Flash (Reasoning & Agent)".into()),
         },
         ModelCatalogEntry {
@@ -111,6 +112,7 @@ pub fn default_google_pro_catalog(tier: QuotaTier) -> Vec<ModelCatalogEntry> {
             }),
             reachable: false,
             reachability_reason: String::new(),
+            requires_payment: false,
             antigravity_alias: Some("Gemini 3.5 Flash-Lite (Fast Execution)".into()),
         },
         ModelCatalogEntry {
@@ -130,6 +132,7 @@ pub fn default_google_pro_catalog(tier: QuotaTier) -> Vec<ModelCatalogEntry> {
             }),
             reachable: false,
             reachability_reason: String::new(),
+            requires_payment: false,
             antigravity_alias: Some("Gemini 3.1 Flash-Lite".into()),
         },
         ModelCatalogEntry {
@@ -149,6 +152,7 @@ pub fn default_google_pro_catalog(tier: QuotaTier) -> Vec<ModelCatalogEntry> {
             }),
             reachable: false,
             reachability_reason: String::new(),
+            requires_payment: false,
             antigravity_alias: Some("Gemini Flash-Lite Latest".into()),
         },
         ModelCatalogEntry {
@@ -168,6 +172,7 @@ pub fn default_google_pro_catalog(tier: QuotaTier) -> Vec<ModelCatalogEntry> {
             }),
             reachable: false,
             reachability_reason: String::new(),
+            requires_payment: false,
             antigravity_alias: Some("Gemini 3.1 Flash-Lite Preview".into()),
         },
         ModelCatalogEntry {
@@ -187,6 +192,7 @@ pub fn default_google_pro_catalog(tier: QuotaTier) -> Vec<ModelCatalogEntry> {
             }),
             reachable: false,
             reachability_reason: String::new(),
+            requires_payment: false,
             antigravity_alias: Some("Gemma 4 26B A4B MoE".into()),
         },
         ModelCatalogEntry {
@@ -206,6 +212,7 @@ pub fn default_google_pro_catalog(tier: QuotaTier) -> Vec<ModelCatalogEntry> {
             }),
             reachable: false,
             reachability_reason: String::new(),
+            requires_payment: false,
             antigravity_alias: Some("Claude Sonnet 4.5".into()),
         },
         ModelCatalogEntry {
@@ -225,6 +232,7 @@ pub fn default_google_pro_catalog(tier: QuotaTier) -> Vec<ModelCatalogEntry> {
             }),
             reachable: false,
             reachability_reason: String::new(),
+            requires_payment: false,
             antigravity_alias: Some("Claude Opus 4.5".into()),
         },
         ModelCatalogEntry {
@@ -244,6 +252,7 @@ pub fn default_google_pro_catalog(tier: QuotaTier) -> Vec<ModelCatalogEntry> {
             }),
             reachable: false,
             reachability_reason: String::new(),
+            requires_payment: false,
             antigravity_alias: Some("OpenRouter Auto".into()),
         },
     ]
@@ -319,6 +328,11 @@ pub fn compute_catalog_and_quotas(
                 existing.supports_thinking = vm.supports_thinking;
                 existing.supports_tools = vm.supports_tools;
                 existing.supports_vision = vm.supports_vision;
+                existing.reachable = vm.reachable;
+                existing.requires_payment = vm.requires_payment;
+                if !vm.reachability_reason.is_empty() {
+                    existing.reachability_reason = vm.reachability_reason.clone();
+                }
                 if existing.antigravity_alias.is_none() {
                     existing.antigravity_alias = vm.antigravity_alias.clone();
                 }
@@ -333,26 +347,62 @@ pub fn compute_catalog_and_quotas(
         if let Some(block_reason) = state.blocked_models.get(&item.id) {
             item.reachable = false;
             item.reachability_reason = block_reason.clone();
+            let lower_reason = block_reason.to_ascii_lowercase();
+            if lower_reason.contains("payment")
+                || lower_reason.contains("credit")
+                || lower_reason.contains("billing")
+                || lower_reason.contains("paid")
+            {
+                item.requires_payment = true;
+            }
             continue;
         }
         let has_key = has_provider_key(&state.settings.api_keys, item.provider);
         let p_key = provider_key_name(item.provider);
         if !has_key {
             item.reachable = false;
+            item.requires_payment = false;
             item.reachability_reason = missing_key_reason(item.provider);
         } else if let Some(verified_list) = state.verified_provider_models.get(p_key) {
-            if verified_list.iter().any(|v| v.id == item.id) {
-                item.reachable = true;
-                item.reachability_reason = "Verified reachable via live API".into();
+            if let Some(vm) = verified_list.iter().find(|v| v.id == item.id) {
+                item.requires_payment = vm.requires_payment;
+                if vm.requires_payment {
+                    item.reachable = false;
+                    item.reachability_reason = if vm.reachability_reason.is_empty() {
+                        "Requires paid credits".into()
+                    } else {
+                        vm.reachability_reason.clone()
+                    };
+                } else if vm.reachable {
+                    item.reachable = true;
+                    item.reachability_reason = if vm.reachability_reason.is_empty() {
+                        "Verified reachable via live API".into()
+                    } else {
+                        vm.reachability_reason.clone()
+                    };
+                } else {
+                    item.reachable = false;
+                    item.reachability_reason = if vm.reachability_reason.is_empty() {
+                        "Unavailable on current API key".into()
+                    } else {
+                        vm.reachability_reason.clone()
+                    };
+                }
             } else {
                 item.reachable = false;
+                item.requires_payment = false;
                 item.reachability_reason =
                     "Not returned by your API key during live verification".into();
             }
         } else {
-            item.reachable = true;
-            item.reachability_reason =
-                "API key configured (click Verify Reachable Models to probe live)".into();
+            item.reachable = !item.requires_payment;
+            if item.reachability_reason.is_empty() {
+                item.reachability_reason =
+                    "API key configured (click Save & Live-Probe Models to verify)".into();
+            }
+        }
+        if item.requires_payment {
+            item.reachable = false;
         }
     }
 
@@ -449,8 +499,143 @@ pub fn compute_catalog_and_quotas(
             reachable: item.reachable,
             reachability_reason: item.reachability_reason.clone(),
             antigravity_alias: item.antigravity_alias.clone(),
+            requires_payment: item.requires_payment,
         });
     }
 
     (catalog, snapshots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        ApiKeys, AppSettings, OrchestratorConfig, UiCustomization, WorkspaceEntry,
+    };
+    use harness_net::PrivacyMode;
+    use std::collections::{BTreeMap, HashMap};
+
+    fn minimal_persisted_state() -> PersistedState {
+        let mut model_aliases = BTreeMap::new();
+        model_aliases.insert("local::qwen3.5:9b".to_string(), "Fast Coder".to_string());
+        PersistedState {
+            settings: AppSettings {
+                privacy_mode: PrivacyMode::Hybrid,
+                model_vault_dir: String::new(),
+                quota_tier: QuotaTier::FreeTier,
+                active_model_id: "openrouter/free:free".into(),
+                compare_model_b_id: String::new(),
+                active_workspace_path: String::new(),
+                active_session_id: String::new(),
+                auto_approve_edits: false,
+                auto_approve_commands: false,
+                idle_unload_minutes: 15,
+                local_ctx_size: 16384,
+                local_gpu_layers: 99,
+                expose_local_api: false,
+                local_server_port: 18080,
+                api_keys: ApiKeys {
+                    openrouter_api_key: "sk-or-test".into(),
+                    ..Default::default()
+                },
+                ui: UiCustomization::default(),
+                orchestrator: OrchestratorConfig::default(),
+                auto_switch_models: true,
+                fallback_to_local: false,
+                model_aliases,
+            },
+            workspaces: Vec::<WorkspaceEntry>::new(),
+            sessions: Vec::new(),
+            usage: HashMap::new(),
+            custom_quotas: HashMap::new(),
+            synced_google_models: Vec::new(),
+            verified_provider_models: HashMap::new(),
+            blocked_models: HashMap::new(),
+            mcp_servers: Vec::new(),
+            custom_models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_model_alias_prefers_non_empty_user_alias() {
+        let state = minimal_persisted_state();
+        assert_eq!(
+            state
+                .settings
+                .resolve_model_alias("local::qwen3.5:9b", "Qwen 3.5 9B"),
+            "Fast Coder"
+        );
+        assert_eq!(
+            state
+                .settings
+                .resolve_model_alias("gemini-3-flash-preview", "Gemini 3 Flash"),
+            "Gemini 3 Flash"
+        );
+    }
+
+    #[test]
+    fn compute_catalog_and_quotas_preserves_requires_payment_and_reachability() {
+        let mut state = minimal_persisted_state();
+        state.verified_provider_models.insert(
+            "open_router".into(),
+            vec![
+                ModelCatalogEntry {
+                    id: "qwen/qwen3-coder:free".into(),
+                    display_name: "Qwen3 Coder (free)".into(),
+                    provider: ProviderKind::OpenRouter,
+                    context_window: 128_000,
+                    supports_thinking: false,
+                    supports_tools: true,
+                    supports_vision: false,
+                    tier_note: "Free tier".into(),
+                    quota_limit: None,
+                    reachable: true,
+                    reachability_reason: "Free tier · Verified reachable".into(),
+                    antigravity_alias: None,
+                    requires_payment: false,
+                },
+                ModelCatalogEntry {
+                    id: "anthropic/claude-sonnet-4".into(),
+                    display_name: "Claude Sonnet 4".into(),
+                    provider: ProviderKind::OpenRouter,
+                    context_window: 200_000,
+                    supports_thinking: true,
+                    supports_tools: true,
+                    supports_vision: true,
+                    tier_note: "Paid credits required".into(),
+                    quota_limit: None,
+                    reachable: false,
+                    reachability_reason: "Requires paid OpenRouter credits".into(),
+                    antigravity_alias: None,
+                    requires_payment: true,
+                },
+            ],
+        );
+        state.blocked_models.insert(
+            "gemini-3-flash-preview".into(),
+            "HTTP 402 payment required".into(),
+        );
+
+        let (_cat, snaps) = compute_catalog_and_quotas(&state);
+        let free = snaps
+            .iter()
+            .find(|s| s.model_id == "qwen/qwen3-coder:free")
+            .unwrap();
+        assert!(free.reachable);
+        assert!(!free.requires_payment);
+
+        let paid = snaps
+            .iter()
+            .find(|s| s.model_id == "anthropic/claude-sonnet-4")
+            .unwrap();
+        assert!(!paid.reachable);
+        assert!(paid.requires_payment);
+
+        let blocked_paid = snaps
+            .iter()
+            .find(|s| s.model_id == "gemini-3-flash-preview")
+            .unwrap();
+        assert!(!blocked_paid.reachable);
+        assert!(blocked_paid.requires_payment);
+    }
 }

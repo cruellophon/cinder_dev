@@ -235,6 +235,8 @@ fn render_search_results(
         "fallback",
         "reachable",
         "custom",
+        "alias",
+        "aliases",
     ]
     .iter()
     .any(|k| k.contains(q) || q.contains(k))
@@ -688,7 +690,8 @@ fn render_models_section(
             let kf_g = !snap.settings.api_keys.gemini_api_key.trim().is_empty();
             let kf_a = !snap.settings.api_keys.anthropic_api_key.trim().is_empty();
             let kf_o = !snap.settings.api_keys.openrouter_api_key.trim().is_empty();
-            let kf_u = !snap.settings.api_keys.openai_compat_api_key.trim().is_empty();
+            let kf_u = !snap.settings.api_keys.openai_compat_base_url.trim().is_empty()
+                || !snap.settings.api_keys.openai_compat_api_key.trim().is_empty();
             let kf_h = !snap.settings.api_keys.huggingface_token.trim().is_empty();
             let kf_b = !snap.settings.api_keys.brave_search_api_key.trim().is_empty();
 
@@ -720,14 +723,14 @@ fn render_models_section(
                 backend,
             );
             ui.horizontal(|ui| {
-                ui.allocate_ui(egui::vec2(126.0, 26.0), |ui| {
-                    ui.label(egui::RichText::new("OpenAI-Compat").color(p.text));
-                });
+                ui.spacing_mut().item_spacing.x = 7.0;
+                fixed_label_col(ui, 128.0, "OpenAI-Compat", p.text);
+                // Combined outer width = (188 + 20) + 7 + (105 + 20) = 340 px, matching key_row exactly
                 input_frame(p, false).show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut state.key_oai_url)
-                            .hint_text("Base URL (http://127.0.0.1:1234/v1)")
-                            .desired_width(175.0)
+                            .hint_text("Base URL (127.0.0.1:1234/v1)")
+                            .desired_width(188.0)
                             .frame(false),
                     );
                 });
@@ -736,12 +739,13 @@ fn render_models_section(
                         egui::TextEdit::singleline(&mut state.key_oai_key)
                             .password(true)
                             .hint_text(if kf_u { "Configured" } else { "API Key" })
-                            .desired_width(110.0)
+                            .desired_width(105.0)
                             .frame(false),
                     );
                 });
-                status_chip(ui, p, kf_u);
+                fixed_status_col(ui, p, kf_u);
                 if kf_u && secondary_button(ui, p, "Clear").clicked() {
+                    state.key_oai_url.clear();
                     state.key_oai_key.clear();
                     backend.save_keys(
                         KeysPatch {
@@ -773,36 +777,23 @@ fn render_models_section(
             );
 
             ui.add_space(10.0);
+            let build_keys_patch = |st: &GuiState| KeysPatch {
+                gemini_api_key: opt(&st.key_gemini),
+                anthropic_api_key: opt(&st.key_anthropic),
+                openrouter_api_key: opt(&st.key_openrouter),
+                openai_compat_base_url: Some(st.key_oai_url.clone()),
+                openai_compat_api_key: opt(&st.key_oai_key),
+                huggingface_token: opt(&st.key_hf),
+                brave_search_api_key: opt(&st.key_brave),
+                clear_keys: Vec::new(),
+            };
             ui.horizontal(|ui| {
-                if primary_button(ui, p, "Save & Live-Probe Models").clicked() {
-                    backend.save_keys(
-                        KeysPatch {
-                            gemini_api_key: opt(&state.key_gemini),
-                            anthropic_api_key: opt(&state.key_anthropic),
-                            openrouter_api_key: opt(&state.key_openrouter),
-                            openai_compat_base_url: Some(state.key_oai_url.clone()),
-                            openai_compat_api_key: opt(&state.key_oai_key),
-                            huggingface_token: opt(&state.key_hf),
-                            brave_search_api_key: opt(&state.key_brave),
-                            clear_keys: Vec::new(),
-                        },
-                        true,
-                    );
+                // Swapped order & colors: Save Keys Offline is primary orange left; Save & Live-Probe Models is secondary grey right
+                if primary_button(ui, p, "Save Keys Offline").clicked() {
+                    backend.save_keys(build_keys_patch(state), false);
                 }
-                if secondary_button(ui, p, "Save Keys Offline").clicked() {
-                    backend.save_keys(
-                        KeysPatch {
-                            gemini_api_key: opt(&state.key_gemini),
-                            anthropic_api_key: opt(&state.key_anthropic),
-                            openrouter_api_key: opt(&state.key_openrouter),
-                            openai_compat_base_url: Some(state.key_oai_url.clone()),
-                            openai_compat_api_key: opt(&state.key_oai_key),
-                            huggingface_token: opt(&state.key_hf),
-                            brave_search_api_key: opt(&state.key_brave),
-                            clear_keys: Vec::new(),
-                        },
-                        false,
-                    );
+                if secondary_button(ui, p, "Save & Live-Probe Models").clicked() {
+                    backend.save_keys(build_keys_patch(state), true);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if secondary_button(ui, p, "View Quotas in Forge →").clicked() {
@@ -818,35 +809,209 @@ fn render_models_section(
     setting_group(
         ui,
         p,
-        "Register Custom Cloud Model",
-        "Add a custom provider model ID (for example a preview release) and verify reachability.",
+        "Model Aliases",
+        "Assign custom display names to active local or cloud models across Chat, Orchestrator, and Forge.",
         |ui| {
+            let active_models = state.selectable_models(true);
+            if !active_models.is_empty()
+                && (state.alias_target_model_id.trim().is_empty()
+                    || !active_models.iter().any(|m| m.id == state.alias_target_model_id))
+            {
+                state.alias_target_model_id = active_models[0].id.clone();
+            }
+
+            let selected_lbl = active_models
+                .iter()
+                .find(|m| m.id == state.alias_target_model_id)
+                .map(|m| format!("[{}] {}", m.provider_label, m.canonical_name))
+                .unwrap_or_else(|| "Select an active model...".into());
+
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 7.0;
+                let avail = ui.available_width();
+                let combo_w = ((avail - 124.0) * 0.50).clamp(160.0, 280.0);
+                let alias_input_w = (avail - combo_w - 140.0).clamp(110.0, 240.0);
+                egui::ComboBox::from_id_salt("settings_alias_model_combo")
+                    .selected_text(selected_lbl)
+                    .width(combo_w)
+                    .show_ui(ui, |ui| {
+                        for m in &active_models {
+                            let row_lbl = format!("[{}] {}", m.provider_label, m.canonical_name);
+                            if ui
+                                .selectable_label(state.alias_target_model_id == m.id, row_lbl)
+                                .clicked()
+                            {
+                                state.alias_target_model_id = m.id.clone();
+                            }
+                        }
+                    });
                 input_frame(p, false).show(ui, |ui| {
                     ui.add(
-                        egui::TextEdit::singleline(&mut state.custom_model_id)
-                            .hint_text("gemini-3-flash-preview")
-                            .desired_width(220.0)
+                        egui::TextEdit::singleline(&mut state.alias_name_draft)
+                            .hint_text("Assign alias (e.g. Fast Coder)")
+                            .desired_width(alias_input_w)
                             .frame(false),
                     );
                 });
-                input_frame(p, false).show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.custom_model_name)
-                            .hint_text("Display alias (optional)")
-                            .desired_width(180.0)
-                            .frame(false),
-                    );
-                });
-                if primary_button(ui, p, "Add & Verify").clicked()
-                    && !state.custom_model_id.trim().is_empty()
+                let can_assign = !state.alias_target_model_id.trim().is_empty()
+                    && !state.alias_name_draft.trim().is_empty();
+                if ui
+                    .add_enabled_ui(can_assign, |ui| primary_button(ui, p, "Assign Alias"))
+                    .inner
+                    .clicked()
                 {
-                    let alias = opt(&state.custom_model_name);
-                    backend.add_custom_model(state.custom_model_id.clone(), alias);
-                    state.custom_model_id.clear();
-                    state.custom_model_name.clear();
+                    let target_id = state.alias_target_model_id.clone();
+                    let alias = state.alias_name_draft.trim().to_string();
+                    backend.update_settings(move |s| {
+                        s.model_aliases.insert(target_id, alias);
+                    });
+                    state.alias_name_draft.clear();
+                    state.set_toast("Assigned model alias.", false);
                 }
             });
+
+            ui.add_space(10.0);
+            let y = ui.cursor().top();
+            ui.painter()
+                .hline(ui.max_rect().x_range(), y, Stroke::new(1.0_f32, p.border));
+            ui.add_space(8.0);
+
+            ui.label(
+                egui::RichText::new(format!(
+                    "Assigned Aliases Ledger ({})",
+                    snap.settings.model_aliases.len()
+                ))
+                .small()
+                .strong()
+                .color(p.text),
+            );
+            ui.add_space(4.0);
+
+            if snap.settings.model_aliases.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No model aliases assigned yet. Choose an active model above and give it an alias.",
+                    )
+                    .small()
+                    .color(p.muted),
+                );
+            } else {
+                let mut remove_id: Option<String> = None;
+                for (mid, alias) in &snap.settings.model_aliases {
+                    let canonical = snap
+                        .local_models
+                        .iter()
+                        .find(|m| m.id == *mid)
+                        .map(|m| m.name.as_str())
+                        .or_else(|| {
+                            snap.cloud_catalog
+                                .iter()
+                                .find(|m| m.id == *mid)
+                                .map(|m| m.display_name.as_str())
+                        })
+                        .unwrap_or(mid.as_str());
+                    p.subcard_frame().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(canonical).strong().color(p.text));
+                                    ui.label(egui::RichText::new("→").color(p.muted));
+                                    ui.label(
+                                        egui::RichText::new(alias)
+                                            .strong()
+                                            .color(p.accent_hot),
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new(mid)
+                                        .monospace()
+                                        .small()
+                                        .color(p.muted),
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if secondary_button(ui, p, "Remove").clicked() {
+                                        remove_id = Some(mid.clone());
+                                    }
+                                },
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+                if let Some(id_to_rm) = remove_id {
+                    backend.update_settings(move |s| {
+                        s.model_aliases.remove(&id_to_rm);
+                    });
+                    state.set_toast("Removed model alias.", false);
+                }
+            }
+
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Register Custom Cloud Model ID (Advanced)")
+                    .small()
+                    .color(p.muted),
+            )
+            .id_salt("settings_register_custom_model_collapse")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 7.0;
+                    input_frame(p, false).show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.custom_model_id)
+                                .hint_text("gemini-3-flash-preview")
+                                .desired_width(240.0)
+                                .frame(false),
+                        );
+                    });
+                    input_frame(p, false).show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.custom_model_name)
+                                .hint_text("Display alias (optional)")
+                                .desired_width(210.0)
+                                .frame(false),
+                        );
+                    });
+                    if primary_button(ui, p, "Add & Verify").clicked()
+                        && !state.custom_model_id.trim().is_empty()
+                    {
+                        let alias = opt(&state.custom_model_name);
+                        backend.add_custom_model(state.custom_model_id.clone(), alias);
+                        state.custom_model_id.clear();
+                        state.custom_model_name.clear();
+                    }
+                });
+            });
+        },
+    );
+}
+
+fn fixed_label_col(ui: &mut egui::Ui, width: f32, text: &str, color: Color32) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 26.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(egui::vec2(width, 26.0));
+            ui.set_max_width(width);
+            ui.add(egui::Label::new(egui::RichText::new(text).color(color)).truncate());
+        },
+    );
+}
+
+fn fixed_status_col(ui: &mut egui::Ui, p: &CinderPalette, configured: bool) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(88.0, 26.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(egui::vec2(88.0, 26.0));
+            ui.set_max_width(88.0);
+            status_chip(ui, p, configured);
         },
     );
 }
@@ -861,9 +1026,8 @@ fn key_row(
     backend: &Arc<BackendHandle>,
 ) {
     ui.horizontal(|ui| {
-        ui.allocate_ui(egui::vec2(126.0, 26.0), |ui| {
-            ui.label(egui::RichText::new(label).color(p.text));
-        });
+        ui.spacing_mut().item_spacing.x = 7.0;
+        fixed_label_col(ui, 128.0, label, p.text);
         input_frame(p, false).show(ui, |ui| {
             ui.add(
                 egui::TextEdit::singleline(buf)
@@ -873,11 +1037,11 @@ fn key_row(
                     } else {
                         "Not set"
                     })
-                    .desired_width(310.0)
+                    .desired_width(320.0)
                     .frame(false),
             );
         });
-        status_chip(ui, p, configured);
+        fixed_status_col(ui, p, configured);
         if configured && secondary_button(ui, p, "Clear").clicked() {
             buf.clear();
             backend.save_keys(
@@ -967,7 +1131,15 @@ fn render_engine_section(
         "Tune context window, GPU layer offload, idle unloading, and loopback OpenAI API exposure.",
         |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Context Window").small().color(p.muted));
+                ui.spacing_mut().item_spacing.x = 7.0;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(104.0, 26.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_size(egui::vec2(104.0, 26.0));
+                        ui.label(egui::RichText::new("Context Window").small().color(p.muted));
+                    },
+                );
                 input_frame(p, false).show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut state.ctx_size_draft)
@@ -975,14 +1147,16 @@ fn render_engine_section(
                             .frame(false),
                     );
                 });
+                ui.add_space(6.0);
                 ui.label(egui::RichText::new("GPU Layers").small().color(p.muted));
                 input_frame(p, false).show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut state.ngl_draft)
-                            .desired_width(50.0)
+                            .desired_width(52.0)
                             .frame(false),
                     );
                 });
+                ui.add_space(6.0);
                 ui.label(egui::RichText::new("Idle Unload (m)").small().color(p.muted));
                 input_frame(p, false).show(ui, |ui| {
                     ui.add(
@@ -991,17 +1165,19 @@ fn render_engine_section(
                             .frame(false),
                     );
                 });
-                if primary_button(ui, p, "Apply").clicked() {
-                    let ctx_v = state.ctx_size_draft.trim().parse::<u32>().unwrap_or(16384);
-                    let ngl_v = state.ngl_draft.trim().parse::<i32>().unwrap_or(99);
-                    let idle_v = state.idle_mins_draft.trim().parse::<u64>().unwrap_or(15);
-                    backend.update_settings(move |s| {
-                        s.local_ctx_size = ctx_v.clamp(2048, 131072);
-                        s.local_gpu_layers = ngl_v.clamp(0, 999);
-                        s.idle_unload_minutes = idle_v;
-                    });
-                    state.set_toast("Applied local forge settings.", false);
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if primary_button(ui, p, "Apply").clicked() {
+                        let ctx_v = state.ctx_size_draft.trim().parse::<u32>().unwrap_or(16384);
+                        let ngl_v = state.ngl_draft.trim().parse::<i32>().unwrap_or(99);
+                        let idle_v = state.idle_mins_draft.trim().parse::<u64>().unwrap_or(15);
+                        backend.update_settings(move |s| {
+                            s.local_ctx_size = ctx_v.clamp(2048, 131072);
+                            s.local_gpu_layers = ngl_v.clamp(0, 999);
+                            s.idle_unload_minutes = idle_v;
+                        });
+                        state.set_toast("Applied local forge settings.", false);
+                    }
+                });
             });
 
             ui.add_space(6.0);
@@ -1201,15 +1377,14 @@ fn render_agent_section(
             let mut orch_changed = false;
 
             ui.horizontal(|ui| {
-                ui.allocate_ui(egui::vec2(120.0, 24.0), |ui| {
-                    ui.label(egui::RichText::new("Planner Model").color(p.text));
-                });
+                ui.spacing_mut().item_spacing.x = 7.0;
+                fixed_label_col(ui, 128.0, "Planner Model", p.text);
                 let cur_planner_lbl = if orch.planner_model_id.trim().is_empty()
                     || orch.planner_model_id.eq_ignore_ascii_case("auto")
                 {
-                    "Auto (Best Planner Model)"
+                    "Auto (Best Planner Model)".to_string()
                 } else {
-                    orch.planner_model_id.as_str()
+                    crate::app_state::resolve_model_display_name(snap, &orch.planner_model_id)
                 };
                 egui::ComboBox::from_id_salt("settings_orch_planner")
                     .selected_text(cur_planner_lbl)
@@ -1240,15 +1415,14 @@ fn render_agent_section(
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.allocate_ui(egui::vec2(120.0, 24.0), |ui| {
-                    ui.label(egui::RichText::new("Executor Model").color(p.text));
-                });
+                ui.spacing_mut().item_spacing.x = 7.0;
+                fixed_label_col(ui, 128.0, "Executor Model", p.text);
                 let cur_exec_lbl = if orch.executor_model_id.trim().is_empty()
                     || orch.executor_model_id.eq_ignore_ascii_case("auto")
                 {
-                    "Auto (Best Execution Model)"
+                    "Auto (Best Execution Model)".to_string()
                 } else {
-                    orch.executor_model_id.as_str()
+                    crate::app_state::resolve_model_display_name(snap, &orch.executor_model_id)
                 };
                 egui::ComboBox::from_id_salt("settings_orch_executor")
                     .selected_text(cur_exec_lbl)
@@ -1279,13 +1453,12 @@ fn render_agent_section(
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.allocate_ui(egui::vec2(120.0, 24.0), |ui| {
-                    ui.label(egui::RichText::new("Vision Sub-Agent").color(p.text));
-                });
+                ui.spacing_mut().item_spacing.x = 7.0;
+                fixed_label_col(ui, 128.0, "Vision Sub-Agent", p.text);
                 let cur_vision_lbl = if orch.vision_model_id.trim().is_empty() {
-                    "Auto (Best Vision Model)"
+                    "Auto (Best Vision Model)".to_string()
                 } else {
-                    orch.vision_model_id.as_str()
+                    crate::app_state::resolve_model_display_name(snap, &orch.vision_model_id)
                 };
                 egui::ComboBox::from_id_salt("settings_orch_vision")
                     .selected_text(cur_vision_lbl)
@@ -1315,9 +1488,8 @@ fn render_agent_section(
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.allocate_ui(egui::vec2(120.0, 24.0), |ui| {
-                    ui.label(egui::RichText::new("Max Auto Steps").color(p.text));
-                });
+                ui.spacing_mut().item_spacing.x = 7.0;
+                fixed_label_col(ui, 128.0, "Max Auto Steps", p.text);
                 if ui
                     .add(
                         egui::Slider::new(&mut orch.max_autonomous_steps, 2..=32)

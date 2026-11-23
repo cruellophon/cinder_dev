@@ -17,6 +17,13 @@ pub enum ForgeTab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotasTabFilter {
+    Available,
+    Paid,
+    Unreachable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CustomTab {
     Plugins,
     Skills,
@@ -216,11 +223,16 @@ pub enum PromptModal {
 pub struct SelectableModel {
     pub id: String,
     pub display_name: String,
+    pub canonical_name: String,
     pub badge: String,
     pub provider_label: String,
     pub category: String, // "local" | "google" | "cloud"
     pub reachable: bool,
+    pub requires_payment: bool,
     pub is_local: bool,
+    pub quota_pct: Option<f64>,
+    pub quota_badge: String,
+    pub quota_tooltip: String,
 }
 
 pub struct GuiState {
@@ -270,6 +282,7 @@ pub struct GuiState {
     pub question_custom_text: String,
     pub model_search: String,
     pub model_cat: String, // "all" | "local" | "google" | "cloud"
+    pub show_model_popover: bool,
     pub attach_ws_filter: String,
     pub is_generating: bool,
 
@@ -302,6 +315,9 @@ pub struct GuiState {
     pub key_hf: String,
     pub key_brave: String,
     pub verify_statuses: Vec<ProviderVerifyStatus>,
+    pub quotas_filter: QuotasTabFilter,
+    pub alias_target_model_id: String,
+    pub alias_name_draft: String,
     pub custom_model_id: String,
     pub custom_model_name: String,
 
@@ -393,6 +409,7 @@ impl GuiState {
             question_custom_text: String::new(),
             model_search: String::new(),
             model_cat: "all".into(),
+            show_model_popover: false,
             attach_ws_filter: String::new(),
             is_generating: false,
             editor_tabs: Vec::new(),
@@ -419,6 +436,9 @@ impl GuiState {
             key_hf: String::new(),
             key_brave: String::new(),
             verify_statuses: Vec::new(),
+            quotas_filter: QuotasTabFilter::Available,
+            alias_target_model_id: String::new(),
+            alias_name_draft: String::new(),
             custom_model_id: String::new(),
             custom_model_name: String::new(),
             plugin_cat_filter: "all".into(),
@@ -563,25 +583,48 @@ impl GuiState {
         let Some(snap) = self.snap.as_ref() else {
             return Vec::new();
         };
-        let only_reach = respect_only_reachable && snap.settings.orchestrator.only_show_reachable_models;
+        let only_reach =
+            respect_only_reachable && snap.settings.orchestrator.only_show_reachable_models;
         let mut out = Vec::new();
 
         for m in &snap.local_models {
             if m.is_embedding {
                 continue;
             }
+            let resolved_name = snap
+                .settings
+                .resolve_model_alias(&m.id, &m.name)
+                .to_string();
+            let vram_short = match m.vram_fit.tier {
+                harness_models::FitTier::FitsInVram => "100% GPU".to_string(),
+                harness_models::FitTier::PartialOffload => "Hybrid GPU".to_string(),
+                harness_models::FitTier::CpuHeavy => "CPU Heavy".to_string(),
+            };
             out.push(SelectableModel {
                 id: m.id.clone(),
-                display_name: m.name.clone(),
+                display_name: resolved_name,
+                canonical_name: m.name.clone(),
                 badge: m.vram_fit.label.clone(),
                 provider_label: "Local".into(),
                 category: "local".into(),
                 reachable: true,
+                requires_payment: false,
                 is_local: true,
+                quota_pct: None,
+                quota_badge: vram_short,
+                quota_tooltip: format!(
+                    "{} · {} (est. {} MB)",
+                    m.vram_fit.label,
+                    fmt_bytes(m.size_bytes),
+                    m.vram_fit.estimated_total_mb
+                ),
             });
         }
 
         for m in &snap.cloud_catalog {
+            if respect_only_reachable && m.requires_payment {
+                continue;
+            }
             if only_reach && !m.reachable {
                 continue;
             }
@@ -592,14 +635,53 @@ impl GuiState {
                 ProviderKind::OpenAiCompat => ("Custom", "cloud"),
                 _ => ("Cloud", "cloud"),
             };
+            let resolved_name = snap
+                .settings
+                .resolve_model_alias(&m.id, &m.display_name)
+                .to_string();
+            let quota_snap = snap.cloud_quotas.iter().find(|q| q.model_id == m.id);
+            let quota_pct = quota_snap.map(|q| q.remaining_daily_pct);
+            let quota_badge = if m.requires_payment {
+                "Paid".to_string()
+            } else if !m.reachable {
+                "Offline".to_string()
+            } else if let Some(pct) = quota_pct {
+                format!("{pct:.0}%")
+            } else {
+                "Ready".to_string()
+            };
+            let quota_tooltip = if let Some(q) = quota_snap {
+                format!(
+                    "ID: {}\nDaily quota: {:.0}% remaining\nToday: {} reqs · {} tok · RPM {}/{}",
+                    m.id,
+                    q.remaining_daily_pct,
+                    q.rpd_used,
+                    q.tokens_today,
+                    q.rpm_used,
+                    q.rpm_limit
+                )
+            } else {
+                format!("ID: {}\n{}", m.id, m.reachability_reason)
+            };
             out.push(SelectableModel {
                 id: m.id.clone(),
-                display_name: m.display_name.clone(),
-                badge: if m.reachable { "Ready".into() } else { "No Key".into() },
+                display_name: resolved_name,
+                canonical_name: m.display_name.clone(),
+                badge: if m.requires_payment {
+                    "Paid".into()
+                } else if m.reachable {
+                    "Ready".into()
+                } else {
+                    "Unavailable".into()
+                },
                 provider_label: prov_label.into(),
                 category: cat.into(),
                 reachable: m.reachable,
+                requires_payment: m.requires_payment,
                 is_local: false,
+                quota_pct,
+                quota_badge,
+                quota_tooltip,
             });
         }
         out
@@ -939,6 +1021,29 @@ impl GuiState {
         }
         external_dir_to_open
     }
+}
+
+pub fn resolve_model_display_name(snap: &UiSnapshot, model_id: &str) -> String {
+    let trimmed = model_id.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return "Auto".to_string();
+    }
+    if let Some(alias) = snap
+        .settings
+        .model_aliases
+        .get(trimmed)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        return alias.to_string();
+    }
+    if let Some(loc) = snap.local_models.iter().find(|m| m.id == trimmed) {
+        return loc.name.clone();
+    }
+    if let Some(cloud) = snap.cloud_catalog.iter().find(|m| m.id == trimmed) {
+        return cloud.display_name.clone();
+    }
+    trimmed.rsplit('/').next().unwrap_or(trimmed).to_string()
 }
 
 fn decode_dropped_text(bytes: &[u8]) -> Option<String> {

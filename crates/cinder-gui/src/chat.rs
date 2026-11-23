@@ -1,6 +1,6 @@
 use crate::app_state::{
-    decode_base64_simple, fmt_bytes, fmt_rel_age, mode_label, norm_path, GuiState, PromptModal,
-    StageTab,
+    decode_base64_simple, fmt_bytes, fmt_rel_age, mode_label, norm_path,
+    resolve_model_display_name, GuiState, PromptModal, SelectableModel, StageTab,
 };
 use crate::backend::{BackendHandle, FolderPickTarget};
 use crate::icons::{draw_icon, icon_button, Icon};
@@ -803,10 +803,12 @@ pub fn render_chat_column(
                                 if let Some(ref cp) = msg.compare_partner {
                                     ui.add_space(6.0);
                                     p.subcard_frame().show(ui, |ui| {
+                                        let cp_label =
+                                            resolve_model_display_name(&snap, &cp.model_id);
                                         ui.horizontal(|ui| {
                                             badge(
                                                 ui,
-                                                &format!("Compare: {}", cp.model_id),
+                                                &format!("Compare: {cp_label}"),
                                                 p.purple,
                                                 p.bg_card,
                                             );
@@ -962,11 +964,13 @@ pub fn render_chat_column(
                                     }
                                     if !is_user {
                                         if let Some(ref mid) = msg.model_id {
+                                            let mlabel = resolve_model_display_name(&snap, mid);
                                             ui.label(
-                                                egui::RichText::new(short_model_name(mid))
+                                                egui::RichText::new(mlabel)
                                                     .small()
                                                     .color(p.muted),
-                                            );
+                                            )
+                                            .on_hover_text(mid.as_str());
                                         }
                                         if snap.settings.ui.show_token_metrics {
                                             if let Some(ms) = msg.latency_ms {
@@ -1220,16 +1224,6 @@ fn summarize_checkpoints(sess: &harness_store::Session) -> (usize, usize, usize)
     (paths.len(), added, removed)
 }
 
-fn short_model_name(model_id: &str) -> String {
-    model_id
-        .rsplit('/')
-        .next()
-        .unwrap_or(model_id)
-        .chars()
-        .take(28)
-        .collect()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn render_composer(
     ctx: &egui::Context,
@@ -1252,6 +1246,14 @@ fn render_composer(
 
     // Subtle ember glow halo painted behind composer when focused
     let glow_idx = ui.painter().add(egui::Shape::Noop);
+    let mut mode_model_trigger_rect: Option<egui::Rect> = None;
+    let models = state.selectable_models(true);
+    let active_id = if sess.mode == AgentMode::Orchestrator {
+        snap.settings.orchestrator.planner_model_id.clone()
+    } else {
+        snap.settings.active_model_id.clone()
+    };
+
     let inner_res = Frame::new()
         .fill(p.bg_elev)
         .stroke(composer_stroke)
@@ -1584,152 +1586,38 @@ fn render_composer(
                             });
                     });
 
-                    // Unified frameless Mode & Model Popover with segmented controls
-                    let models = state.selectable_models(true);
-                    let active_id = if sess.mode == AgentMode::Orchestrator {
-                        snap.settings.orchestrator.planner_model_id.clone()
-                    } else {
-                        snap.settings.active_model_id.clone()
-                    };
+                    // Unified frameless Mode & Model Popover Trigger with inline Quota indicator
+                    let active_entry = models.iter().find(|m| m.id == active_id);
                     let active_label = if active_id.trim().is_empty()
                         || active_id.eq_ignore_ascii_case("auto")
                     {
                         "Auto".to_string()
                     } else {
-                        models
-                            .iter()
-                            .find(|m| m.id == active_id)
+                        active_entry
                             .map(|m| m.display_name.clone())
-                            .unwrap_or_else(|| short_model_name(&active_id))
+                            .unwrap_or_else(|| resolve_model_display_name(snap, &active_id))
                     };
+                    let active_quota_badge = active_entry.map(|m| m.quota_badge.as_str());
+                    let active_quota_col = active_entry
+                        .map(|m| quota_pill_color(p, m))
+                        .unwrap_or(p.muted);
 
-                    let unified_lbl = format!("{} · {} ▼", mode_label(sess.mode), active_label);
-                    ui.menu_button(unified_lbl, |ui| {
-                        ui.set_min_width(390.0);
-                        ui.label(egui::RichText::new("Mode").small().strong().color(p.muted));
-                        if let Some(next_mode) = segmented_control(
-                            ui,
-                            p,
-                            "composer_mode_seg",
-                            sess.mode,
-                            &[
-                                (AgentMode::Auto, "Auto"),
-                                (AgentMode::Chat, "Chat"),
-                                (AgentMode::Plan, "Plan"),
-                                (AgentMode::Agent, "Agent"),
-                                (AgentMode::Orchestrator, "Orch"),
-                                (AgentMode::Compare, "Compare"),
-                            ],
-                        ) {
-                            backend.set_session_mode(sess.id.clone(), next_mode);
-                        }
-
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Reasoning").small().color(p.muted));
-                            let cur_eff = match snap.settings.ui.thinking_effort.as_str() {
-                                "standard" => "standard",
-                                "deep" => "deep",
-                                _ => "off",
-                            };
-                            if let Some(next_eff) = segmented_control(
-                                ui,
-                                p,
-                                "composer_effort_seg",
-                                cur_eff,
-                                &[("off", "Off"), ("standard", "Standard"), ("deep", "Deep")],
-                            ) {
-                                let mut next_ui = snap.settings.ui.clone();
-                                next_ui.thinking_effort = next_eff.into();
-                                backend.save_ui_and_orch(Some(next_ui), None);
-                            }
-                        });
-
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Auto Steps").small().color(p.muted));
-                            let mut max_steps =
-                                snap.settings.orchestrator.max_autonomous_steps.clamp(2, 32);
-                            if ui
-                                .add(egui::Slider::new(&mut max_steps, 2..=32).text("steps"))
-                                .on_hover_text(
-                                    "Autonomous tool steps allowed per turn before asking to continue",
-                                )
-                                .changed()
-                            {
-                                let mut orch = snap.settings.orchestrator.clone();
-                                orch.max_autonomous_steps = max_steps;
-                                backend.save_ui_and_orch(None, Some(orch));
-                            }
-                        });
-
-                        ui.separator();
-                        ui.label(egui::RichText::new("Model").small().strong().color(p.muted));
-                        input_frame(p, false).show(ui, |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut state.model_search)
-                                    .hint_text("Search models...")
-                                    .desired_width(f32::INFINITY)
-                                    .frame(false),
-                            );
-                        });
-                        ui.add_space(4.0);
-                        let cur_cat = match state.model_cat.as_str() {
-                            "local" => "local",
-                            "google" => "google",
-                            "cloud" => "cloud",
-                            _ => "all",
-                        };
-                        if let Some(next_cat) = segmented_control(
-                            ui,
-                            p,
-                            "composer_model_cat",
-                            cur_cat,
-                            &[
-                                ("all", "All"),
-                                ("local", "Local"),
-                                ("google", "Gemini"),
-                                ("cloud", "Other"),
-                            ],
-                        ) {
-                            state.model_cat = next_cat.into();
-                        }
-                        ui.separator();
-                        let q = state.model_search.trim().to_ascii_lowercase();
-                        egui::ScrollArea::vertical()
-                            .id_salt("unified_model_menu_scroll")
-                            .max_height(220.0)
-                            .show(ui, |ui| {
-                                for m in &models {
-                                    if state.model_cat != "all" && m.category != state.model_cat {
-                                        continue;
-                                    }
-                                    if !q.is_empty()
-                                        && !m.display_name.to_ascii_lowercase().contains(&q)
-                                        && !m.id.to_ascii_lowercase().contains(&q)
-                                    {
-                                        continue;
-                                    }
-                                    let label = format!(
-                                        "[{}] {} · {}",
-                                        m.provider_label, m.display_name, m.badge
-                                    );
-                                    if ui.selectable_label(m.id == active_id, label).clicked() {
-                                        let chosen = m.id.clone();
-                                        if sess.mode == AgentMode::Orchestrator {
-                                            let mut o = snap.settings.orchestrator.clone();
-                                            o.planner_model_id = chosen;
-                                            backend.save_ui_and_orch(None, Some(o));
-                                        } else {
-                                            backend.update_settings(move |s| {
-                                                s.active_model_id = chosen;
-                                            });
-                                        }
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                    });
+                    let trig_resp = unified_model_trigger_pill(
+                        ui,
+                        p,
+                        mode_label(sess.mode),
+                        &active_label,
+                        active_quota_badge,
+                        active_quota_col,
+                        state.show_model_popover,
+                    );
+                    mode_model_trigger_rect = Some(trig_resp.rect);
+                    let trig_tip = active_entry
+                        .map(|m| format!("{} ({})\n{}", m.canonical_name, m.id, m.quota_tooltip))
+                        .unwrap_or_else(|| "Select reasoning mode & active model".to_string());
+                    if trig_resp.on_hover_text(trig_tip).clicked() {
+                        state.show_model_popover = !state.show_model_popover;
+                    }
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1798,6 +1686,541 @@ fn render_composer(
             ),
         );
     }
+
+    // Floating Mode & Model Popover anchored cleanly above & to the left of the composer
+    if state.show_model_popover {
+        if let Some(trig_rect) = mode_model_trigger_rect {
+            let screen = ctx.screen_rect();
+            let composer_rect = inner_res.response.rect;
+            let pop_w = 460.0_f32.min(screen.width() - 28.0);
+            let left_x = (trig_rect.right() - pop_w)
+                .clamp(screen.left() + 14.0, (screen.right() - pop_w - 14.0).max(screen.left() + 14.0));
+            let bottom_y = (composer_rect.top() - 12.0)
+                .min(screen.bottom() - 36.0)
+                .max(screen.top() + 260.0);
+
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                state.show_model_popover = false;
+            }
+
+            let area_resp = egui::Area::new(egui::Id::new("composer_mode_model_popover"))
+                .order(egui::Order::Foreground)
+                .pivot(egui::Align2::LEFT_BOTTOM)
+                .fixed_pos(egui::pos2(left_x, bottom_y))
+                .show(ctx, |ui| {
+                    Frame::new()
+                        .fill(p.bg_elev)
+                        .stroke(Stroke::new(1.0_f32, p.border_strong))
+                        .corner_radius(CornerRadius::same(12))
+                        .inner_margin(Margin::same(14))
+                        .show(ui, |ui| {
+                            ui.set_width(pop_w - 28.0);
+
+                            // Title + Close
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Mode & Model")
+                                        .strong()
+                                        .color(p.text),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if icon_button(ui, p, Icon::Close, false, "Close").clicked() {
+                                            state.show_model_popover = false;
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(6.0);
+
+                            // Aligned 3-row controls grid
+                            let label_w = 78.0;
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(label_w, 24.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.set_min_size(egui::vec2(label_w, 24.0));
+                                        ui.label(egui::RichText::new("Mode").small().color(p.muted));
+                                    },
+                                );
+                                if let Some(next_mode) = segmented_control(
+                                    ui,
+                                    p,
+                                    "composer_mode_seg",
+                                    sess.mode,
+                                    &[
+                                        (AgentMode::Auto, "Auto"),
+                                        (AgentMode::Chat, "Chat"),
+                                        (AgentMode::Plan, "Plan"),
+                                        (AgentMode::Agent, "Agent"),
+                                        (AgentMode::Orchestrator, "Orch"),
+                                        (AgentMode::Compare, "Compare"),
+                                    ],
+                                ) {
+                                    backend.set_session_mode(sess.id.clone(), next_mode);
+                                }
+                            });
+
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(label_w, 24.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.set_min_size(egui::vec2(label_w, 24.0));
+                                        ui.label(
+                                            egui::RichText::new("Reasoning").small().color(p.muted),
+                                        );
+                                    },
+                                );
+                                let cur_eff = match snap.settings.ui.thinking_effort.as_str() {
+                                    "standard" => "standard",
+                                    "deep" => "deep",
+                                    _ => "off",
+                                };
+                                if let Some(next_eff) = segmented_control(
+                                    ui,
+                                    p,
+                                    "composer_effort_seg",
+                                    cur_eff,
+                                    &[("off", "Off"), ("standard", "Standard"), ("deep", "Deep")],
+                                ) {
+                                    let mut next_ui = snap.settings.ui.clone();
+                                    next_ui.thinking_effort = next_eff.into();
+                                    backend.save_ui_and_orch(Some(next_ui), None);
+                                }
+                            });
+
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(label_w, 24.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.set_min_size(egui::vec2(label_w, 24.0));
+                                        ui.label(
+                                            egui::RichText::new("Auto Steps")
+                                                .small()
+                                                .color(p.muted),
+                                        );
+                                    },
+                                );
+                                let mut max_steps =
+                                    snap.settings.orchestrator.max_autonomous_steps.clamp(2, 32);
+                                if ui
+                                    .add(egui::Slider::new(&mut max_steps, 2..=32).text("steps"))
+                                    .on_hover_text(
+                                        "Autonomous tool steps allowed per turn before prompting to continue",
+                                    )
+                                    .changed()
+                                {
+                                    let mut orch = snap.settings.orchestrator.clone();
+                                    orch.max_autonomous_steps = max_steps;
+                                    backend.save_ui_and_orch(None, Some(orch));
+                                }
+                            });
+
+                            ui.add_space(6.0);
+                            let div_y = ui.cursor().top();
+                            ui.painter().hline(
+                                ui.max_rect().x_range(),
+                                div_y,
+                                Stroke::new(1.0_f32, p.border),
+                            );
+                            ui.add_space(8.0);
+
+                            // Models header + inline category filter
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Models")
+                                        .small()
+                                        .strong()
+                                        .color(p.text),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let cur_cat = match state.model_cat.as_str() {
+                                            "local" => "local",
+                                            "google" => "google",
+                                            "cloud" => "cloud",
+                                            _ => "all",
+                                        };
+                                        if let Some(next_cat) = segmented_control(
+                                            ui,
+                                            p,
+                                            "composer_model_cat",
+                                            cur_cat,
+                                            &[
+                                                ("all", "All"),
+                                                ("local", "Local"),
+                                                ("google", "Gemini"),
+                                                ("cloud", "Other"),
+                                            ],
+                                        ) {
+                                            state.model_cat = next_cat.into();
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(6.0);
+
+                            input_frame(p, false).show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut state.model_search)
+                                        .hint_text("Search active models...")
+                                        .desired_width(f32::INFINITY)
+                                        .frame(false),
+                                );
+                            });
+                            ui.add_space(6.0);
+
+                            let q = state.model_search.trim().to_ascii_lowercase();
+                            let list_max_h = (bottom_y - screen.top() - 250.0).clamp(150.0, 260.0);
+                            let mut any_shown = false;
+                            egui::ScrollArea::vertical()
+                                .id_salt("unified_model_menu_scroll")
+                                .max_height(list_max_h)
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 3.0;
+                                    for m in &models {
+                                        if state.model_cat != "all" && m.category != state.model_cat
+                                        {
+                                            continue;
+                                        }
+                                        if !q.is_empty()
+                                            && !m.display_name.to_ascii_lowercase().contains(&q)
+                                            && !m.canonical_name.to_ascii_lowercase().contains(&q)
+                                            && !m.id.to_ascii_lowercase().contains(&q)
+                                        {
+                                            continue;
+                                        }
+                                        any_shown = true;
+                                        if model_picker_row(ui, p, m, m.id == active_id).clicked()
+                                        {
+                                            let chosen = m.id.clone();
+                                            if sess.mode == AgentMode::Orchestrator {
+                                                let mut o = snap.settings.orchestrator.clone();
+                                                o.planner_model_id = chosen;
+                                                backend.save_ui_and_orch(None, Some(o));
+                                            } else {
+                                                backend.update_settings(move |s| {
+                                                    s.active_model_id = chosen;
+                                                });
+                                            }
+                                            state.show_model_popover = false;
+                                        }
+                                    }
+                                    if !any_shown {
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new("No matching active models.")
+                                                .small()
+                                                .color(p.muted),
+                                        );
+                                    }
+                                });
+                        });
+                });
+
+            let clicked_outside = ctx.input(|i| {
+                i.pointer.primary_pressed()
+                    && i.pointer
+                        .interact_pos()
+                        .map(|pos| !area_resp.response.rect.contains(pos) && !trig_rect.contains(pos))
+                        .unwrap_or(false)
+            });
+            if clicked_outside {
+                state.show_model_popover = false;
+            }
+        } else {
+            state.show_model_popover = false;
+        }
+    }
+}
+
+fn quota_pill_color(p: &CinderPalette, m: &SelectableModel) -> Color32 {
+    if m.is_local {
+        if m.quota_badge.starts_with("100%") {
+            p.green
+        } else if m.quota_badge.starts_with("Hybrid") {
+            p.amber
+        } else {
+            p.muted
+        }
+    } else if let Some(pct) = m.quota_pct {
+        if pct >= 50.0 {
+            p.green
+        } else if pct >= 20.0 {
+            p.amber
+        } else {
+            p.red
+        }
+    } else {
+        p.green
+    }
+}
+
+fn unified_model_trigger_pill(
+    ui: &mut egui::Ui,
+    p: &CinderPalette,
+    mode_lbl: &str,
+    model_lbl: &str,
+    quota_badge: Option<&str>,
+    quota_col: Color32,
+    open: bool,
+) -> egui::Response {
+    let title = format!("{mode_lbl} · {model_lbl}");
+    let title_galley = egui::WidgetText::from(
+        egui::RichText::new(&title)
+            .small()
+            .color(if open { p.text } else { p.muted }),
+    )
+    .into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        220.0,
+        egui::TextStyle::Small,
+    );
+    let q_galley = quota_badge.filter(|s| !s.is_empty()).map(|q_txt| {
+        egui::WidgetText::from(egui::RichText::new(q_txt).size(10.5).strong().color(quota_col))
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                100.0,
+                egui::TextStyle::Small,
+            )
+    });
+    let chev_galley = egui::WidgetText::from(
+        egui::RichText::new(if open { "▲" } else { "▼" })
+            .size(9.5)
+            .color(p.muted),
+    )
+    .into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        24.0,
+        egui::TextStyle::Small,
+    );
+
+    let q_pad_w = q_galley.as_ref().map(|g| g.size().x + 18.0).unwrap_or(0.0);
+    let total_w = 10.0 + title_galley.size().x + 6.0 + q_pad_w + chev_galley.size().x + 10.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(total_w, 26.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if open {
+            p.bg_card
+        } else if resp.hovered() {
+            p.bg_hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        if fill != Color32::TRANSPARENT {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(7), fill);
+        }
+        if open {
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::same(7),
+                Stroke::new(1.0_f32, p.border_strong),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let fg = if open || resp.hovered() {
+            p.text
+        } else {
+            p.muted
+        };
+        let mut x = rect.left() + 8.0;
+        let tw = title_galley.size().x;
+        let th = title_galley.size().y;
+        ui.painter()
+            .galley(egui::pos2(x, rect.center().y - th * 0.5), title_galley, fg);
+        x += tw + 6.0;
+        if let Some(qg) = q_galley {
+            let pill_w = qg.size().x + 12.0;
+            let pill_h = 17.0;
+            let pill_rect = egui::Rect::from_min_size(
+                egui::pos2(x, rect.center().y - pill_h * 0.5),
+                egui::vec2(pill_w, pill_h),
+            );
+            ui.painter().rect(
+                pill_rect,
+                CornerRadius::same(5),
+                Color32::from_rgba_unmultiplied(quota_col.r(), quota_col.g(), quota_col.b(), 24),
+                Stroke::new(
+                    1.0_f32,
+                    Color32::from_rgba_unmultiplied(
+                        quota_col.r(),
+                        quota_col.g(),
+                        quota_col.b(),
+                        72,
+                    ),
+                ),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().galley(
+                egui::pos2(
+                    pill_rect.left() + 6.0,
+                    pill_rect.center().y - qg.size().y * 0.5,
+                ),
+                qg,
+                quota_col,
+            );
+            x += pill_w + 6.0;
+        }
+        ui.painter().galley(
+            egui::pos2(x, rect.center().y - chev_galley.size().y * 0.5),
+            chev_galley,
+            p.muted,
+        );
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+fn model_picker_row(
+    ui: &mut egui::Ui,
+    p: &CinderPalette,
+    m: &SelectableModel,
+    selected: bool,
+) -> egui::Response {
+    let w = ui.available_width().max(220.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 29.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if selected {
+            p.accent_soft
+        } else if resp.hovered() {
+            p.bg_hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        if fill != Color32::TRANSPARENT {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(6), fill);
+        }
+        if selected {
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::same(6),
+                Stroke::new(1.0_f32, p.accent),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        let tag_col = if m.is_local {
+            p.accent_hot
+        } else if m.category == "google" {
+            p.green
+        } else {
+            p.purple
+        };
+        let tag_galley = egui::WidgetText::from(
+            egui::RichText::new(&m.provider_label)
+                .size(10.5)
+                .strong()
+                .color(tag_col),
+        )
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            90.0,
+            egui::TextStyle::Small,
+        );
+        let tag_w = (tag_galley.size().x + 12.0).ceil();
+        let tag_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 8.0, rect.center().y - 9.0),
+            egui::vec2(tag_w, 18.0),
+        );
+        ui.painter().rect(
+            tag_rect,
+            CornerRadius::same(5),
+            Color32::from_rgba_unmultiplied(tag_col.r(), tag_col.g(), tag_col.b(), 22),
+            Stroke::new(
+                1.0_f32,
+                Color32::from_rgba_unmultiplied(tag_col.r(), tag_col.g(), tag_col.b(), 64),
+            ),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().galley(
+            egui::pos2(
+                tag_rect.left() + 6.0,
+                tag_rect.center().y - tag_galley.size().y * 0.5,
+            ),
+            tag_galley,
+            tag_col,
+        );
+
+        let q_col = quota_pill_color(p, m);
+        let q_galley = egui::WidgetText::from(
+            egui::RichText::new(&m.quota_badge)
+                .size(10.5)
+                .strong()
+                .color(q_col),
+        )
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            90.0,
+            egui::TextStyle::Small,
+        );
+        let q_w = (q_galley.size().x + 12.0).ceil();
+        let q_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 8.0 - q_w, rect.center().y - 9.0),
+            egui::vec2(q_w, 18.0),
+        );
+        ui.painter().rect(
+            q_rect,
+            CornerRadius::same(5),
+            Color32::from_rgba_unmultiplied(q_col.r(), q_col.g(), q_col.b(), 22),
+            Stroke::new(
+                1.0_f32,
+                Color32::from_rgba_unmultiplied(q_col.r(), q_col.g(), q_col.b(), 68),
+            ),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().galley(
+            egui::pos2(
+                q_rect.left() + 6.0,
+                q_rect.center().y - q_galley.size().y * 0.5,
+            ),
+            q_galley,
+            q_col,
+        );
+
+        let name_left = tag_rect.right() + 8.0;
+        let name_max_w = (q_rect.left() - 8.0 - name_left).max(40.0);
+        let name_fg = if selected { p.text } else { p.text };
+        let name_galley = egui::WidgetText::from(
+            egui::RichText::new(&m.display_name)
+                .small()
+                .color(name_fg),
+        )
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            name_max_w,
+            egui::TextStyle::Small,
+        );
+        ui.painter().with_clip_rect(rect.intersect(ui.clip_rect())).galley(
+            egui::pos2(name_left, rect.center().y - name_galley.size().y * 0.5),
+            name_galley,
+            name_fg,
+        );
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let tip = if m.display_name != m.canonical_name {
+        format!("Alias: {} (Canonical: {})\n{}", m.display_name, m.canonical_name, m.quota_tooltip)
+    } else {
+        m.quota_tooltip.clone()
+    };
+    resp.on_hover_text(tip)
 }
 
 fn chip_remove_button(
@@ -2031,11 +2454,12 @@ pub(crate) fn dispatch_chat_prompt(
             .orchestrator
             .max_autonomous_steps
             .clamp(2, 64);
+        let sent_name = resolve_model_display_name(snap_mut, active_model_id);
         snap_mut.live_activity = harness_store::LiveActivityStatus {
             active: true,
             session_id: Some(session_id.to_string()),
             phase: "thinking".into(),
-            detail: format!("Sending to {active_model_id}..."),
+            detail: format!("Sending to {sent_name}..."),
             step: 1,
             max_steps,
             active_model: active_model_id.to_string(),
@@ -2072,12 +2496,12 @@ pub(crate) fn fmt_worked_header(
     latency_ms: Option<u64>,
     is_live: bool,
     step: usize,
-    max_steps: usize,
+    _max_steps: usize,
     tools: &[harness_store::ToolCallRecord],
 ) -> String {
     if is_live {
-        return if step > 0 && max_steps > 0 {
-            format!("Working · step {step}/{max_steps}")
+        return if step > 0 {
+            format!("Working · Turn {step}")
         } else {
             "Working...".into()
         };
@@ -3018,7 +3442,7 @@ mod tests {
         );
         assert_eq!(
             fmt_worked_header(None, true, 2, 18, &[]),
-            "Working · step 2/18"
+            "Working · Turn 2"
         );
 
         let summary = summarize_tool_activity_group(&[
