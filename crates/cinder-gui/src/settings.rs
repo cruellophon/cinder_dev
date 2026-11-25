@@ -1553,6 +1553,51 @@ fn render_agent_section(
     setting_group(
         ui,
         p,
+        "Trusted Workspace Instructions",
+        "Repo-local instruction files (.cinder/rules.md, AGENTS.md, CLAUDE.md, GEMINI.md, .agents/rules/*.md) are ignored unless you explicitly trust their folder.",
+        |ui| {
+            if snap.settings.trusted_workspaces.is_empty() {
+                ui.label(
+                    egui::RichText::new("No workspace folders trusted yet.")
+                        .small()
+                        .color(p.muted),
+                );
+            } else {
+                let mut revoke_path: Option<String> = None;
+                for ws_key in &snap.settings.trusted_workspaces {
+                    p.subcard_frame().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(ws_key)
+                                    .monospace()
+                                    .small()
+                                    .color(p.text),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if secondary_button(ui, p, "Revoke").clicked() {
+                                        revoke_path = Some(ws_key.clone());
+                                    }
+                                },
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+                if let Some(path) = revoke_path {
+                    backend.set_workspace_trusted(path, false);
+                }
+            }
+        },
+    );
+
+    ui.add_space(16.0);
+
+    setting_group(
+        ui,
+        p,
         "Allowed CLI Runtimes (Opt-In · Posture 2)",
         "Off by default. Only runtimes you add and enable here can be requested via `run_local_software` — every execution pauses for manual approval inside a scrubbed, timeout-bounded environment and is never shared in cloud system prompts.",
         |ui| {

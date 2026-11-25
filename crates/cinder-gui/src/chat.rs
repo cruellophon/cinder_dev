@@ -226,6 +226,45 @@ pub fn render_chat_column(
         });
     });
 
+    if !is_standalone
+        && !snap.workspace_instruction_files.is_empty()
+        && !snap
+            .settings
+            .is_workspace_trusted(std::path::Path::new(&sess.workspace_path))
+    {
+        let preview_files = if snap.workspace_instruction_files.len() <= 3 {
+            snap.workspace_instruction_files.join(", ")
+        } else {
+            format!(
+                "{}, +{} more",
+                snap.workspace_instruction_files[..3].join(", "),
+                snap.workspace_instruction_files.len() - 3
+            )
+        };
+        Frame::new()
+            .fill(p.bg_sidebar)
+            .inner_margin(Margin::symmetric(14, 5))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    badge(ui, "UNTRUSTED WORKSPACE RULES", p.amber, p.bg_card);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Ignored until trusted: {preview_files}"
+                        ))
+                        .small()
+                        .color(p.muted),
+                    );
+                    if primary_button(ui, p, "Trust Folder").clicked() {
+                        backend.set_workspace_trusted(sess.workspace_path.clone(), true);
+                    }
+                });
+            });
+        let y = ui.cursor().top();
+        ui.painter()
+            .hline(ui.max_rect().x_range(), y, Stroke::new(1.0_f32, p.border));
+    }
+
     if is_standalone && !snap.scratch_files.is_empty() {
         Frame::new()
             .fill(p.bg_sidebar)

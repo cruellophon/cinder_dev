@@ -68,7 +68,16 @@ fn configure_no_window_std(_cmd: &mut Command) {}
 fn run_git_sync(workspace_root: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
     cmd.arg("--no-optional-locks")
-        .args(["-c", "core.fsmonitor=false", "-c", "protocol.file.allow=never"])
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "protocol.file.allow=never",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "diff.external=",
+        ])
         .arg("-C")
         .arg(workspace_root)
         .args(args);
@@ -343,13 +352,22 @@ pub fn inspect_git_diff_head(
         let diff = if *st == GitFileStatus::Untracked {
             synthesize_untracked_diff(&workspace_root.join(rel_path), rel_path)
         } else if has_head {
-            run_git_sync(workspace_root, &["diff", "HEAD", "--", rel_path])
-                .unwrap_or_default()
+            run_git_sync(
+                workspace_root,
+                &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", rel_path],
+            )
+            .unwrap_or_default()
         } else {
-            let staged = run_git_sync(workspace_root, &["diff", "--cached", "--", rel_path])
-                .unwrap_or_default();
-            let unstaged = run_git_sync(workspace_root, &["diff", "--", rel_path])
-                .unwrap_or_default();
+            let staged = run_git_sync(
+                workspace_root,
+                &["diff", "--no-ext-diff", "--no-textconv", "--cached", "--", rel_path],
+            )
+            .unwrap_or_default();
+            let unstaged = run_git_sync(
+                workspace_root,
+                &["diff", "--no-ext-diff", "--no-textconv", "--", rel_path],
+            )
+            .unwrap_or_default();
             format!("{staged}{unstaged}")
         };
 

@@ -6,6 +6,7 @@ use harness_store::{BumboPaths, McpServerEntry};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -249,6 +250,7 @@ fn build_npm_tokio_command(node_path: &Path, npm_path: &Path) -> tokio::process:
         tokio::process::Command::new(npm_path)
     };
     cmd.env("PATH", path_env);
+    crate::scrub_sensitive_child_env(&mut cmd);
     configure_no_window_tokio(&mut cmd);
     cmd
 }
@@ -265,6 +267,30 @@ fn nodejs_dist_spec_for(
         ("linux", "aarch64") => Some(("linux-arm64", "linux-arm64.tar.gz", "targz")),
         _ => None,
     }
+}
+
+fn parse_shasums256_for_file(text: &str, filename: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split_ascii_whitespace();
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let Some(name_tok) = parts.next() else {
+            continue;
+        };
+        let clean_name = name_tok.trim_start_matches('*');
+        if clean_name == filename
+            && hash.len() == 64
+            && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
 }
 
 async fn ensure_node_and_npm<F>(
@@ -336,6 +362,23 @@ where
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing Node.js LTS version field"))?;
     let archive_name = format!("node-{ver}-{archive_suffix}");
+    let shasums_url = format!("https://nodejs.org/dist/{ver}/SHASUMS256.txt");
+    on_log(14, format!("Fetching SHA-256 checksums for {ver}..."));
+    let shasums_resp = gate
+        .request(Method::GET, &shasums_url, "toolchain_nodejs_checksums")?
+        .send()
+        .await?;
+    if !shasums_resp.status().is_success() {
+        anyhow::bail!(
+            "nodejs.org SHASUMS256.txt returned HTTP {}",
+            shasums_resp.status()
+        );
+    }
+    let shasums_text = shasums_resp.text().await?;
+    let expected_sha256 = parse_shasums256_for_file(&shasums_text, &archive_name).ok_or_else(|| {
+        anyhow::anyhow!("SHA-256 checksum missing for '{archive_name}' in SHASUMS256.txt")
+    })?;
+
     let url = format!("https://nodejs.org/dist/{ver}/{archive_name}");
 
     on_log(18, format!("Downloading {archive_name} into temp folder..."));
@@ -351,10 +394,12 @@ where
     let archive_path = stage.path().join(&archive_name);
     let mut file = std::fs::File::create(&archive_path)?;
     let mut stream = resp.bytes_stream();
+    let mut hasher = Sha256::new();
     let mut downloaded = 0u64;
     let mut last_pct = 18u8;
     while let Some(chunk) = stream.next().await {
         let bytes = chunk?;
+        hasher.update(&bytes);
         file.write_all(&bytes)?;
         downloaded += bytes.len() as u64;
         if total_len > 0 {
@@ -372,6 +417,13 @@ where
     }
     file.flush()?;
     drop(file);
+
+    let computed_sha256 = hex::encode(hasher.finalize());
+    if !computed_sha256.eq_ignore_ascii_case(&expected_sha256) {
+        anyhow::bail!(
+            "SHA-256 verification failed for {archive_name}: expected {expected_sha256}, got {computed_sha256}"
+        );
+    }
 
     on_log(60, "Extracting Node.js LTS archive inside temp folder...".into());
     let extract_dir = stage.path().join("extracted");
@@ -1187,6 +1239,7 @@ pub fn uninstall_project_dependency(
             if venv_py.exists() {
                 let mut cmd = std::process::Command::new(&venv_py);
                 cmd.args(["-m", "pip", "uninstall", "-y", pkg]);
+                crate::scrub_sensitive_std_env(&mut cmd);
                 configure_no_window_std(&mut cmd);
                 let _ = cmd.output();
             }
@@ -1397,6 +1450,7 @@ where
             cmd.args(&add_args)
                 .current_dir(stage.path())
                 .env("PATH", &cargo_path_env);
+            crate::scrub_sensitive_child_env(&mut cmd);
             configure_no_window_tokio(&mut cmd);
             let out = cmd.output().await?;
             let combined = format!(
@@ -1451,6 +1505,7 @@ where
                     .arg(&entry.name)
                     .current_dir(workspace_root)
                     .env("PATH", &cargo_path_env);
+                crate::scrub_sensitive_child_env(&mut commit_cmd);
                 if let Some(ref feats) = entry.features_hint {
                     commit_cmd.arg("--features").arg(feats);
                 }
@@ -1462,6 +1517,7 @@ where
                         .args(&add_args)
                         .current_dir(workspace_root)
                         .env("PATH", &cargo_path_env);
+                    crate::scrub_sensitive_child_env(&mut retry);
                     configure_no_window_tokio(&mut retry);
                     let r_out = retry.output().await?;
                     if !r_out.status.success() && !resolved_line.is_empty() {
@@ -1512,12 +1568,14 @@ where
                 "-m",
                 "pip",
                 "download",
+                "--only-binary=:all:",
                 "--no-input",
                 "--disable-pip-version-check",
                 "-d",
             ])
             .arg(&wheels_dir)
             .arg(&entry.name);
+            crate::scrub_sensitive_child_env(&mut dl);
             configure_no_window_tokio(&mut dl);
             let dl_out = dl.output().await?;
             if !dl_out.status.success() {
@@ -1538,6 +1596,7 @@ where
                 on_log(55, "Creating isolated workspace `.venv`...".into());
                 let mut mk = tokio::process::Command::new(&py);
                 mk.args(["-m", "venv"]).arg(&venv_dir);
+                crate::scrub_sensitive_child_env(&mut mk);
                 configure_no_window_tokio(&mut mk);
                 let mk_out = mk.output().await?;
                 if !mk_out.status.success() {
@@ -1560,6 +1619,7 @@ where
                 "-m",
                 "pip",
                 "install",
+                "--only-binary=:all:",
                 "--no-input",
                 "--disable-pip-version-check",
                 "--no-index",
@@ -1567,6 +1627,7 @@ where
             ])
             .arg(&wheels_dir)
             .arg(&entry.name);
+            crate::scrub_sensitive_child_env(&mut inst);
             configure_no_window_tokio(&mut inst);
             let inst_out = inst.output().await?;
             if !inst_out.status.success() {
@@ -1635,7 +1696,7 @@ where
                 format!("Staging `npm install {}` inside temp folder...", entry.name),
             );
             let mut cmd = build_npm_tokio_command(&node_path, &npm_path);
-            cmd.args(["install", "--no-audit", "--no-fund", &entry.name])
+            cmd.args(["install", "--ignore-scripts", "--no-audit", "--no-fund", &entry.name])
                 .current_dir(stage.path());
             let out = cmd.output().await?;
             if !out.status.success() {
@@ -1736,7 +1797,7 @@ pub fn curated_plugin_catalog() -> Vec<CuratedPluginEntry> {
             description: "Official MCP server for structured git status, diffs, commits, log, and branch inspection. 100% offline.".into(),
             requires_toolchain: Some("python".into()),
             needs_network: false,
-            read_only: true,
+            read_only: false,
             antigravity_compatible: true,
         },
         CuratedPluginEntry {
@@ -1750,7 +1811,7 @@ pub fn curated_plugin_catalog() -> Vec<CuratedPluginEntry> {
             description: "Official MCP server that fetches web pages and converts them into clean Markdown for the agent (requires Hybrid Mode).".into(),
             requires_toolchain: Some("python".into()),
             needs_network: true,
-            read_only: true,
+            read_only: false,
             antigravity_compatible: true,
         },
         // Verified Node.js MCP servers (work with system Node or Cinder Portable Node.js LTS)
@@ -2079,6 +2140,7 @@ where
             on_log(20, "Creating isolated Python virtual environment in temp folder...".into());
             let mut mk = tokio::process::Command::new(&py);
             mk.args(["-m", "venv"]).arg(&venv_dir);
+            crate::scrub_sensitive_child_env(&mut mk);
             configure_no_window_tokio(&mut mk);
             let mk_out = mk.output().await?;
             if !mk_out.status.success() {
@@ -2106,11 +2168,13 @@ where
             let mut pip = tokio::process::Command::new(&pip_bin);
             pip.args([
                 "install",
+                "--only-binary=:all:",
                 "--no-input",
                 "--disable-pip-version-check",
                 "-q",
                 &entry.package_spec,
             ]);
+            crate::scrub_sensitive_child_env(&mut pip);
             configure_no_window_tokio(&mut pip);
             let pip_out = pip.output().await?;
             if !pip_out.status.success() {
@@ -2210,8 +2274,14 @@ where
                 format!("Installing pinned `{}` inside temp folder...", entry.package_spec),
             );
             let mut cmd = build_npm_tokio_command(&node_path, &npm_path);
-            cmd.args(["install", "--no-audit", "--no-fund", &entry.package_spec])
-                .current_dir(stage.path());
+            cmd.args([
+                "install",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                &entry.package_spec,
+            ])
+            .current_dir(stage.path());
             let out = cmd.output().await?;
             if !out.status.success() {
                 anyhow::bail!(
@@ -2946,5 +3016,23 @@ mod tests {
             nodejs_dist_spec_for("linux", "aarch64"),
             Some(("linux-arm64", "linux-arm64.tar.gz", "targz"))
         );
+    }
+
+    #[test]
+    fn parse_shasums256_for_file_matches_exact_filename_and_rejects_malformed() {
+        let valid_hash = "e2edda75bfb089654705cf65a13b58933bfd5f57148e8ebda916f58a2474f1f7";
+        let manifest = format!(
+            "# checksums\n{valid_hash}  node-v26.13.1-win-x64.zip\ndeadbeef  node-v26.13.1-linux-x64.tar.gz\n{valid_hash}  *node-v26.13.1-darwin-arm64.tar.gz\n"
+        );
+        assert_eq!(
+            parse_shasums256_for_file(&manifest, "node-v26.13.1-win-x64.zip"),
+            Some(valid_hash.into())
+        );
+        assert_eq!(
+            parse_shasums256_for_file(&manifest, "node-v26.13.1-darwin-arm64.tar.gz"),
+            Some(valid_hash.into())
+        );
+        assert!(parse_shasums256_for_file(&manifest, "node-v26.13.1-linux-x64.tar.gz").is_none());
+        assert!(parse_shasums256_for_file(&manifest, "missing.zip").is_none());
     }
 }

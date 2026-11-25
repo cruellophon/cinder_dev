@@ -29,7 +29,8 @@ pub use packages::{
     PluginInstallOutcome, ProjectDependenciesOverview, TempStageDir, ToolchainStatus,
 };
 pub use rag::{
-    build_workspace_index, search_workspace_knowledge, IndexStats, KnowledgeSearchHit,
+    build_workspace_index, search_workspace_knowledge, search_workspace_knowledge_with_policy,
+    IndexStats, KnowledgeSearchHit,
 };
 pub use risk::{
     classify_tool_risk, classify_tool_risk_with_context, extract_tool_secret_path,
@@ -630,7 +631,9 @@ pub async fn execute_tool_with_policy(
         "read_file" => run_read_file(workspace_root, args),
         "search_files" => run_search_files(workspace_root, args, skip_secret_contents),
         "extract_pdf_text" => run_extract_pdf_text(workspace_root, args),
-        "search_knowledge" => run_search_knowledge(workspace_root, gate, args).await,
+        "search_knowledge" => {
+            run_search_knowledge(workspace_root, gate, args, skip_secret_contents).await
+        }
         "propose_edit" => match prepare_file_change(workspace_root, "edit_file", args) {
             Ok(c) => Ok(ToolExecutionResult {
                 output: format!(
@@ -668,12 +671,20 @@ async fn run_search_knowledge(
     workspace_root: &Path,
     gate: &NetworkGate,
     args: &Value,
+    skip_secret_contents: bool,
 ) -> anyhow::Result<ToolExecutionResult> {
     let query = args["query"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing 'query'"))?;
     let top_k = args["top_k"].as_u64().unwrap_or(5).clamp(1, 12) as usize;
-    let hits = search_workspace_knowledge(workspace_root, gate, query, top_k).await?;
+    let hits = search_workspace_knowledge_with_policy(
+        workspace_root,
+        gate,
+        query,
+        top_k,
+        skip_secret_contents,
+    )
+    .await?;
     if hits.is_empty() {
         return Ok(ToolExecutionResult {
             output: "No relevant knowledge chunks found.".into(),
@@ -1208,25 +1219,34 @@ fn spawn_pipe_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     });
 }
 
+const SENSITIVE_ENV_VARS: &[&str] = &[
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+    "BRAVE_API_KEY",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITLAB_TOKEN",
+    "NPM_TOKEN",
+    "PYPI_TOKEN",
+];
+
 /// Strip sensitive API tokens and cloud credentials from child process environments.
 pub fn scrub_sensitive_child_env(cmd: &mut tokio::process::Command) {
-    for var in [
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "HF_TOKEN",
-        "HUGGING_FACE_HUB_TOKEN",
-        "BRAVE_API_KEY",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "GITHUB_TOKEN",
-        "GH_TOKEN",
-        "GITLAB_TOKEN",
-        "NPM_TOKEN",
-        "PYPI_TOKEN",
-    ] {
+    for var in SENSITIVE_ENV_VARS {
+        cmd.env_remove(var);
+    }
+}
+
+/// Strip sensitive API tokens and cloud credentials from synchronous child process environments.
+pub fn scrub_sensitive_std_env(cmd: &mut std::process::Command) {
+    for var in SENSITIVE_ENV_VARS {
         cmd.env_remove(var);
     }
 }
@@ -1270,6 +1290,14 @@ pub async fn run_shell_command_streaming(
     };
     cmd.current_dir(&cwd);
     scrub_sensitive_child_env(&mut cmd);
+    // Neutralize malicious repo `.git/config` hooks/pagers on SafeReadOnly git checks.
+    cmd.env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "core.pager")
+        .env("GIT_CONFIG_VALUE_1", "cat")
+        .env("GIT_CONFIG_KEY_2", "protocol.file.allow")
+        .env("GIT_CONFIG_VALUE_2", "never");
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -1602,15 +1630,28 @@ pub fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
             let segs = ipv6.segments();
             let is_unique_local = (segs[0] & 0xfe00) == 0xfc00;
             let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
+            let is_site_local = (segs[0] & 0xffc0) == 0xfec0;
+            let is_nat64 = segs[0] == 0x0064 && segs[1] == 0xff9b;
+            let is_6to4 = segs[0] == 0x2002;
+            let is_doc = segs[0] == 0x2001 && segs[1] == 0x0db8;
             let mapped_blocked = ipv6
                 .to_ipv4_mapped()
+                .is_some_and(|v4| is_non_public_ip(std::net::IpAddr::V4(v4)));
+            #[allow(deprecated)]
+            let compat_blocked = ipv6
+                .to_ipv4()
                 .is_some_and(|v4| is_non_public_ip(std::net::IpAddr::V4(v4)));
             ipv6.is_loopback()
                 || ipv6.is_unspecified()
                 || ipv6.is_multicast()
                 || is_unique_local
                 || is_link_local
+                || is_site_local
+                || is_nat64
+                || is_6to4
+                || is_doc
                 || mapped_blocked
+                || compat_blocked
         }
     }
 }
@@ -1659,9 +1700,11 @@ fn validate_public_fetch_url(raw_url: &str) -> anyhow::Result<url::Url> {
     Ok(parsed)
 }
 
-async fn validate_and_resolve_public_url(raw_url: &str) -> anyhow::Result<url::Url> {
+type PinnedHostAddrs = Option<(String, Vec<std::net::SocketAddr>)>;
+
+async fn validate_and_resolve_public_url(raw_url: &str) -> anyhow::Result<(url::Url, PinnedHostAddrs)> {
     let parsed = validate_public_fetch_url(raw_url)?;
-    if let Some(url::Host::Domain(domain)) = parsed.host() {
+    let pinned = if let Some(url::Host::Domain(domain)) = parsed.host() {
         let port = parsed.port_or_known_default().unwrap_or(80);
         let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((domain, port))
             .await
@@ -1670,7 +1713,7 @@ async fn validate_and_resolve_public_url(raw_url: &str) -> anyhow::Result<url::U
         if addrs.is_empty() {
             anyhow::bail!("DNS returned no addresses for '{domain}'.");
         }
-        for addr in addrs {
+        for addr in &addrs {
             if is_non_public_ip(addr.ip()) {
                 anyhow::bail!(
                     "SSRF Guard blocked '{domain}': resolved to non-public IP '{}'",
@@ -1678,8 +1721,11 @@ async fn validate_and_resolve_public_url(raw_url: &str) -> anyhow::Result<url::U
                 );
             }
         }
-    }
-    Ok(parsed)
+        Some((domain.to_string(), addrs))
+    } else {
+        None
+    };
+    Ok((parsed, pinned))
 }
 
 fn github_api_fast_path(url: &url::Url) -> Option<(&'static str, String)> {
@@ -1947,7 +1993,7 @@ async fn run_fetch_url(gate: &NetworkGate, args: &Value) -> anyhow::Result<ToolE
 
     let raw_url = arg_str(args, &["url", "query", "href"])
         .ok_or_else(|| anyhow::anyhow!("Missing 'url' argument"))?;
-    let mut parsed = validate_and_resolve_public_url(raw_url).await?;
+    let (mut parsed, mut pinned) = validate_and_resolve_public_url(raw_url).await?;
     let target_url = parsed.to_string();
 
     if let Some((kind, api_url)) = github_api_fast_path(&parsed) {
@@ -1964,8 +2010,9 @@ async fn run_fetch_url(gate: &NetworkGate, args: &Value) -> anyhow::Result<ToolE
     let mut hops = 0usize;
     let resp = loop {
         let cur_url = parsed.to_string();
+        let pin_ref = pinned.as_ref().map(|(d, a)| (d.as_str(), a.as_slice()));
         let req = gate
-            .request_no_redirect(Method::GET, &cur_url, "fetch_url")?
+            .request_no_redirect_pinned(Method::GET, &cur_url, "fetch_url", pin_ref)?
             .header("User-Agent", "cinder-ide")
             .header(
                 "Accept",
@@ -1986,7 +2033,7 @@ async fn run_fetch_url(gate: &NetworkGate, args: &Value) -> anyhow::Result<ToolE
             let next_url = parsed
                 .join(loc.trim())
                 .map_err(|e| anyhow::anyhow!("Invalid redirect target '{loc}': {e}"))?;
-            parsed = validate_and_resolve_public_url(next_url.as_str()).await?;
+            (parsed, pinned) = validate_and_resolve_public_url(next_url.as_str()).await?;
             hops += 1;
             continue;
         }

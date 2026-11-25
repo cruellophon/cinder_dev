@@ -8,7 +8,9 @@ anyhow.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 harness-net = { path = "../harness-net" }
+hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 uuid.workspace = true

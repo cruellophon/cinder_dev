@@ -1516,6 +1516,15 @@ struct GitHubRelease {
 struct GitHubAsset {
     name: String,
     browser_download_url: String,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedLlamaAsset {
+    name: String,
+    url: String,
+    expected_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1748,7 +1757,7 @@ impl ServerManager {
         backend_preference: &str,
     ) -> anyhow::Result<String> {
         let mut checked_tags: Vec<String> = Vec::new();
-        let mut chosen: Option<(String, Vec<(String, String)>)> = None;
+        let mut chosen: Option<(String, Vec<SelectedLlamaAsset>, Option<String>)> = None;
 
         // GitHub `/releases/latest` now points to a placeholder `v1.0.0` release whose only
         // asset is `nightly-tag.txt`; scan recent releases for the newest matching binary build.
@@ -1783,11 +1792,12 @@ impl ServerManager {
             }
             let assets = select_llama_assets(&release.assets, backend_preference);
             if !assets.is_empty() {
-                chosen = Some((release.tag_name, assets));
+                let manifest_url = find_checksum_manifest_url(&release.assets);
+                chosen = Some((release.tag_name, assets, manifest_url));
             }
         }
 
-        let Some((release_tag, selected_urls)) = chosen else {
+        let Some((release_tag, mut selected_assets, manifest_url)) = chosen else {
             anyhow::bail!(
                 "No compatible llama.cpp prebuilt archive found in recent releases ({}) for OS={} ARCH={} (backend={})",
                 checked_tags.join(", "),
@@ -1797,11 +1807,44 @@ impl ServerManager {
             );
         };
 
+        if selected_assets.iter().any(|a| a.expected_sha256.is_none()) {
+            if let Some(ref m_url) = manifest_url {
+                if let Ok(req) = gate.request(Method::GET, m_url, "engine_install_checksums") {
+                    if let Ok(m_resp) = req.header("User-Agent", "cinder-ide").send().await {
+                        if m_resp.status().is_success() {
+                            if let Ok(manifest_txt) = m_resp.text().await {
+                                for asset in &mut selected_assets {
+                                    if asset.expected_sha256.is_none() {
+                                        asset.expected_sha256 =
+                                            parse_checksum_manifest_for_file(&manifest_txt, &asset.name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for asset in &selected_assets {
+            if asset.expected_sha256.is_none() {
+                anyhow::bail!(
+                    "Refusing to install unverified llama.cpp asset '{}' without a SHA-256 digest.",
+                    asset.name
+                );
+            }
+        }
+
         let target_dir = self.engines_dir.join("llama-cpp");
         std::fs::create_dir_all(&target_dir)?;
 
-        let total_assets = selected_urls.len();
-        for (idx, (name, url)) in selected_urls.iter().enumerate() {
+        let total_assets = selected_assets.len();
+        for (idx, asset) in selected_assets.iter().enumerate() {
+            let name = &asset.name;
+            let url = &asset.url;
+            let expected_sha = asset.expected_sha256.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("Missing SHA-256 digest for '{}'", asset.name)
+            })?;
             {
                 let mut st = self.install_state.write().await;
                 *st = (
@@ -1820,14 +1863,17 @@ impl ServerManager {
             }
 
             let total_bytes = dl_resp.content_length();
+            let part_path = target_dir.join(format!("{name}.part"));
             let zip_path = target_dir.join(name);
-            let mut file = tokio::fs::File::create(&zip_path).await?;
+            let mut file = tokio::fs::File::create(&part_path).await?;
             let mut stream = dl_resp.bytes_stream();
+            let mut hasher = Sha256::new();
             let mut downloaded: u64 = 0;
             let mut last_reported: u64 = 0;
 
             while let Some(chunk_res) = stream.next().await {
                 let chunk = chunk_res?;
+                hasher.update(&chunk);
                 file.write_all(&chunk).await?;
                 downloaded += chunk.len() as u64;
                 if downloaded.saturating_sub(last_reported) >= 512 * 1024
@@ -1860,11 +1906,23 @@ impl ServerManager {
             file.flush().await?;
             drop(file);
 
+            let computed_sha = hex::encode(hasher.finalize());
+            if !computed_sha.eq_ignore_ascii_case(expected_sha) {
+                let _ = tokio::fs::remove_file(&part_path).await;
+                anyhow::bail!(
+                    "SHA-256 verification failed for {name}: expected {expected_sha}, got {computed_sha}"
+                );
+            }
+            if zip_path.exists() {
+                let _ = tokio::fs::remove_file(&zip_path).await;
+            }
+            tokio::fs::rename(&part_path, &zip_path).await?;
+
             {
                 let mut st = self.install_state.write().await;
                 *st = (
                     EngineStatusKind::Installing,
-                    format!("Extracting {name}..."),
+                    format!("Verifying & extracting {name}..."),
                     86.0 + (idx as f64 / total_assets.max(1) as f64) * 10.0,
                 );
             }
@@ -2558,20 +2616,88 @@ async fn find_free_loopback_port(preferred: u16) -> u16 {
     preferred
 }
 
-fn pick_release_assets(
-    releases: &[GitHubRelease],
-    backend_preference: &str,
-) -> Option<(String, Vec<(String, String)>)> {
-    for rel in releases {
-        let selected = select_llama_assets(&rel.assets, backend_preference);
-        if !selected.is_empty() {
-            return Some((rel.tag_name.clone(), selected));
+fn parse_github_sha256_digest(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    let hex_part = s
+        .strip_prefix("sha256:")
+        .or_else(|| s.strip_prefix("SHA256:"))
+        .unwrap_or(s)
+        .trim();
+    if hex_part.len() == 64 && hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(hex_part.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn parse_checksum_manifest_for_file(text: &str, filename: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split_ascii_whitespace();
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let Some(name_tok) = parts.next() else {
+            continue;
+        };
+        let clean_name = name_tok.trim_start_matches('*');
+        let base_match = Path::new(clean_name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == filename);
+        if (clean_name == filename || base_match)
+            && hash.len() == 64
+            && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Some(hash.to_ascii_lowercase());
         }
     }
     None
 }
 
-fn select_llama_assets(assets: &[GitHubAsset], backend_preference: &str) -> Vec<(String, String)> {
+fn find_checksum_manifest_url(assets: &[GitHubAsset]) -> Option<String> {
+    assets
+        .iter()
+        .find(|a| {
+            let low = a.name.to_ascii_lowercase();
+            (low.contains("sha256sum") || (low.contains("sha256") && low.ends_with(".txt")))
+                && !low.ends_with(".sig")
+        })
+        .map(|a| a.browser_download_url.clone())
+}
+
+fn asset_to_selected(a: &GitHubAsset) -> SelectedLlamaAsset {
+    SelectedLlamaAsset {
+        name: a.name.clone(),
+        url: a.browser_download_url.clone(),
+        expected_sha256: parse_github_sha256_digest(a.digest.as_deref()),
+    }
+}
+
+fn pick_release_assets(
+    releases: &[GitHubRelease],
+    backend_preference: &str,
+) -> Option<(String, Vec<SelectedLlamaAsset>, Option<String>)> {
+    for rel in releases {
+        let selected = select_llama_assets(&rel.assets, backend_preference);
+        if !selected.is_empty() {
+            return Some((
+                rel.tag_name.clone(),
+                selected,
+                find_checksum_manifest_url(&rel.assets),
+            ));
+        }
+    }
+    None
+}
+
+fn select_llama_assets(
+    assets: &[GitHubAsset],
+    backend_preference: &str,
+) -> Vec<SelectedLlamaAsset> {
     select_llama_assets_for(
         assets,
         std::env::consts::OS,
@@ -2600,7 +2726,7 @@ fn select_llama_assets_for(
     os: &str,
     arch: &str,
     backend_preference: &str,
-) -> Vec<(String, String)> {
+) -> Vec<SelectedLlamaAsset> {
     let mut picked = Vec::new();
 
     if os == "windows" {
@@ -2632,21 +2758,21 @@ fn select_llama_assets_for(
                 });
 
             if let Some(bin) = cuda_bin {
-                picked.push((bin.name.clone(), bin.browser_download_url.clone()));
+                picked.push(asset_to_selected(bin));
                 if let Some(rt) = cuda_rt {
-                    picked.push((rt.name.clone(), rt.browser_download_url.clone()));
+                    picked.push(asset_to_selected(rt));
                 }
                 return picked;
             }
         }
 
         if let Some(vk) = find_asset_matching_needles(assets, &["bin-win-vulkan-x64.zip"]) {
-            picked.push((vk.name.clone(), vk.browser_download_url.clone()));
+            picked.push(asset_to_selected(vk));
             return picked;
         }
 
         if let Some(cpu) = find_asset_matching_needles(assets, &["bin-win-cpu-x64.zip"]) {
-            picked.push((cpu.name.clone(), cpu.browser_download_url.clone()));
+            picked.push(asset_to_selected(cpu));
             return picked;
         }
     } else if os == "macos" {
@@ -2664,7 +2790,7 @@ fn select_llama_assets_for(
             ]
         };
         if let Some(a) = find_asset_matching_needles(assets, needles) {
-            picked.push((a.name.clone(), a.browser_download_url.clone()));
+            picked.push(asset_to_selected(a));
             return picked;
         }
     } else if os == "linux" {
@@ -2717,7 +2843,7 @@ fn select_llama_assets_for(
             })
         };
         if let Some(a) = found {
-            picked.push((a.name.clone(), a.browser_download_url.clone()));
+            picked.push(asset_to_selected(a));
             return picked;
         }
     }
@@ -2897,68 +3023,79 @@ Graphics/Displays:
 
     #[test]
     fn select_llama_assets_for_supports_windows_macos_intel_arm_and_linux() {
+        let d = Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into());
         let assets = vec![
             GitHubAsset {
                 name: "llama-b12800-bin-win-cuda-12.4-x64.zip".into(),
                 browser_download_url: "https://example.com/win-cuda.zip".into(),
+                digest: d.clone(),
             },
             GitHubAsset {
                 name: "cudart-llama-bin-win-cuda-12.4-x64.zip".into(),
                 browser_download_url: "https://example.com/win-cudart.zip".into(),
+                digest: d.clone(),
             },
             GitHubAsset {
                 name: "llama-b12800-bin-win-vulkan-x64.zip".into(),
                 browser_download_url: "https://example.com/win-vk.zip".into(),
+                digest: d.clone(),
             },
             GitHubAsset {
                 name: "llama-b12800-bin-macos-arm64.tar.gz".into(),
                 browser_download_url: "https://example.com/mac-arm64.tar.gz".into(),
+                digest: d.clone(),
             },
             GitHubAsset {
                 name: "llama-b12800-bin-macos-x64.tar.gz".into(),
                 browser_download_url: "https://example.com/mac-x64.tar.gz".into(),
+                digest: d.clone(),
             },
             GitHubAsset {
                 name: "llama-b12800-bin-ubuntu-x64.tar.gz".into(),
                 browser_download_url: "https://example.com/ubuntu-x64.tar.gz".into(),
+                digest: d.clone(),
             },
             GitHubAsset {
                 name: "llama-b12800-bin-ubuntu-vulkan-x64.zip".into(),
                 browser_download_url: "https://example.com/ubuntu-vk.zip".into(),
+                digest: d.clone(),
             },
         ];
 
         let win_cuda = select_llama_assets_for(&assets, "windows", "x86_64", "cuda");
         assert_eq!(win_cuda.len(), 2);
-        assert_eq!(win_cuda[0].0, "llama-b12800-bin-win-cuda-12.4-x64.zip");
+        assert_eq!(win_cuda[0].name, "llama-b12800-bin-win-cuda-12.4-x64.zip");
+        assert!(win_cuda[0].expected_sha256.is_some());
 
         let win_vk = select_llama_assets_for(&assets, "windows", "x86_64", "vulkan");
         assert_eq!(win_vk.len(), 1);
-        assert_eq!(win_vk[0].0, "llama-b12800-bin-win-vulkan-x64.zip");
+        assert_eq!(win_vk[0].name, "llama-b12800-bin-win-vulkan-x64.zip");
 
         let mac_intel = select_llama_assets_for(&assets, "macos", "x86_64", "cuda");
         assert_eq!(mac_intel.len(), 1);
-        assert_eq!(mac_intel[0].0, "llama-b12800-bin-macos-x64.tar.gz");
+        assert_eq!(mac_intel[0].name, "llama-b12800-bin-macos-x64.tar.gz");
 
         let mac_arm = select_llama_assets_for(&assets, "macos", "aarch64", "cuda");
         assert_eq!(mac_arm.len(), 1);
-        assert_eq!(mac_arm[0].0, "llama-b12800-bin-macos-arm64.tar.gz");
+        assert_eq!(mac_arm[0].name, "llama-b12800-bin-macos-arm64.tar.gz");
 
         let linux_cpu = select_llama_assets_for(&assets, "linux", "x86_64", "cuda");
         assert_eq!(linux_cpu.len(), 1);
-        assert_eq!(linux_cpu[0].0, "llama-b12800-bin-ubuntu-x64.tar.gz");
+        assert_eq!(linux_cpu[0].name, "llama-b12800-bin-ubuntu-x64.tar.gz");
 
         let linux_vk = select_llama_assets_for(&assets, "linux", "x86_64", "vulkan");
         assert_eq!(linux_vk.len(), 1);
-        assert_eq!(linux_vk[0].0, "llama-b12800-bin-ubuntu-vulkan-x64.zip");
+        assert_eq!(linux_vk[0].name, "llama-b12800-bin-ubuntu-vulkan-x64.zip");
 
         // Legacy .zip format still matches on macOS Intel when .tar.gz is absent
         let legacy_mac_zip = vec![GitHubAsset {
             name: "llama-b12000-bin-macos-x64.zip".into(),
             browser_download_url: "https://example.com/mac-x64.zip".into(),
+            digest: None,
         }];
         let mac_zip_picked = select_llama_assets_for(&legacy_mac_zip, "macos", "x86_64", "cuda");
-        assert_eq!(mac_zip_picked[0].0, "llama-b12000-bin-macos-x64.zip");
+        assert_eq!(mac_zip_picked[0].name, "llama-b12000-bin-macos-x64.zip");
+        assert!(mac_zip_picked[0].expected_sha256.is_none());
     }
 
     #[test]
@@ -2968,6 +3105,7 @@ Graphics/Displays:
             assets: vec![GitHubAsset {
                 name: "nightly-tag.txt".into(),
                 browser_download_url: "https://example.com/nightly-tag.txt".into(),
+                digest: None,
             }],
         };
         let b12621 = GitHubRelease {
@@ -2976,22 +3114,27 @@ Graphics/Displays:
                 GitHubAsset {
                     name: "llama-b12621-bin-win-cuda-12.4-x64.zip".into(),
                     browser_download_url: "https://example.com/cuda12.zip".into(),
+                    digest: Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
                 },
                 GitHubAsset {
                     name: "cudart-llama-bin-win-cuda-12.4-x64.zip".into(),
                     browser_download_url: "https://example.com/cudart12.zip".into(),
+                    digest: Some("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
                 },
                 GitHubAsset {
                     name: "llama-b12621-bin-macos-arm64.zip".into(),
                     browser_download_url: "https://example.com/macos-arm64.zip".into(),
+                    digest: Some("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into()),
                 },
                 GitHubAsset {
                     name: "llama-b12621-bin-macos-x64.tar.gz".into(),
                     browser_download_url: "https://example.com/macos-x64.tar.gz".into(),
+                    digest: Some("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into()),
                 },
                 GitHubAsset {
                     name: "llama-b12621-bin-ubuntu-x64.zip".into(),
                     browser_download_url: "https://example.com/ubuntu.zip".into(),
+                    digest: Some("sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into()),
                 },
             ],
         };
@@ -3001,10 +3144,12 @@ Graphics/Displays:
                 GitHubAsset {
                     name: "llama-b12620-bin-win-vulkan-x64.zip".into(),
                     browser_download_url: "https://example.com/vulkan.zip".into(),
+                    digest: None,
                 },
                 GitHubAsset {
                     name: "llama-b12620-bin-ubuntu-vulkan-x64.zip".into(),
                     browser_download_url: "https://example.com/ubuntu-vulkan.zip".into(),
+                    digest: None,
                 },
             ],
         };
@@ -3019,8 +3164,31 @@ Graphics/Displays:
             assert_eq!(picked.1.len(), 2);
             let vk = pick_release_assets(&releases, "vulkan").unwrap();
             assert_eq!(vk.0, "b12620");
-            assert_eq!(vk.1[0].0, "llama-b12620-bin-win-vulkan-x64.zip");
+            assert_eq!(vk.1[0].name, "llama-b12620-bin-win-vulkan-x64.zip");
         }
+    }
+
+    #[test]
+    fn llama_asset_digest_parser_and_checksum_manifest_verify_strictly() {
+        assert_eq!(
+            parse_github_sha256_digest(Some(
+                "sha256:ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"
+            )),
+            Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into())
+        );
+        assert!(parse_github_sha256_digest(Some("sha256:tooshort")).is_none());
+        assert!(parse_github_sha256_digest(Some("md5:0123456789abcdef0123456789abcdef")).is_none());
+
+        let manifest = "\
+# release checksums
+1111111111111111111111111111111111111111111111111111111111111111  *llama-b12800-bin-win-vulkan-x64.zip
+nothex  llama-b12800-bin-ubuntu-x64.tar.gz
+";
+        assert_eq!(
+            parse_checksum_manifest_for_file(manifest, "llama-b12800-bin-win-vulkan-x64.zip"),
+            Some("1111111111111111111111111111111111111111111111111111111111111111".into())
+        );
+        assert!(parse_checksum_manifest_for_file(manifest, "llama-b12800-bin-ubuntu-x64.tar.gz").is_none());
     }
 
     #[tokio::test]

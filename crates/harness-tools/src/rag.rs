@@ -157,6 +157,10 @@ pub async fn build_workspace_index(
             .to_string_lossy()
             .replace('\\', "/");
 
+        if crate::risk::is_sensitive_secret_path(&rel_path) {
+            continue;
+        }
+
         if ext == "pdf" {
             if let Ok(doc) = lopdf::Document::load(path) {
                 let mut page_nums: Vec<u32> = doc.get_pages().keys().copied().collect();
@@ -288,6 +292,16 @@ pub async fn search_workspace_knowledge(
     query: &str,
     top_k: usize,
 ) -> anyhow::Result<Vec<KnowledgeSearchHit>> {
+    search_workspace_knowledge_with_policy(workspace_root, gate, query, top_k, false).await
+}
+
+pub async fn search_workspace_knowledge_with_policy(
+    workspace_root: &Path,
+    gate: &NetworkGate,
+    query: &str,
+    top_k: usize,
+    skip_secret_contents: bool,
+) -> anyhow::Result<Vec<KnowledgeSearchHit>> {
     let idx_path = index_file_path(workspace_root);
     if !idx_path.exists() {
         build_workspace_index(workspace_root, gate).await?;
@@ -321,6 +335,9 @@ pub async fn search_workspace_knowledge(
         .iter()
         .enumerate()
         .map(|(i, chunk)| {
+            if skip_secret_contents && crate::risk::is_sensitive_secret_path(&chunk.rel_path) {
+                return (i, 0.0, 0.0);
+            }
             let doc_len: f64 = chunk.terms.values().sum::<usize>().max(1) as f64;
             let mut bm25 = 0.0;
             for qt in &query_terms {
@@ -520,6 +537,63 @@ mod tests {
             assert!(!hits.is_empty());
             assert_eq!(hits[0].rel_path, "notes.md");
             assert_eq!(gate.audit_summary().external_requests_allowed, 0);
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offline_rag_excludes_secret_files_and_honors_cloud_guard() {
+        let dir = std::env::temp_dir().join(format!("bumbo_rag_secret_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.md"), "Public architecture documentation.\n").unwrap();
+        std::fs::write(
+            dir.join("credentials.json"),
+            "{\"secret_token\": \"super_secret_leaked_token_123\"}\n",
+        )
+        .unwrap();
+
+        let gate = NetworkGate::new(PrivacyMode::StrictLocal).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let stats = build_workspace_index(&dir, &gate).await.unwrap();
+            assert_eq!(stats.total_files, 1);
+
+            let hits = search_workspace_knowledge_with_policy(
+                &dir,
+                &gate,
+                "super_secret_leaked_token_123",
+                5,
+                true,
+            )
+            .await
+            .unwrap();
+            assert!(hits.is_empty());
+
+            // Also test filtering on a pre-existing index containing a secret chunk
+            let idx_path = index_file_path(&dir);
+            let mut idx: WorkspaceKnowledgeIndex =
+                serde_json::from_str(&std::fs::read_to_string(&idx_path).unwrap()).unwrap();
+            idx.chunks.push(KnowledgeChunk {
+                id: Uuid::new_v4().to_string(),
+                rel_path: "secrets.toml".into(),
+                location: "chunk 1".into(),
+                content: "api_key = super_secret_leaked_token_123".into(),
+                terms: term_counts("api_key super_secret_leaked_token_123"),
+                embedding: None,
+            });
+            std::fs::write(&idx_path, serde_json::to_string(&idx).unwrap()).unwrap();
+
+            let guarded = search_workspace_knowledge_with_policy(
+                &dir,
+                &gate,
+                "super_secret_leaked_token_123",
+                5,
+                true,
+            )
+            .await
+            .unwrap();
+            assert!(guarded.is_empty());
         });
 
         let _ = std::fs::remove_dir_all(&dir);

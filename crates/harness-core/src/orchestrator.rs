@@ -255,6 +255,7 @@ pub async fn run_orchestrator_turn(
 
     // --- PHASE 1: PLANNER ---
     let is_scratchpad = ctx.store.paths().is_scratch_path(workspace_root);
+    let trust_ws_instructions = snapshot.settings.is_workspace_trusted(workspace_root);
     let enabled_modules = &snapshot.settings.ui.enabled_modules;
     let thinking_effort = &snapshot.settings.ui.thinking_effort;
     let mut base_plan_sys = format!(
@@ -265,6 +266,7 @@ pub async fn run_orchestrator_turn(
             planner_model.starts_with("local::"),
             None,
             &snapshot.settings.ui.custom_system_prompt,
+            trust_ws_instructions,
         )
     );
     append_scratchpad_guidance(&mut base_plan_sys, is_scratchpad, workspace_root);
@@ -480,6 +482,33 @@ pub async fn run_orchestrator_turn(
             }
 
             if tc.name == "delegate_research" {
+                if !crate::is_tool_declared(&tc.name, &plan_specs) {
+                    let msg = format!(
+                        "Security Guard: tool '{}' is not enabled in Planner mode.",
+                        tc.name
+                    );
+                    all_tools.push(ToolCallRecord {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments_json: tc.arguments.to_string(),
+                        status: "error".into(),
+                        output: msg.clone(),
+                        diff: None,
+                        file_path: None,
+                        risk_tier: Some(RiskTier::HighRiskDestructive),
+                        subagent_summary: None,
+                        subagent_model: None,
+                    });
+                    plan_history.push(ProviderMessage {
+                        role: "tool".into(),
+                        content: msg,
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_name: Some(tc.name.clone()),
+                        tool_calls: Vec::new(),
+                        images: Vec::new(),
+                    });
+                    continue;
+                }
                 let (rec, tool_msg, phase) = handle_delegate_research_tool(
                     ctx,
                     session_id,
@@ -495,11 +524,68 @@ pub async fn run_orchestrator_turn(
             }
 
             if tc.name == "delegate_vision" {
+                if !crate::is_tool_declared(&tc.name, &plan_specs) {
+                    let msg = format!(
+                        "Security Guard: tool '{}' is not enabled in Planner mode.",
+                        tc.name
+                    );
+                    all_tools.push(ToolCallRecord {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments_json: tc.arguments.to_string(),
+                        status: "error".into(),
+                        output: msg.clone(),
+                        diff: None,
+                        file_path: None,
+                        risk_tier: Some(RiskTier::HighRiskDestructive),
+                        subagent_summary: None,
+                        subagent_model: None,
+                    });
+                    plan_history.push(ProviderMessage {
+                        role: "tool".into(),
+                        content: msg,
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_name: Some(tc.name.clone()),
+                        tool_calls: Vec::new(),
+                        images: Vec::new(),
+                    });
+                    continue;
+                }
                 let (rec, tool_msg, phase) =
                     handle_delegate_vision_tool(ctx, session_id, workspace_root, tc).await;
                 all_tools.push(rec);
                 extra_phases.push(phase);
                 plan_history.push(tool_msg);
+                continue;
+            }
+
+            if !crate::is_tool_declared(&tc.name, &plan_specs)
+                || !crate::is_readonly_planner_tool(&tc.name)
+            {
+                let msg = format!(
+                    "Security Guard: tool '{}' is not permitted during read-only planning.",
+                    tc.name
+                );
+                all_tools.push(ToolCallRecord {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments_json: tc.arguments.to_string(),
+                    status: "error".into(),
+                    output: msg.clone(),
+                    diff: None,
+                    file_path: None,
+                    risk_tier: Some(RiskTier::HighRiskDestructive),
+                    subagent_summary: None,
+                    subagent_model: None,
+                });
+                plan_history.push(ProviderMessage {
+                    role: "tool".into(),
+                    content: msg,
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_name: Some(tc.name.clone()),
+                    tool_calls: Vec::new(),
+                    images: Vec::new(),
+                });
                 continue;
             }
 
@@ -691,6 +777,7 @@ pub async fn run_orchestrator_turn(
         executor_model.starts_with("local::"),
         Some(&plan),
         &snapshot.settings.ui.custom_system_prompt,
+        trust_ws_instructions,
     );
     append_scratchpad_guidance(&mut base_exec_sys, is_scratchpad, workspace_root);
     append_allowed_runtimes_guidance(
@@ -818,6 +905,33 @@ pub async fn run_orchestrator_turn(
 
         let mut paused: Option<PendingToolApproval> = None;
         for tc in &resp.tool_calls {
+            if tc.name != "switch_mode" && !crate::is_tool_declared(&tc.name, &exec_specs) {
+                let msg = format!(
+                    "Security Guard: tool '{}' is not enabled for Orchestrator execution.",
+                    tc.name
+                );
+                all_tools.push(ToolCallRecord {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments_json: tc.arguments.to_string(),
+                    status: "error".into(),
+                    output: msg.clone(),
+                    diff: None,
+                    file_path: None,
+                    risk_tier: Some(RiskTier::HighRiskDestructive),
+                    subagent_summary: None,
+                    subagent_model: None,
+                });
+                exec_history.push(ProviderMessage {
+                    role: "tool".into(),
+                    content: msg,
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_name: Some(tc.name.clone()),
+                    tool_calls: Vec::new(),
+                    images: Vec::new(),
+                });
+                continue;
+            }
             if tc.name == "write_artifact" {
                 let (rec, msg_txt) = upsert_artifact_from_tool(ctx.store, session_id, tc).await;
                 all_tools.push(rec);
@@ -950,7 +1064,7 @@ pub async fn run_orchestrator_turn(
                 RiskTier::SafeReadOnly => false,
                 RiskTier::HighRiskDestructive => true,
                 RiskTier::WorkspaceMutation => match tc.name.as_str() {
-                    "write_file" | "edit_file" => false, // Plan already approved by Orchestrator
+                    "write_file" | "edit_file" => !snapshot.settings.auto_approve_edits,
                     "run_command" | "verify_workspace" => {
                         is_scratchpad || !snapshot.settings.auto_approve_commands
                     }

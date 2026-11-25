@@ -1,4 +1,5 @@
 pub mod drives;
+mod secret_vault;
 pub mod types;
 pub mod usage;
 
@@ -62,6 +63,7 @@ impl BumboStore {
             Self::default_state(&paths)
         };
 
+        secret_vault::unseal_state_in_place(&mut state, &paths.state_file);
         Self::sanitize_loaded_state(&mut state);
         let _ = std::fs::create_dir_all(&state.settings.model_vault_dir);
         Self::write_atomic_to(&paths.state_file, &state)?;
@@ -136,6 +138,7 @@ impl BumboStore {
                 fallback_chain: Vec::new(),
                 model_aliases: std::collections::BTreeMap::new(),
                 allowed_runtimes: Vec::new(),
+                trusted_workspaces: Vec::new(),
             },
             workspaces,
             sessions: vec![initial_session],
@@ -158,6 +161,11 @@ impl BumboStore {
         }
         if state.settings.ui.thinking_effort.trim().is_empty() {
             state.settings.ui.thinking_effort = "standard".into();
+        }
+        for srv in &mut state.mcp_servers {
+            if matches!(srv.id.as_str(), "plugin::mcp-git" | "plugin::mcp-fetch") {
+                srv.read_only = false;
+            }
         }
         if state.synced_google_models.len() > 12 {
             // Legacy unprobed `/v1beta/models` catalog dump (e.g. contains `gemini-4-neon` with limit: 0).
@@ -254,8 +262,9 @@ impl BumboStore {
         if let Some(parent) = state_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let disk_state = secret_vault::seal_state_for_disk(state, state_file)?;
         let tmp = state_file.with_extension(format!("json.{}.tmp", Uuid::new_v4().simple()));
-        let payload = serde_json::to_string_pretty(state)?;
+        let payload = serde_json::to_string_pretty(&disk_state)?;
         #[cfg(unix)]
         {
             use std::io::Write;
@@ -628,6 +637,143 @@ mod tests {
             assert_eq!(gem_list[0].id, "gemini-3-flash-preview");
             assert!(!gem_list.iter().any(|m| m.id == "gemini-3.7-flash"));
         });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_downgrades_mutating_and_network_mcp_readonly_flags() {
+        let dir = std::env::temp_dir().join(format!("bumbo_mcp_sanitize_{}", Uuid::new_v4()));
+        let paths = BumboPaths {
+            app_data_dir: dir.clone(),
+            engines_dir: dir.join("engines"),
+            state_file: dir.join("state.json"),
+            default_vault_dir: dir.join("models"),
+        };
+        let store = BumboStore::init(paths.clone()).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            store
+                .update(|s| {
+                    s.mcp_servers.push(McpServerEntry {
+                        id: "plugin::mcp-git".into(),
+                        name: "Git Repository Inspector MCP".into(),
+                        transport: "stdio".into(),
+                        target: "python -m mcp_server_git".into(),
+                        enabled: true,
+                        command: "python".into(),
+                        args: vec!["-m".into(), "mcp_server_git".into()],
+                        env: HashMap::new(),
+                        url: String::new(),
+                        source: "catalog".into(),
+                        needs_network: false,
+                        read_only: true,
+                    });
+                    s.mcp_servers.push(McpServerEntry {
+                        id: "plugin::mcp-fetch".into(),
+                        name: "Web Fetch & Markdown MCP".into(),
+                        transport: "stdio".into(),
+                        target: "python -m mcp_server_fetch".into(),
+                        enabled: true,
+                        command: "python".into(),
+                        args: vec!["-m".into(), "mcp_server_fetch".into()],
+                        env: HashMap::new(),
+                        url: String::new(),
+                        source: "catalog".into(),
+                        needs_network: true,
+                        read_only: true,
+                    });
+                })
+                .await
+                .unwrap();
+        });
+        drop(store);
+
+        let reloaded = BumboStore::init(paths).unwrap();
+        rt.block_on(async {
+            let snap = reloaded.snapshot().await;
+            assert!(snap.mcp_servers.iter().all(|m| !m.read_only));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_persists_encrypted_secrets_and_migrates_legacy_plaintext() {
+        let dir = std::env::temp_dir().join(format!("bumbo_vault_test_{}", Uuid::new_v4()));
+        let paths = BumboPaths {
+            app_data_dir: dir.clone(),
+            engines_dir: dir.join("engines"),
+            state_file: dir.join("state.json"),
+            default_vault_dir: dir.join("models"),
+        };
+        let secret_gem = "AIzaSy-very-secret-gemini-token";
+        let secret_ant = "sk-ant-very-secret-token";
+        let secret_mcp = "mcp-secret-bearer-token";
+
+        let store = BumboStore::init(paths.clone()).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            store
+                .update(|s| {
+                    s.settings.api_keys.gemini_api_key = secret_gem.into();
+                    s.settings.api_keys.anthropic_api_key = secret_ant.into();
+                    let mut env = HashMap::new();
+                    env.insert("API_TOKEN".into(), secret_mcp.into());
+                    s.mcp_servers.push(McpServerEntry {
+                        id: "test-srv".into(),
+                        name: "Test".into(),
+                        transport: "stdio".into(),
+                        target: "echo".into(),
+                        enabled: false,
+                        command: "echo".into(),
+                        args: Vec::new(),
+                        env,
+                        url: String::new(),
+                        source: "manual".into(),
+                        needs_network: false,
+                        read_only: false,
+                    });
+                })
+                .await
+                .unwrap();
+        });
+        drop(store);
+
+        let disk_raw = std::fs::read_to_string(&paths.state_file).unwrap();
+        assert!(!disk_raw.contains(secret_gem));
+        assert!(!disk_raw.contains(secret_ant));
+        assert!(!disk_raw.contains(secret_mcp));
+        let disk_parsed: PersistedState = serde_json::from_str(&disk_raw).unwrap();
+        let expected_prefix = if cfg!(windows) { "dpapi:v1:" } else { "sealed:v1:" };
+        assert!(disk_parsed
+            .settings
+            .api_keys
+            .gemini_api_key
+            .starts_with(expected_prefix));
+        assert!(disk_parsed.mcp_servers[0].env["API_TOKEN"].starts_with(expected_prefix));
+
+        let reloaded = BumboStore::init(paths.clone()).unwrap();
+        rt.block_on(async {
+            let snap = reloaded.snapshot().await;
+            assert_eq!(snap.settings.api_keys.gemini_api_key, secret_gem);
+            assert_eq!(snap.settings.api_keys.anthropic_api_key, secret_ant);
+            assert_eq!(snap.mcp_servers[0].env["API_TOKEN"], secret_mcp);
+        });
+        drop(reloaded);
+
+        // Simulate a legacy plaintext state.json and verify automatic migration on load
+        let legacy_secret = "AIzaSy-legacy-plaintext-key";
+        let mut legacy = disk_parsed;
+        legacy.settings.api_keys.gemini_api_key = legacy_secret.into();
+        std::fs::write(&paths.state_file, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let migrated = BumboStore::init(paths.clone()).unwrap();
+        rt.block_on(async {
+            let snap = migrated.snapshot().await;
+            assert_eq!(snap.settings.api_keys.gemini_api_key, legacy_secret);
+        });
+        let migrated_raw = std::fs::read_to_string(&paths.state_file).unwrap();
+        assert!(!migrated_raw.contains(legacy_secret));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -37,10 +37,11 @@ jobs:
       - name: Build Apple Silicon binary (aarch64-apple-darwin)
         run: cargo build --release --bin cinder --target aarch64-apple-darwin
       - name: Package macOS .app bundles
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          VER="${{ inputs.tag || github.ref_name }}"
-          bash scripts/bundle-macos-app.sh target/x86_64-apple-darwin/release/cinder dist intel "$VER"
-          bash scripts/bundle-macos-app.sh target/aarch64-apple-darwin/release/cinder dist apple-silicon "$VER"
+          bash scripts/bundle-macos-app.sh target/x86_64-apple-darwin/release/cinder dist intel "$RELEASE_TAG"
+          bash scripts/bundle-macos-app.sh target/aarch64-apple-darwin/release/cinder dist apple-silicon "$RELEASE_TAG"
           ls -lh dist/
       - name: Upload macOS release artifacts
         uses: actions/upload-artifact@v4
@@ -76,9 +77,10 @@ jobs:
       - name: Build Linux release binary
         run: cargo build --release --bin cinder
       - name: Package Linux archive
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          VER="${{ inputs.tag || github.ref_name }}"
-          bash scripts/package-linux.sh target/release/cinder dist "$VER"
+          bash scripts/package-linux.sh target/release/cinder dist "$RELEASE_TAG"
           ls -lh dist/
       - name: Upload Linux release artifact
         uses: actions/upload-artifact@v4

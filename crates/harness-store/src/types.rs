@@ -2,6 +2,7 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use harness_net::PrivacyMode;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -589,7 +590,7 @@ impl Default for OrchestratorConfig {
             planner_model_id: "local::gemma4:12b".into(),
             executor_model_id: "local::qwen3.5:9b".into(),
             vision_model_id: String::new(),
-            review_before_execute: false,
+            review_before_execute: true,
             auto_verify_after_edits: true,
             max_autonomous_steps: 8,
             only_show_reachable_models: true,
@@ -648,6 +649,36 @@ pub struct AppSettings {
     /// Explicit user opt-in CLI runtimes (Posture 2: disabled unless added and toggled on).
     #[serde(default)]
     pub allowed_runtimes: Vec<AllowedRuntimeEntry>,
+    /// Normalized workspace folder paths explicitly trusted for automatic repo instruction loading.
+    #[serde(default)]
+    pub trusted_workspaces: Vec<String>,
+}
+
+pub fn normalize_workspace_trust_key(path: &Path) -> String {
+    let raw = path.as_os_str().to_string_lossy();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let resolved =
+        std::fs::canonicalize(Path::new(trimmed)).unwrap_or_else(|_| PathBuf::from(trimmed));
+    let mut s = resolved.to_string_lossy().to_string();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        s = format!(r"\\{rest}");
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        s = rest.to_string();
+    }
+    let mut s = s.replace('\\', "/");
+    while s.len() > 1 && s.ends_with('/') {
+        if cfg!(windows) && s.len() == 3 && s.as_bytes()[1] == b':' {
+            break;
+        }
+        s.pop();
+    }
+    if cfg!(windows) {
+        s = s.to_ascii_lowercase();
+    }
+    s
 }
 
 impl AppSettings {
@@ -659,6 +690,25 @@ impl AppSettings {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .unwrap_or(fallback)
+    }
+
+    pub fn is_workspace_trusted(&self, workspace_root: &Path) -> bool {
+        let key = normalize_workspace_trust_key(workspace_root);
+        !key.is_empty() && self.trusted_workspaces.iter().any(|w| w == &key)
+    }
+
+    pub fn trust_workspace(&mut self, workspace_root: &Path) {
+        let key = normalize_workspace_trust_key(workspace_root);
+        if !key.is_empty() && !self.trusted_workspaces.iter().any(|w| w == &key) {
+            self.trusted_workspaces.push(key);
+        }
+    }
+
+    pub fn untrust_workspace(&mut self, workspace_root: &Path) {
+        let key = normalize_workspace_trust_key(workspace_root);
+        if !key.is_empty() {
+            self.trusted_workspaces.retain(|w| w != &key);
+        }
     }
 }
 

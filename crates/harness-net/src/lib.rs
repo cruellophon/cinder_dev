@@ -218,6 +218,33 @@ impl NetworkGate {
         self.authorize_with_client(&self.no_redirect_client, method, raw_url, purpose)
     }
 
+    /// Authorize an outbound HTTP request with redirects disabled and optional pre-resolved DNS
+    /// pinning so TCP connection cannot rebind away from the SSRF-validated IP addresses.
+    pub fn request_no_redirect_pinned(
+        &self,
+        method: Method,
+        raw_url: &str,
+        purpose: &str,
+        pinned_domain: Option<(&str, &[std::net::SocketAddr])>,
+    ) -> Result<RequestBuilder, NetError> {
+        let Some((domain, addrs)) = pinned_domain else {
+            return self.authorize_with_client(&self.no_redirect_client, method, raw_url, purpose);
+        };
+        if addrs.is_empty() {
+            return self.authorize_with_client(&self.no_redirect_client, method, raw_url, purpose);
+        }
+        let client = Client::builder()
+            .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .resolve_to_addrs(domain, addrs)
+            .build()
+            .map_err(|e| NetError::InvalidUrl(raw_url.to_string(), e.to_string()))?;
+        self.authorize_with_client(&client, method, raw_url, purpose)
+    }
+
     fn authorize_with_client(
         &self,
         client: &Client,
@@ -386,5 +413,28 @@ mod tests {
         let loopback_target = Url::parse("http://127.0.0.1:18080/v1/models").unwrap();
         assert!(classify_redirect_target(PrivacyMode::Hybrid, Some(&ext_origin), &loopback_target).is_err());
         assert!(classify_redirect_target(PrivacyMode::Hybrid, Some(&ext_origin), &ext_target).is_ok());
+    }
+
+    #[test]
+    fn request_no_redirect_pinned_enforces_strict_local_and_pins_addrs() {
+        let addr: std::net::SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let strict_gate = NetworkGate::new(PrivacyMode::StrictLocal).unwrap();
+        let blocked = strict_gate.request_no_redirect_pinned(
+            Method::GET,
+            "https://example.com/",
+            "fetch_url",
+            Some(("example.com", std::slice::from_ref(&addr))),
+        );
+        assert!(matches!(blocked, Err(NetError::BlockedByStrictLocal { .. })));
+
+        let hybrid_gate = NetworkGate::new(PrivacyMode::Hybrid).unwrap();
+        let allowed = hybrid_gate.request_no_redirect_pinned(
+            Method::GET,
+            "https://example.com/",
+            "fetch_url",
+            Some(("example.com", std::slice::from_ref(&addr))),
+        );
+        assert!(allowed.is_ok());
+        assert_eq!(hybrid_gate.audit_summary().external_requests_allowed, 1);
     }
 }

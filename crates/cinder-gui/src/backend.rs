@@ -2,9 +2,10 @@ use chrono::Utc;
 use harness_core::{
     accept_checkpoint_file, answer_pending_question, compact_session_context,
     delete_session_artifact, handle_plan_review_action, list_skills_with_global,
-    load_workspace_rules, resolve_pending_approval, resolve_pending_fallback,
-    revert_checkpoint_file, rewind_session_to_message, rollback_entire_checkpoint, run_turn,
-    save_custom_skill, save_workspace_rules, upsert_session_artifact, HarnessContext,
+    list_workspace_instruction_files, load_workspace_rules, resolve_pending_approval,
+    resolve_pending_fallback, revert_checkpoint_file, rewind_session_to_message,
+    rollback_entire_checkpoint, run_turn, save_custom_skill, save_workspace_rules,
+    upsert_session_artifact, HarnessContext,
 };
 use harness_models::{
     inspect_hf_repo, probe_hardware, scan_local_models, search_hf_gguf, DownloadJob,
@@ -79,6 +80,7 @@ pub struct UiSnapshot {
     pub scratch_files: Vec<WorkspaceFileNode>,
     pub git_status: GitWorkspaceStatus,
     pub workspace_rules: String,
+    pub workspace_instruction_files: Vec<String>,
     pub skills: Vec<SkillDefinition>,
     pub hardware: HardwareReport,
     pub local_models: Vec<LocalModelEntry>,
@@ -372,6 +374,13 @@ impl BackendHandle {
             .cloned()
             .or_else(|| snap.sessions.first().cloned());
 
+        let workspace_instruction_files = active_session
+            .as_ref()
+            .map(|s| s.workspace_path.trim())
+            .filter(|p| !p.is_empty())
+            .map(|p| list_workspace_instruction_files(Path::new(p)))
+            .unwrap_or_default();
+
         let sessions = snap
             .sessions
             .iter()
@@ -429,6 +438,7 @@ impl BackendHandle {
             scratch_files,
             git_status,
             workspace_rules,
+            workspace_instruction_files,
             skills,
             hardware: hw,
             local_models,
@@ -1514,6 +1524,12 @@ impl BackendHandle {
             let ws = h.store.snapshot().await.settings.active_workspace_path;
             match save_workspace_rules(Path::new(&ws), &content) {
                 Ok(_) => {
+                    let _ = h
+                        .store
+                        .update(|s| {
+                            s.settings.trust_workspace(Path::new(&ws));
+                        })
+                        .await;
                     h.toast("Saved .cinder/rules.md", false);
                     h.emit_snapshot(false).await;
                 }
@@ -2534,6 +2550,32 @@ impl BackendHandle {
             if prev.starts_with("local::") && !now_model.starts_with("local::") {
                 let _ = h.server_mgr.stop_all_local_models(&h.gate).await;
             }
+            h.emit_snapshot(false).await;
+        });
+    }
+
+    pub fn set_workspace_trusted(self: &Arc<Self>, workspace_path: String, trusted: bool) {
+        let h = Arc::clone(self);
+        self.rt.spawn(async move {
+            let _ = h
+                .store
+                .update(|s| {
+                    let pb = PathBuf::from(&workspace_path);
+                    if trusted {
+                        s.settings.trust_workspace(&pb);
+                    } else {
+                        s.settings.untrust_workspace(&pb);
+                    }
+                })
+                .await;
+            h.toast(
+                if trusted {
+                    "Trusted workspace instructions for this folder."
+                } else {
+                    "Revoked workspace instruction trust."
+                },
+                false,
+            );
             h.emit_snapshot(false).await;
         });
     }

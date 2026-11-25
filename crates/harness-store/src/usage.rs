@@ -546,6 +546,7 @@ mod tests {
                 fallback_to_local: false,
                 model_aliases,
                 allowed_runtimes: Vec::new(),
+                trusted_workspaces: Vec::new(),
             },
             workspaces: Vec::<WorkspaceEntry>::new(),
             sessions: Vec::new(),

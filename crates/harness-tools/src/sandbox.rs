@@ -372,6 +372,21 @@ pub fn resolve_workspace_path(workspace_root: &Path, user_path: &str) -> anyhow:
         }
     }
 
+    let clean_ws_buf = strip_verbatim_prefix(workspace_root.to_path_buf());
+    let root_is_unc = {
+        let cr_s = clean_canon_root.to_string_lossy();
+        let ws_s = clean_ws_buf.to_string_lossy();
+        cr_s.starts_with(r"\\")
+            || cr_s.starts_with("//")
+            || ws_s.starts_with(r"\\")
+            || ws_s.starts_with("//")
+    };
+    if (candidate_raw.starts_with(r"\\") || candidate_raw.starts_with("//")) && !root_is_unc {
+        anyhow::bail!(
+            "UNC or network share paths are blocked by sandbox policy: '{user_path}'"
+        );
+    }
+
     let candidate_buf: PathBuf = {
         let p = Path::new(candidate_raw.as_str());
         if !p.is_absolute()
@@ -440,13 +455,33 @@ pub fn resolve_workspace_path(workspace_root: &Path, user_path: &str) -> anyhow:
     }
 
     let joined = if candidate.is_absolute() {
+        let clean_cand = strip_verbatim_prefix(candidate.to_path_buf());
+        let matches_root =
+            clean_cand.starts_with(&clean_canon_root) || clean_cand.starts_with(&clean_ws_buf);
+        #[cfg(windows)]
+        let matches_root = matches_root
+            || strip_prefix_case_insensitive_win(&clean_canon_root, &clean_cand).is_some()
+            || strip_prefix_case_insensitive_win(&clean_ws_buf, &clean_cand).is_some();
+        if !matches_root {
+            anyhow::bail!(
+                "Sandbox policy blocked access outside workspace '{}': '{user_path}'",
+                clean_canon_root.display()
+            );
+        }
         candidate.to_path_buf()
     } else {
         let mut normal_parts: Vec<std::ffi::OsString> = Vec::new();
         for comp in candidate.components() {
             match comp {
                 Component::CurDir => {}
-                Component::Normal(part) => normal_parts.push(part.to_os_string()),
+                Component::Normal(part) => {
+                    if part.to_string_lossy().contains(':') {
+                        anyhow::bail!(
+                            "Colons / alternate data streams are blocked in workspace paths: '{user_path}'"
+                        );
+                    }
+                    normal_parts.push(part.to_os_string());
+                }
                 Component::ParentDir => {
                     anyhow::bail!(
                         "Path traversal ('..') outside workspace is blocked: '{user_path}'"
@@ -918,5 +953,26 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_workspace_path_blocks_unc_device_and_ads_paths() {
+        let ws = std::env::temp_dir().join(format!("cinder_unc_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+
+        for bad in [
+            r"\\attacker.invalid\share\secret.txt",
+            "//attacker.invalid/share/secret.txt",
+            r"\\.\PhysicalDrive0",
+            r"\\?\UNC\attacker.invalid\share\secret.txt",
+            "note.txt:hidden_stream",
+        ] {
+            assert!(
+                resolve_workspace_path(&ws, bad).is_err(),
+                "expected sandbox block for '{bad}'"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

@@ -551,7 +551,19 @@ pub async fn run_research_subagent(
 
         let is_cloud_model = !actual_model.starts_with("local::");
         for tc in resp.tool_calls {
-            let res = if is_cloud_model && tc.name != "search_files" {
+            let res = if !crate::is_tool_declared(&tc.name, &subagent_specs)
+                || !crate::is_readonly_subagent_tool(&tc.name)
+            {
+                ToolExecutionResult {
+                    output: format!(
+                        "Security Guard: tool '{}' is not permitted in the read-only Research Sub-Agent.",
+                        tc.name
+                    ),
+                    diff: None,
+                    file_path: None,
+                    is_error: true,
+                }
+            } else if is_cloud_model && tc.name != "search_files" {
                 if let Some(secret_path) = extract_tool_secret_path(&tc.name, &tc.arguments) {
                     ToolExecutionResult {
                         output: format!(

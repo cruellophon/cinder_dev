@@ -55,6 +55,26 @@ pub fn run_local_software_spec(allowed: &[AllowedRuntimeEntry]) -> Option<ToolSp
     })
 }
 
+fn validate_runtime_path_arg(workspace_root: &Path, candidate: &str) -> anyhow::Result<()> {
+    if candidate.starts_with('/') || candidate.starts_with('\\') || candidate.contains(':') {
+        anyhow::bail!(
+            "Absolute or drive-prefixed path '{candidate}' is blocked; pass a relative path inside the workspace/scratchpad."
+        );
+    }
+    if Path::new(candidate)
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        anyhow::bail!("Path traversal ('..') is blocked in runtime argument: '{candidate}'");
+    }
+    let _ = resolve_workspace_path(workspace_root, candidate)?;
+    Ok(())
+}
+
+fn looks_like_runtime_path(s: &str) -> bool {
+    s.contains('/') || s.contains('\\') || s.contains(':') || s.contains("..") || s.contains('.')
+}
+
 pub fn validate_runtime_args(workspace_root: &Path, args: &[String]) -> anyhow::Result<Vec<String>> {
     if args.len() > 16 {
         anyhow::bail!("Allowed runtime arguments exceed maximum limit (16 arguments).");
@@ -74,39 +94,56 @@ pub fn validate_runtime_args(workspace_root: &Path, args: &[String]) -> anyhow::
         // Block inline code-eval / nested-command flags so execution always inspects visible workspace files.
         if matches!(
             lower.as_str(),
-            "-e" | "--eval" | "-c" | "--command" | "-command" | "-encodedcommand" | "-enc" | "/c" | "/k"
+            "-e" | "--eval"
+                | "-c"
+                | "--command"
+                | "-command"
+                | "-encodedcommand"
+                | "-enc"
+                | "/c"
+                | "/k"
+                | "-p"
+                | "--print"
+                | "-qc"
+                | "-uc"
+                | "-ic"
+                | "-sc"
+                | "-ec"
+                | "-pe"
+                | "-qe"
+                | "-ie"
+                | "-te"
         ) || lower.starts_with("--eval=")
             || lower.starts_with("-e=")
+            || lower.starts_with("-c=")
+            || lower.starts_with("--command=")
+            || lower.starts_with("--print=")
         {
             anyhow::bail!(
                 "Inline eval/command flag '{trimmed}' is blocked in run_local_software; write code to a file inside the workspace/scratchpad and pass its filename instead."
             );
         }
 
-        let looks_like_path_or_file = !trimmed.starts_with('-')
-            && (trimmed.contains('/')
-                || trimmed.contains('\\')
-                || trimmed.contains(':')
-                || trimmed.contains("..")
-                || trimmed.contains('.'));
-        if looks_like_path_or_file {
-            if trimmed.starts_with('/') || trimmed.starts_with('\\') || trimmed.contains(':') {
-                anyhow::bail!(
-                    "Absolute or drive-prefixed path '{trimmed}' is blocked; pass a relative path inside the workspace/scratchpad."
-                );
+        if trimmed.starts_with('-') {
+            if let Some((_, rhs)) = trimmed.split_once('=') {
+                let rhs_clean = rhs.trim();
+                if !rhs_clean.is_empty() && looks_like_runtime_path(rhs_clean) {
+                    validate_runtime_path_arg(workspace_root, rhs_clean)?;
+                }
             }
-            if Path::new(trimmed)
-                .components()
-                .any(|c| matches!(c, Component::ParentDir))
-            {
-                anyhow::bail!("Path traversal ('..') is blocked in runtime argument: '{trimmed}'");
-            }
-            let _ = resolve_workspace_path(workspace_root, trimmed)?;
+        } else if looks_like_runtime_path(trimmed) {
+            validate_runtime_path_arg(workspace_root, trimmed)?;
         }
 
         validated.push(raw.to_string());
     }
     Ok(validated)
+}
+
+fn is_blocked_batch_wrapper(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "bat" | "cmd" | "ps1"))
 }
 
 fn resolve_runtime_executable_path(raw: &str) -> anyhow::Result<PathBuf> {
@@ -117,6 +154,11 @@ fn resolve_runtime_executable_path(raw: &str) -> anyhow::Result<PathBuf> {
     let p = Path::new(trimmed);
     if p.components().any(|c| matches!(c, Component::ParentDir)) {
         anyhow::bail!("Runtime executable path cannot contain '..'.");
+    }
+    if is_blocked_batch_wrapper(p) {
+        anyhow::bail!(
+            "Batch/script wrappers (.bat/.cmd/.ps1) are blocked in Allowed CLI Runtimes; configure the direct binary executable instead: '{trimmed}'"
+        );
     }
 
     if trimmed.contains('/') || trimmed.contains('\\') {
@@ -130,12 +172,12 @@ fn resolve_runtime_executable_path(raw: &str) -> anyhow::Result<PathBuf> {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path_var) {
         let direct = dir.join(trimmed);
-        if direct.is_file() {
+        if direct.is_file() && !is_blocked_batch_wrapper(&direct) {
             return Ok(direct);
         }
         #[cfg(windows)]
         if p.extension().is_none() {
-            for ext in ["exe", "com", "cmd", "bat"] {
+            for ext in ["exe", "com"] {
                 let with_ext = dir.join(format!("{trimmed}.{ext}"));
                 if with_ext.is_file() {
                     return Ok(with_ext);
@@ -539,6 +581,10 @@ mod tests {
         for bad in [
             vec!["-e".into(), "(system \"calc\")".into()],
             vec!["-c".into(), "import os".into()],
+            vec!["-qc".into(), "import os".into()],
+            vec!["-p".into(), "process.exit(1)".into()],
+            vec!["--output=C:\\Windows\\win.ini".into()],
+            vec!["--file=../outside.txt".into()],
             vec!["../outside.rkt".into()],
             vec!["C:\\Windows\\win.ini".into()],
             vec!["foo\nbar".into()],
@@ -549,6 +595,9 @@ mod tests {
                 bad
             );
         }
+
+        assert!(resolve_runtime_executable_path("wrapper.bat").is_err());
+        assert!(resolve_runtime_executable_path("wrapper.cmd").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

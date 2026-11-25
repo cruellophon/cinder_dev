@@ -141,16 +141,24 @@ fn has_shell_metacharacters(cmd: &str) -> bool {
         || cmd.contains('\r')
 }
 
+fn is_confined_readonly_value(val: &str) -> bool {
+    !(val.contains("..")
+        || val.starts_with('/')
+        || val.starts_with('\\')
+        || val.contains(':'))
+}
+
 fn are_readonly_path_args_confined(tokens: &[String], start_idx: usize) -> bool {
     for tok in tokens.iter().skip(start_idx) {
         if tok.starts_with('-') {
+            if let Some((_, rhs)) = tok.split_once(['=', ':']) {
+                if !is_confined_readonly_value(rhs) {
+                    return false;
+                }
+            }
             continue;
         }
-        if tok.contains("..")
-            || tok.starts_with('/')
-            || tok.starts_with('\\')
-            || tok.contains(':')
-        {
+        if !is_confined_readonly_value(tok) {
             return false;
         }
     }
@@ -179,12 +187,29 @@ fn is_safe_readonly_git(tokens: &[String]) -> bool {
         return false;
     }
     let has_dangerous_git_flag = tokens.iter().any(|t| {
-        matches!(t.as_str(), "-c" | "--exec-path" | "--output" | "--git-dir" | "--work-tree")
+        matches!(
+            t.as_str(),
+            "-c" | "-o"
+                | "--exec-path"
+                | "--output"
+                | "--git-dir"
+                | "--work-tree"
+                | "--config-env"
+                | "--no-index"
+                | "--ext-diff"
+                | "--textconv"
+        ) || t.starts_with("-c")
+            || t.starts_with("-o")
+            || t.starts_with("--exec-path=")
             || t.starts_with("--output=")
             || t.starts_with("--git-dir=")
             || t.starts_with("--work-tree=")
+            || t.starts_with("--config-env=")
     });
     if has_dangerous_git_flag {
+        return false;
+    }
+    if !are_readonly_path_args_confined(tokens, 2) {
         return false;
     }
     match sub {
@@ -223,28 +248,79 @@ fn is_safe_readonly_command(cmd_raw: &str) -> bool {
         "dir" | "ls" | "get-childitem" | "gci" => are_readonly_path_args_confined(&tokens, 1),
         "pwd" => tokens.len() == 1,
         "git" => is_safe_readonly_git(&tokens),
-        "python" | "python3" => {
-            tokens.get(1).map(String::as_str) == Some("-m")
-                && tokens.get(2).map(String::as_str) == Some("py_compile")
-                && are_readonly_path_args_confined(&tokens, 3)
-        }
-        "pytest" => {
-            tokens.iter().any(|t| t == "--collect-only")
-                && are_readonly_path_args_confined(&tokens, 1)
-        }
         _ => false,
     }
 }
 
+const PATH_GUARD_KEYS: &[&str] = &[
+    "path",
+    "file_path",
+    "filepath",
+    "file",
+    "filename",
+    "filePath",
+    "target_file",
+    "target_path",
+    "sub_path",
+];
+
+fn normalize_guard_path(raw: &str) -> String {
+    let mut cleaned = raw.trim().to_string();
+    loop {
+        let mut changed = false;
+        for (open, close) in [('"', '"'), ('\'', '\''), ('`', '`')] {
+            if cleaned.len() >= 2 && cleaned.starts_with(open) && cleaned.ends_with(close) {
+                cleaned = cleaned[1..cleaned.len() - 1].trim().to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if cleaned.contains("%20") {
+        cleaned = cleaned.replace("%20", " ");
+    }
+    if let Some(rest) = cleaned.strip_prefix("file:///") {
+        let has_win_drive = rest.as_bytes().get(1) == Some(&b':');
+        cleaned = if cfg!(windows) || has_win_drive {
+            rest.to_string()
+        } else {
+            format!("/{rest}")
+        };
+    } else if let Some(rest) = cleaned.strip_prefix("file://") {
+        cleaned = rest.to_string();
+    }
+    let trimmed = cleaned.trim();
+    let no_verbatim = if let Some(rest) = trimmed.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else if let Some(rest) = trimmed.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    let mut s = no_verbatim.trim().to_string();
+    if let Some(after_at) = s.strip_prefix('@') {
+        s = after_at.trim().to_string();
+    }
+    let mut norm = s.replace('\\', "/").to_ascii_lowercase();
+    while let Some(rest) = norm.strip_prefix("./") {
+        norm = rest.to_string();
+    }
+    norm = norm.trim_start_matches('/').trim_end_matches('/').to_string();
+    // Strip Windows trailing dots/spaces (`.env.` / `.env ` resolve to `.env` on Win32)
+    norm.trim_end_matches(['.', ' ']).to_string()
+}
+
 pub fn is_sensitive_secret_path(path: &str) -> bool {
-    let trimmed = path
-        .trim()
-        .trim_matches(|c| c == '"' || c == '\'')
-        .replace('\\', "/");
-    if trimmed.is_empty() {
+    let lower_path = normalize_guard_path(path);
+    if lower_path.is_empty() {
         return false;
     }
-    let lower_path = trimmed.to_ascii_lowercase();
     let fname = Path::new(&lower_path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -322,15 +398,7 @@ pub fn extract_tool_secret_path(tool_name: &str, args: &Value) -> Option<String>
     ) {
         return None;
     }
-    for key in [
-        "path",
-        "file_path",
-        "filepath",
-        "file",
-        "filename",
-        "target_file",
-        "sub_path",
-    ] {
+    for key in PATH_GUARD_KEYS {
         if let Some(raw) = args.get(key).and_then(|v| v.as_str()) {
             let t = raw.trim();
             if !t.is_empty() && is_sensitive_secret_path(t) {
@@ -360,19 +428,14 @@ pub fn classify_tool_risk_with_context(
 }
 
 pub fn is_high_risk_config_write_path(path: &str) -> bool {
-    let trimmed = path
-        .trim()
-        .trim_matches(|c| c == '"' || c == '\'')
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    if trimmed.is_empty() {
+    let norm = normalize_guard_path(path);
+    if norm.is_empty() {
         return false;
     }
-    let norm = trimmed.trim_start_matches("./");
-    let fname = Path::new(norm)
+    let fname = Path::new(&norm)
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or(norm);
+        .unwrap_or(norm.as_str());
 
     if norm.split('/').any(|seg| seg == ".git") || fname == ".gitmodules" {
         return true;
@@ -386,6 +449,13 @@ pub fn is_high_risk_config_write_path(path: &str) -> bool {
     if norm.ends_with(".vscode/tasks.json")
         || norm.ends_with(".vscode/launch.json")
         || norm.ends_with(".vscode/settings.json")
+    {
+        return true;
+    }
+    if norm.ends_with(".cinder/rules.md")
+        || norm.ends_with(".bumbo/rules.md")
+        || norm.split('/').any(|seg| seg == ".agents")
+            && norm.contains(".agents/rules/")
     {
         return true;
     }
@@ -413,14 +483,7 @@ pub fn classify_tool_risk(tool_name: &str, args: &Value) -> (RiskTier, String) {
             "Read-only / planning operation".into(),
         ),
         "write_file" | "edit_file" => {
-            for key in [
-                "path",
-                "file_path",
-                "filepath",
-                "file",
-                "filename",
-                "target_file",
-            ] {
+            for key in PATH_GUARD_KEYS {
                 if let Some(p) = args.get(key).and_then(|v| v.as_str()) {
                     if is_high_risk_config_write_path(p) {
                         return (
@@ -447,24 +510,31 @@ pub fn classify_tool_risk(tool_name: &str, args: &Value) -> (RiskTier, String) {
             )
         }
         "run_command" | "verify_workspace" => {
-            let cmd_raw = args["command"].as_str().unwrap_or("");
-            let cmd = cmd_raw.trim().to_ascii_lowercase();
+            let cmd_primary = args.get("command").and_then(|v| v.as_str());
+            let cmd_alias = args.get("cmd").and_then(|v| v.as_str());
 
-            if HIGH_RISK_SUBSTRINGS.iter().any(|p| cmd.contains(p))
-                || segment_leading_programs(&cmd)
-                    .iter()
-                    .any(|prog| HIGH_RISK_PROGRAMS.contains(&prog.as_str()))
-            {
-                return (
-                    RiskTier::HighRiskDestructive,
-                    "High-risk or destructive shell command — always requires review".into(),
-                );
+            for raw_opt in [cmd_primary, cmd_alias] {
+                if let Some(raw) = raw_opt {
+                    let cmd = raw.trim().to_ascii_lowercase();
+                    if HIGH_RISK_SUBSTRINGS.iter().any(|p| cmd.contains(p))
+                        || segment_leading_programs(&cmd)
+                            .iter()
+                            .any(|prog| HIGH_RISK_PROGRAMS.contains(&prog.as_str()))
+                    {
+                        return (
+                            RiskTier::HighRiskDestructive,
+                            "High-risk or destructive shell command — always requires review".into(),
+                        );
+                    }
+                }
             }
 
-            if is_safe_readonly_command(cmd_raw) {
+            let conflicting_keys = matches!((cmd_primary, cmd_alias), (Some(a), Some(b)) if a.trim() != b.trim());
+            let effective = cmd_primary.or(cmd_alias).unwrap_or("");
+            if !conflicting_keys && !effective.trim().is_empty() && is_safe_readonly_command(effective) {
                 return (
                     RiskTier::SafeReadOnly,
-                    "Safe read-only or syntax check command".into(),
+                    "Safe read-only command".into(),
                 );
             }
 
@@ -548,10 +618,22 @@ mod tests {
             "ls -la",
             "dir",
             "pwd",
-            "python -m py_compile main.py",
         ] {
             let (tier, _) = classify_tool_risk("run_command", &json!({ "command": cmd }));
             assert_eq!(tier, RiskTier::SafeReadOnly, "cmd={cmd}");
+        }
+
+        // Code-executing commands must NOT be SafeReadOnly
+        for exec_cmd in [
+            "python -m py_compile main.py",
+            "pytest --collect-only",
+            "git diff --no-index C:\\Users\\victim\\state.json NUL",
+            "git diff --ext-diff",
+            "git -C .. status",
+            "gci -Path:C:\\Users",
+        ] {
+            let (tier, _) = classify_tool_risk("run_command", &json!({ "command": exec_cmd }));
+            assert_eq!(tier, RiskTier::WorkspaceMutation, "exec_cmd={exec_cmd}");
         }
 
         // Build-script / proc-macro / PowerShell subexpression / off-workspace path escapes must never be SafeReadOnly
@@ -646,5 +728,60 @@ mod tests {
             &json!({ "path": "src/main.rs", "content": "fn main() {}" }),
         );
         assert_eq!(normal, RiskTier::WorkspaceMutation);
+    }
+
+    #[test]
+    fn guard_catches_cmd_alias_and_path_wrapper_bypasses() {
+        for cmd_key in ["command", "cmd"] {
+            let (tier, _) = classify_tool_risk(
+                "run_command",
+                &serde_json::json!({ cmd_key: "rm -rf /" }),
+            );
+            assert_eq!(tier, RiskTier::HighRiskDestructive, "key={cmd_key}");
+
+            let (enc_tier, _) = classify_tool_risk(
+                "run_command",
+                &serde_json::json!({ cmd_key: "powershell -EncodedCommand SQBFAFgA" }),
+            );
+            assert_eq!(enc_tier, RiskTier::HighRiskDestructive, "key={cmd_key}");
+        }
+
+        for (key, val) in [
+            ("filePath", ".env"),
+            ("target_path", ".env"),
+            ("path", "`.env`"),
+            ("path", "@.env"),
+            ("path", ".env."),
+        ] {
+            let (tier, _) = classify_tool_risk_with_context(
+                "read_file",
+                &serde_json::json!({ key: val }),
+                true,
+            );
+            assert_eq!(
+                tier,
+                RiskTier::HighRiskDestructive,
+                "secret guard missed {key}={val}"
+            );
+        }
+
+        for (key, val) in [
+            ("filePath", ".git/hooks/pre-commit"),
+            ("target_path", ".cargo/config.toml"),
+            ("path", "`.git/config`"),
+            ("path", "@.mcp.json"),
+            ("path", ".cinder/rules.md"),
+            ("path", ".agents/rules/evil.md"),
+        ] {
+            let (tier, _) = classify_tool_risk(
+                "write_file",
+                &serde_json::json!({ key: val, "content": "x" }),
+            );
+            assert_eq!(
+                tier,
+                RiskTier::HighRiskDestructive,
+                "config guard missed {key}={val}"
+            );
+        }
     }
 }
