@@ -1,4 +1,4 @@
-# Cinder (v0.6.0)
+# Cinder (v0.6.1)
 
 > A local-first, 100% pure-Rust desktop agentic IDE and GGUF model forge powered by a native `eframe` / `egui` GPU frontend (`cinder-gui`) and modular backend crates — zero Electron, zero WebView bloat, and strict network privacy controls.
 
@@ -16,8 +16,10 @@ Repository: <https://github.com/cruellophon/cinder_dev>
   - **Hybrid Mode:** Enables external cloud APIs (Google Gemini, Anthropic, OpenAI/OpenRouter), live web search, and model/plugin installers when explicitly enabled by the user. Models are strictly prevented from switching network privacy mode.
 - **Multi-Mode Agentic Engine (`harness-core`):**
   - **`Auto`**, **`Chat`**, **`Plan`**, **`Agent`**, **`Orchestrator`** (dual-model Planner + Executor anchoring `Auto` selection to your active free cloud model and pinning `PlanArtifact` execution), and **`Compare`** (side-by-side model evaluation).
+  - **Sandboxed Standalone Session Scratchpads & One-Click Export:** Standalone chats automatically provision an isolated `<app_data_dir>/scratch/<session_id>` directory so Cinder creates real, saveable files directly—with a chat **Scratchpad** strip (`Save As…`, `Reveal Folder`, `Export to Folder…`) plus **`Save As…`** buttons on every code block.
+  - **Opt-In Allowed CLI Runtimes (`run_local_software`):** Disabled by default with zero silent host scanning or cloud prompt fingerprinting; users can explicitly opt in specific CLI runtimes in **Settings → Allowed CLI Runtimes**, always gated by mandatory approval, direct `argv` invocation (no shell), scrubbed environments (`env_clear`), and OS process-tree timeout kills.
   - Turn-scoped **Model Consistency & Fallback Policies** (`Ask First`, `Auto-Chain`, `Never`) with an ordered **Fallback Chain**, automatic single transient primary retry, interactive in-chat fallback prompts, and `Fallback: Orig → Actual` badges with one-click retry — never silently overwriting your active Chat model.
-  - Streaming token output (Gemini, Anthropic, OpenAI-compatible SSE), live streaming shell command output, inline local tool-call parsing (Gemma, Qwen, DeepSeek), borderless thought traces, and structured summaries.
+  - Streaming token output (Gemini, Anthropic, OpenAI-compatible SSE) with full local token accounting, live streaming shell command output, inline local tool-call parsing (Gemma, Qwen, DeepSeek), borderless thought traces, and structured summaries.
 - **Multimodal Vision & Sub-Agent Delegation (`harness-core/src/subagent.rs`):**
   - Paste screenshots directly via `Ctrl+V` (Win32 `CF_DIB` / `CF_DIBV5` + Explorer file lists) or drag-and-drop images, code files, PDFs, and folders anywhere onto the window.
   - Dedicated **Vision Sub-Agent** (local `--mmproj` or free cloud vision) and **Research Sub-Agent** (respecting your active cloud model and ordered fallback chain while filtering paid models).
@@ -86,8 +88,8 @@ cargo build --release --bin cinder
 ```
 
 - **Windows:** Copy standalone executable (`target\release\cinder.exe`) to `release\cinder.exe`.
-- **macOS `.app` bundle:** `bash scripts/bundle-macos-app.sh target/release/cinder dist native 0.6.0`
-- **Linux archive:** `bash scripts/package-linux.sh target/release/cinder dist 0.6.0`
+- **macOS `.app` bundle:** `bash scripts/bundle-macos-app.sh target/release/cinder dist native 0.6.1`
+- **Linux archive:** `bash scripts/package-linux.sh target/release/cinder dist 0.6.1`
 
 ### Runtime Flags & Environment Variables
 - `--open-stage` / `--open-settings` / `--open-forge` / `--open-customizations` — open directly into a specific panel

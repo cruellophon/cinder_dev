@@ -32,9 +32,22 @@ pub mod win32 {
         data3: 0x4768,
         data4: [0xBE, 0x02, 0x9D, 0x96, 0x95, 0x32, 0xD9, 0x60],
     };
+    const CLSID_FILE_SAVE_DIALOG: Guid = Guid {
+        data1: 0xC0B4E2F3,
+        data2: 0xBA21,
+        data3: 0x4773,
+        data4: [0x8D, 0xBA, 0x33, 0x5E, 0xC9, 0x46, 0xEB, 0x8B],
+    };
+    const IID_I_FILE_SAVE_DIALOG: Guid = Guid {
+        data1: 0x84BCCD23,
+        data2: 0x5FDE,
+        data3: 0x4CDB,
+        data4: [0xAE, 0xA4, 0xAF, 0x64, 0xB8, 0x3D, 0x78, 0xAB],
+    };
 
     const COINIT_APARTMENTTHREADED_NO_OLE1: u32 = 0x2 | 0x4;
     const CLSCTX_INPROC_SERVER: u32 = 0x1;
+    const FOS_OVERWRITEPROMPT: u32 = 0x0000_0002;
     const FOS_PICKFOLDERS: u32 = 0x0000_0020;
     const FOS_FORCEFILESYSTEM: u32 = 0x0000_0040;
     const FOS_NOCHANGEDIR: u32 = 0x0000_0008;
@@ -285,6 +298,79 @@ pub mod win32 {
             Ok(Vec::new())
         }
     }
+
+    pub fn pick_save_file(title: &str, suggested_name: &str) -> anyhow::Result<Option<String>> {
+        unsafe {
+            let hr_init = CoInitializeEx(ptr::null_mut(), COINIT_APARTMENTTHREADED_NO_OLE1);
+            let should_uninit = hr_init == 0 || hr_init == 1;
+            if hr_init < 0 {
+                anyhow::bail!("COM CoInitializeEx failed: 0x{:08X}", hr_init as u32);
+            }
+            let _com = ComGuard(should_uninit);
+
+            let mut raw_dlg: *mut c_void = ptr::null_mut();
+            let hr_create = CoCreateInstance(
+                &CLSID_FILE_SAVE_DIALOG,
+                ptr::null_mut(),
+                CLSCTX_INPROC_SERVER,
+                &IID_I_FILE_SAVE_DIALOG,
+                &mut raw_dlg,
+            );
+            if hr_create < 0 || raw_dlg.is_null() {
+                anyhow::bail!(
+                    "CoCreateInstance(IFileSaveDialog) failed: 0x{:08X}",
+                    hr_create as u32
+                );
+            }
+            let dlg = ComPtr(raw_dlg);
+
+            let get_opts: extern "system" fn(*mut c_void, *mut u32) -> i32 =
+                std::mem::transmute(*vtbl(dlg.0).add(10));
+            let set_opts: extern "system" fn(*mut c_void, u32) -> i32 =
+                std::mem::transmute(*vtbl(dlg.0).add(9));
+            let set_file_name: extern "system" fn(*mut c_void, *const u16) -> i32 =
+                std::mem::transmute(*vtbl(dlg.0).add(15));
+            let set_title: extern "system" fn(*mut c_void, *const u16) -> i32 =
+                std::mem::transmute(*vtbl(dlg.0).add(17));
+            let show: extern "system" fn(*mut c_void, isize) -> i32 =
+                std::mem::transmute(*vtbl(dlg.0).add(3));
+            let get_result: extern "system" fn(*mut c_void, *mut *mut c_void) -> i32 =
+                std::mem::transmute(*vtbl(dlg.0).add(20));
+
+            let mut opts: u32 = 0;
+            let _ = get_opts(dlg.0, &mut opts);
+            let _ = set_opts(
+                dlg.0,
+                opts | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR | FOS_PATHMUSTEXIST | FOS_OVERWRITEPROMPT,
+            );
+            let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+            let _ = set_title(dlg.0, wide_title.as_ptr());
+            if !suggested_name.trim().is_empty() {
+                let wide_name: Vec<u16> = suggested_name
+                    .trim()
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let _ = set_file_name(dlg.0, wide_name.as_ptr());
+            }
+
+            let hwnd = find_owner_hwnd();
+            let hr_show = show(dlg.0, hwnd);
+            if hr_show == HRESULT_CANCELLED {
+                return Ok(None);
+            }
+            if hr_show < 0 {
+                anyhow::bail!("IFileSaveDialog::Show failed: 0x{:08X}", hr_show as u32);
+            }
+            let mut raw_item: *mut c_void = ptr::null_mut();
+            let hr_res = get_result(dlg.0, &mut raw_item);
+            if hr_res < 0 || raw_item.is_null() {
+                return Ok(None);
+            }
+            let item = ComPtr(raw_item);
+            Ok(shell_item_path(item.0))
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -436,31 +522,142 @@ pub fn reveal_in_file_manager(path: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// Open a file, HTML preview, PDF, or URL with the OS default handler.
-pub fn open_with_system_default(path_or_url: &Path) -> anyhow::Result<()> {
+pub fn is_dangerous_executable_extension(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "exe"
+            | "bat"
+            | "cmd"
+            | "com"
+            | "ps1"
+            | "psm1"
+            | "vbs"
+            | "vbe"
+            | "js"
+            | "jse"
+            | "wsf"
+            | "wsh"
+            | "hta"
+            | "scr"
+            | "pif"
+            | "msi"
+            | "msp"
+            | "reg"
+            | "lnk"
+            | "cpl"
+            | "jar"
+            | "app"
+            | "command"
+            | "tool"
+            | "sh"
+    )
+}
+
+/// Open the native OS save-file dialog on a dedicated STA thread.
+pub fn pick_save_file(title: &str, suggested_name: &str) -> anyhow::Result<Option<String>> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let clean = strip_verbatim(path_or_url);
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &clean])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()?;
+        let title_owned = title.to_string();
+        let name_owned = suggested_name.to_string();
+        let handle = std::thread::spawn(move || win32::pick_save_file(&title_owned, &name_owned));
+        return handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("Save dialog UI thread panicked"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let esc_title = escape_applescript_string(title);
+        let esc_name = escape_applescript_string(suggested_name);
+        let script = format!(
+            "POSIX path of (choose file name with prompt \"{esc_title}\" default name \"{esc_name}\")"
+        );
+        let out = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        return Ok(if s.is_empty() { None } else { Some(s) });
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let out = match std::process::Command::new("zenity")
+            .args([
+                "--file-selection",
+                "--save",
+                "--confirm-overwrite",
+                &format!("--title={title}"),
+                &format!("--filename={suggested_name}"),
+            ])
+            .output()
+        {
+            Ok(out) => out,
+            Err(_) => std::process::Command::new("kdialog")
+                .args(["--getsavefilename", suggested_name, "--title", title])
+                .output()?,
+        };
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        return Ok(if s.is_empty() { None } else { Some(s) });
+    }
+}
+
+/// Open an existing non-executable local document with the OS default handler without shell interpolation.
+pub fn open_with_system_default(path: &Path) -> anyhow::Result<()> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| anyhow::anyhow!("Cannot open '{}': {e}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        anyhow::bail!("Refusing to open symlink with system default handler.");
+    }
+    if !meta.is_file() {
+        anyhow::bail!("Can only open existing regular files.");
+    }
+    if is_dangerous_executable_extension(path) {
+        anyhow::bail!(
+            "Refusing to launch executable/script extension via system default handler: '{}'",
+            path.display()
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: isize,
+                lp_operation: *const u16,
+                lp_file: *const u16,
+                lp_parameters: *const u16,
+                lp_directory: *const u16,
+                n_show_cmd: i32,
+            ) -> isize;
+        }
+        let clean = strip_verbatim(path);
+        let op: Vec<u16> = "open\0".encode_utf16().collect();
+        let file: Vec<u16> = clean.encode_utf16().chain(std::iter::once(0)).collect();
+        let rc = unsafe {
+            ShellExecuteW(
+                0,
+                op.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+            )
+        };
+        if rc <= 32 {
+            anyhow::bail!("Windows ShellExecuteW could not open file (code {rc})");
+        }
         return Ok(());
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open")
-            .arg(path_or_url)
-            .spawn()?;
+        std::process::Command::new("open").arg(path).spawn()?;
         return Ok(());
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        std::process::Command::new("xdg-open")
-            .arg(path_or_url)
-            .spawn()?;
+        std::process::Command::new("xdg-open").arg(path).spawn()?;
         return Ok(());
     }
 }
@@ -539,6 +736,22 @@ mod tests {
             super::escape_applescript_string(r#"Pick "Project" in C:\Work"#),
             r#"Pick \"Project\" in C:\\Work"#
         );
+    }
+
+    #[test]
+    fn open_with_system_default_rejects_executables_and_missing_files() {
+        let dir = std::env::temp_dir().join(format!("cinder_opendlg_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bat = dir.join("payload.bat");
+        std::fs::write(&bat, "@echo off\n").unwrap();
+        assert!(super::open_with_system_default(&bat).is_err());
+
+        let ps1 = dir.join("script.ps1");
+        std::fs::write(&ps1, "Write-Host hi\n").unwrap();
+        assert!(super::open_with_system_default(&ps1).is_err());
+
+        assert!(super::open_with_system_default(&dir.join("missing.txt")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

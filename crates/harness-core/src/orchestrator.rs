@@ -1,10 +1,11 @@
 use crate::{
-    active_tools_for_context, apply_thinking_effort, build_fallback_plan_from_notes,
-    build_pending_tool_approval, build_pending_user_question, build_plan_artifact,
-    build_step_contingent_question, build_system_prompt, complete_cancellable,
-    execute_tool_with_checkpoint, format_step_thought_trace, handle_delegate_research_tool,
-    handle_delegate_vision_tool, snapshot_history_for_paused_tool, try_parse_inline_submit_plan,
-    upsert_artifact_from_tool, upsert_session_artifact, HarnessContext,
+    active_tools_for_context, append_allowed_runtimes_guidance, append_scratchpad_guidance,
+    apply_thinking_effort, build_fallback_plan_from_notes, build_pending_tool_approval,
+    build_pending_user_question, build_plan_artifact, build_step_contingent_question,
+    build_system_prompt, complete_cancellable, execute_tool_with_checkpoint,
+    format_step_thought_trace, handle_delegate_research_tool, handle_delegate_vision_tool,
+    snapshot_history_for_paused_tool, try_parse_inline_submit_plan, upsert_artifact_from_tool,
+    upsert_session_artifact, HarnessContext,
 };
 use chrono::Utc;
 use harness_providers::{CompletionRequest, ProviderMessage};
@@ -14,7 +15,7 @@ use harness_store::{
 };
 use harness_tools::{
     classify_tool_risk_with_context, execute_tool_with_policy, extract_tool_secret_path,
-    ToolExecutionResult,
+    run_local_software_spec, ToolExecutionResult,
 };
 use std::path::Path;
 use uuid::Uuid;
@@ -253,9 +254,10 @@ pub async fn run_orchestrator_turn(
     let executor_label = friendly_model_label(&snapshot.settings, &executor_model);
 
     // --- PHASE 1: PLANNER ---
+    let is_scratchpad = ctx.store.paths().is_scratch_path(workspace_root);
     let enabled_modules = &snapshot.settings.ui.enabled_modules;
     let thinking_effort = &snapshot.settings.ui.thinking_effort;
-    let base_plan_sys = format!(
+    let mut base_plan_sys = format!(
         "{}\n\nYou are the PLANNER phase of an Orchestrator workflow. Inspect read-only and submit a concise Plan Artifact via `submit_plan` (do not assume files are edited yet).",
         build_system_prompt(
             workspace_root,
@@ -265,6 +267,7 @@ pub async fn run_orchestrator_turn(
             &snapshot.settings.ui.custom_system_prompt,
         )
     );
+    append_scratchpad_guidance(&mut base_plan_sys, is_scratchpad, workspace_root);
     let (plan_thinking, plan_sys) = apply_thinking_effort(&base_plan_sys, thinking_effort);
     let has_workspace = !workspace_root.as_os_str().is_empty() && workspace_root.is_dir();
     let allow_web = ctx.gate.mode() == harness_net::PrivacyMode::Hybrid;
@@ -682,20 +685,31 @@ pub async fn run_orchestrator_turn(
         )
         .await;
 
-    let base_exec_sys = build_system_prompt(
+    let mut base_exec_sys = build_system_prompt(
         workspace_root,
         AgentMode::Agent,
         executor_model.starts_with("local::"),
         Some(&plan),
         &snapshot.settings.ui.custom_system_prompt,
     );
+    append_scratchpad_guidance(&mut base_exec_sys, is_scratchpad, workspace_root);
+    append_allowed_runtimes_guidance(
+        &mut base_exec_sys,
+        executor_model.starts_with("local::"),
+        &snapshot.settings.allowed_runtimes,
+    );
     let (exec_thinking, exec_sys) = apply_thinking_effort(&base_exec_sys, thinking_effort);
-    let exec_specs = active_tools_for_context(
+    let mut exec_specs = active_tools_for_context(
         AgentMode::Agent,
         ctx.gate.mode() == harness_net::PrivacyMode::Hybrid,
         enabled_modules,
         has_workspace,
     );
+    if has_workspace {
+        if let Some(rt_spec) = run_local_software_spec(&snapshot.settings.allowed_runtimes) {
+            exec_specs.push(rt_spec);
+        }
+    }
     let mut exec_history = history_base;
     exec_history.push(ProviderMessage {
         role: "user".into(),
@@ -937,7 +951,10 @@ pub async fn run_orchestrator_turn(
                 RiskTier::HighRiskDestructive => true,
                 RiskTier::WorkspaceMutation => match tc.name.as_str() {
                     "write_file" | "edit_file" => false, // Plan already approved by Orchestrator
-                    "run_command" | "verify_workspace" => !snapshot.settings.auto_approve_commands,
+                    "run_command" | "verify_workspace" => {
+                        is_scratchpad || !snapshot.settings.auto_approve_commands
+                    }
+                    name if name.starts_with("mcp__") => !snapshot.settings.auto_approve_commands,
                     _ => false,
                 },
             };

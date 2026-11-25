@@ -151,6 +151,47 @@ impl BumboPaths {
     pub fn skills_dir(&self) -> PathBuf {
         self.app_data_dir.join("skills")
     }
+
+    /// Root directory for isolated standalone session scratchpads.
+    pub fn scratch_root_dir(&self) -> PathBuf {
+        self.app_data_dir.join("scratch")
+    }
+
+    /// Returns the sandboxed scratchpad directory for a standalone session.
+    pub fn session_scratch_dir(&self, session_id: &str) -> PathBuf {
+        let slug: String = session_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(64)
+            .collect();
+        let leaf = if slug.is_empty() {
+            "default".to_string()
+        } else {
+            slug
+        };
+        self.scratch_root_dir().join(leaf)
+    }
+
+    /// Returns `true` if `path` resides inside `scratch_root_dir`.
+    pub fn is_scratch_path(&self, path: &Path) -> bool {
+        if path.as_os_str().is_empty() {
+            return false;
+        }
+        let root = std::fs::canonicalize(self.scratch_root_dir())
+            .unwrap_or_else(|_| self.scratch_root_dir());
+        let cand = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let r_str = root.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_string();
+        let c_str = cand.to_string_lossy().replace('\\', "/");
+        if cfg!(windows) {
+            c_str.eq_ignore_ascii_case(&r_str)
+                || (c_str.len() > r_str.len()
+                    && c_str.is_char_boundary(r_str.len())
+                    && c_str[..r_str.len()].eq_ignore_ascii_case(&r_str)
+                    && c_str[r_str.len()..].starts_with('/'))
+        } else {
+            cand.starts_with(&root)
+        }
+    }
 }
 
 fn choose_smart_vault_dir(app_data_dir: &Path, drives: &[DriveInfo]) -> PathBuf {

@@ -9,7 +9,8 @@ use crate::theme::{
 };
 use egui::{Color32, CornerRadius, Stroke};
 use harness_net::{AuditOutcome, PrivacyMode};
-use harness_store::FallbackPolicy;
+use harness_store::{AllowedRuntimeEntry, FallbackPolicy};
+use harness_tools::runtime_presets;
 use std::sync::Arc;
 
 pub fn render_settings_rail(ui: &mut egui::Ui, state: &mut GuiState, p: &CinderPalette) {
@@ -1544,6 +1545,181 @@ fn render_agent_section(
                     }
                 },
             );
+        },
+    );
+
+    ui.add_space(16.0);
+
+    setting_group(
+        ui,
+        p,
+        "Allowed CLI Runtimes (Opt-In · Posture 2)",
+        "Off by default. Only runtimes you add and enable here can be requested via `run_local_software` — every execution pauses for manual approval inside a scrubbed, timeout-bounded environment and is never shared in cloud system prompts.",
+        |ui| {
+            if snap.settings.allowed_runtimes.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No local CLI runtimes allowed yet (`run_local_software` tool is completely disabled).",
+                    )
+                    .small()
+                    .color(p.muted),
+                );
+            } else {
+                let mut toggle_idx: Option<(usize, bool)> = None;
+                let mut remove_idx: Option<usize> = None;
+                for (idx, rt) in snap.settings.allowed_runtimes.iter().enumerate() {
+                    let mut enabled = rt.enabled;
+                    p.subcard_frame().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            if toggle_switch(ui, p, &mut enabled).changed() {
+                                toggle_idx = Some((idx, enabled));
+                            }
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(&rt.label).strong().color(p.text));
+                                    badge(ui, &rt.id, p.amber, p.bg_elev);
+                                });
+                                ui.label(
+                                    egui::RichText::new(&rt.executable)
+                                        .monospace()
+                                        .small()
+                                        .color(p.muted),
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if secondary_button(ui, p, "Remove").clicked() {
+                                        remove_idx = Some(idx);
+                                    }
+                                },
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+                if let Some((idx, next_en)) = toggle_idx {
+                    backend.update_settings(move |s| {
+                        if let Some(item) = s.allowed_runtimes.get_mut(idx) {
+                            item.enabled = next_en;
+                        }
+                    });
+                }
+                if let Some(idx) = remove_idx {
+                    backend.update_settings(move |s| {
+                        if idx < s.allowed_runtimes.len() {
+                            s.allowed_runtimes.remove(idx);
+                        }
+                    });
+                }
+            }
+
+            ui.add_space(6.0);
+            let presets = runtime_presets();
+            let selected_preset_lbl = presets
+                .iter()
+                .find(|(id, _, _)| *id == state.runtime_preset_draft)
+                .map(|(_, lbl, _)| *lbl)
+                .unwrap_or("Custom Runtime");
+
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 7.0;
+                egui::ComboBox::from_id_salt("settings_allowed_runtime_preset_combo")
+                    .selected_text(selected_preset_lbl)
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        for &(id, lbl, exe) in presets {
+                            if ui
+                                .selectable_label(state.runtime_preset_draft == id, lbl)
+                                .clicked()
+                            {
+                                state.runtime_preset_draft = id.to_string();
+                                state.runtime_label_draft = lbl.to_string();
+                                state.runtime_exec_draft = exe.to_string();
+                            }
+                        }
+                        if ui
+                            .selectable_label(
+                                state.runtime_preset_draft == "custom",
+                                "Custom Runtime...",
+                            )
+                            .clicked()
+                        {
+                            state.runtime_preset_draft = "custom".into();
+                            if state.runtime_label_draft.trim().is_empty() {
+                                state.runtime_label_draft = "Custom CLI".into();
+                            }
+                        }
+                    });
+                if state.runtime_preset_draft == "custom" {
+                    input_frame(p, false).show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.runtime_label_draft)
+                                .hint_text("Label (e.g. Racket)")
+                                .desired_width(120.0)
+                                .frame(false),
+                        );
+                    });
+                }
+                input_frame(p, false).show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.runtime_exec_draft)
+                            .hint_text("Executable name or full path (e.g. racket)")
+                            .desired_width(220.0)
+                            .frame(false),
+                    );
+                });
+                let can_add_rt = !state.runtime_exec_draft.trim().is_empty()
+                    && !state.runtime_label_draft.trim().is_empty();
+                if ui
+                    .add_enabled_ui(can_add_rt, |ui| primary_button(ui, p, "+ Allow Runtime"))
+                    .inner
+                    .clicked()
+                {
+                    let raw_id_src = if state.runtime_preset_draft == "custom" {
+                        state.runtime_label_draft.trim()
+                    } else {
+                        state.runtime_preset_draft.trim()
+                    };
+                    let clean_id: String = raw_id_src
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric() {
+                                c.to_ascii_lowercase()
+                            } else {
+                                '_'
+                            }
+                        })
+                        .collect::<String>()
+                        .trim_matches('_')
+                        .to_string();
+                    let final_id = if clean_id.is_empty() {
+                        "runtime".into()
+                    } else {
+                        clean_id
+                    };
+                    let lbl = state.runtime_label_draft.trim().to_string();
+                    let exe = state.runtime_exec_draft.trim().to_string();
+                    backend.update_settings(move |s| {
+                        if let Some(existing) =
+                            s.allowed_runtimes.iter_mut().find(|r| r.id == final_id)
+                        {
+                            existing.label = lbl;
+                            existing.executable = exe;
+                            existing.enabled = true;
+                        } else {
+                            s.allowed_runtimes.push(AllowedRuntimeEntry {
+                                id: final_id,
+                                label: lbl,
+                                executable: exe,
+                                enabled: true,
+                            });
+                        }
+                    });
+                    state.set_toast("Added opt-in allowed CLI runtime.", false);
+                }
+            });
         },
     );
 

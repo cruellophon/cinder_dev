@@ -223,6 +223,7 @@ async fn spawn_and_initialize_stdio_session(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    crate::scrub_sensitive_child_env(&mut cmd);
 
     for (k, v) in &entry.env {
         cmd.env(k, v);

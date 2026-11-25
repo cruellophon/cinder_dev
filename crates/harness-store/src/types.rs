@@ -597,6 +597,15 @@ impl Default for OrchestratorConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AllowedRuntimeEntry {
+    pub id: String,
+    pub label: String,
+    pub executable: String,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub privacy_mode: PrivacyMode,
@@ -636,6 +645,9 @@ pub struct AppSettings {
     /// User-assigned custom display aliases mapped by model ID.
     #[serde(default)]
     pub model_aliases: std::collections::BTreeMap<String, String>,
+    /// Explicit user opt-in CLI runtimes (Posture 2: disabled unless added and toggled on).
+    #[serde(default)]
+    pub allowed_runtimes: Vec<AllowedRuntimeEntry>,
 }
 
 impl AppSettings {

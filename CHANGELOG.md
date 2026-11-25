@@ -4,6 +4,29 @@ All notable changes to **Cinder** are documented in this file.
 
 ---
 
+## [0.6.1] — Security Audit Hardening, Session Scratchpads, Opt-In Local Runtimes & Telemetry Fixes — 2026-11-25
+
+### Security
+- **Dangling Symlink Sandbox Block (`harness-tools/src/sandbox.rs`):** Walked every path component via `std::fs::symlink_metadata` in `resolve_workspace_path` and `relative_to_workspace` so dangling symlinks pointing outside the workspace/scratchpad cannot be used to create external files.
+- **Shell `SafeReadOnly` & Config-Write Escalation (`harness-tools/src/{risk.rs,git.rs}`):** Blocked PowerShell subexpression/metacharacters (`$`, `( )`, `[ ]`, `{ }`, `%`, `@`, `~`) and `cargo check` / `echo` / `Write-Output` from `SafeReadOnly`; confined read-only `dir`/`ls`/`python -m py_compile` arguments against `..` and external drive/root paths; escalated edits to `.git/*`, `.cargo/config*`, `.vscode/tasks.json`/`launch.json`/`settings.json`, `mcp_config.json`, and shell profiles to `HighRiskDestructive`; added `state.json`, `.mcp.json`, `mcp_config.json`, `.git-credentials`, `auth.json`, and `hosts.yml` to the secret guard; and hardened internal Git probes with `-c core.fsmonitor=false -c protocol.file.allow=never`.
+- **HTTP Redirect, `StrictLocal` & DNS SSRF Guards (`harness-net`, `harness-tools/src/lib.rs`):** Attached dynamic `PrivacyMode`-aware HTTP redirect validation on `NetworkGate` blocking loopback↔external escapes and `StrictLocal` external redirects; upgraded `fetch_url` to block CGNAT (`100.64.0.0/10`) and `0.0.0.0/8`, resolve DNS (`lookup_host`) ahead of requests, and manually re-validate every redirect hop via `request_no_redirect`.
+- **MCP Auto-Enable, Archive Extraction, Env Scrubbing & File Opening (`harness-tools/src/{packages.rs,mcp.rs,native_dialogs.rs}`, `harness-core/src/orchestrator.rs`, `harness-store`):** Imported workspace `.agents/mcp_config.json` servers disabled by default; aligned Orchestrator Phase 2 MCP tool approval prompts; replaced `tar::Archive::unpack` in `extract_targz_preserving_tree` with traversal/hardlink/escaping-symlink validation; scrubbed API/cloud token env vars (`scrub_sensitive_child_env`) from shell and MCP stdio processes; replaced `cmd /C start` in `open_with_system_default` with symlink-safe, extension-filtered (`is_dangerous_executable_extension`) `ShellExecuteW`; and enforced `0o700`/`0o600` Unix permissions on `state.json`.
+
+### Added
+- **Sandboxed Standalone Session Scratchpads & One-Click `Save As…` (`harness-store`, `harness-core`, `cinder-gui`):**
+  - Auto-provisioned isolated per-session scratchpads (`BumboPaths::session_scratch_dir`) when a conversation has no project folder attached, allowing `Auto` / `Agent` modes to write real, saveable files while forcing manual approval for scratchpad shell commands.
+  - Added the in-chat **SCRATCHPAD** strip (`Save As…`, `Reveal Folder`, `Export to Folder…`) and **`Save As…`** buttons directly on every Markdown code block (`infer_code_snippet_filename`, native `pick_save_file` dialog).
+- **Opt-In Allowed CLI Runtimes — Posture 2 (`harness-tools/src/software.rs`, `harness-store`, `harness-core`, `cinder-gui/src/settings.rs`):**
+  - Added **Settings → Privacy, Security & Orchestrator → Allowed CLI Runtimes (Opt-In · Posture 2)** (`AllowedRuntimeEntry`, disabled/empty by default, preset + custom executable support).
+  - Enabled runtimes expose `run_local_software` (direct OS `argv` without a shell, inline-eval flags blocked, relative workspace arg validation, always `HighRiskDestructive` manual approval, minimal `env_clear()` environment, Windows Job Object `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` / Unix process-group timeout termination, and zero host fingerprinting in cloud system prompts).
+
+### Fixed
+- **Code Block Default Height & Minimum Resize (`cinder-gui/src/markdown.rs`):** Increased default code block height cap from `260 px` to `420 px` and minimum height from `72 px` to `140 px` so multi-line snippets render comfortably.
+- **Local Model `0 tok` Telemetry (`harness-providers/src/lib.rs`):** Parsed `llama-server` `timings.prompt_n` / `timings.predicted_n` and `prompt_eval_count` / `eval_count` during streaming and JSON responses, enabled `stream_options.include_usage` for `local_inference`, and added char-based token estimation fallback when local servers omit usage metadata.
+- **Duplicate Vision Sub-Agent Breadcrumb (`harness-core/src/lib.rs`, `cinder-gui/src/chat.rs`):** Fixed `vision-subagent (vision-subagent)` duplicate trace labels when sub-agent execution fails or omits a model ID.
+
+---
+
 ## [0.6.0] — Streaming Everywhere, Git & Terminal Workbench, Model Consistency & Turn-Scoped Fallback — 2026-11-23
 
 ### Added

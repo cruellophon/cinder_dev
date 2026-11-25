@@ -2333,10 +2333,89 @@ fn extract_zip_preserving_tree(zip_path: &Path, dest_dir: &Path) -> anyhow::Resu
 
 fn extract_targz_preserving_tree(archive_path: &Path, dest_dir: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dest_dir)?;
+    let canon_dest = crate::sandbox::strip_verbatim_prefix(
+        std::fs::canonicalize(dest_dir).unwrap_or_else(|_| dest_dir.to_path_buf()),
+    );
     let file = std::fs::File::open(archive_path)?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
-    archive.unpack(dest_dir)?;
+    for entry_res in archive.entries()? {
+        let mut entry = entry_res?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_hard_link() {
+            anyhow::bail!("Blocked unsafe hard link inside tar archive");
+        }
+        let rel_path = entry.path()?.into_owned();
+        if rel_path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            anyhow::bail!(
+                "Blocked path traversal entry inside tar archive: '{}'",
+                rel_path.display()
+            );
+        }
+        let out_path = canon_dest.join(&rel_path);
+        if entry_type.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+            continue;
+        }
+        if entry_type.is_symlink() {
+            let Ok(Some(link_target)) = entry.link_name() else {
+                continue;
+            };
+            if link_target.is_absolute()
+                || link_target
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                anyhow::bail!(
+                    "Blocked unsafe symlink target '{}' in tar archive",
+                    link_target.display()
+                );
+            }
+            let resolved_target = out_path
+                .parent()
+                .map(|p| p.join(link_target.as_ref()))
+                .unwrap_or_else(|| link_target.to_path_buf());
+            if !resolved_target.starts_with(&canon_dest) {
+                anyhow::bail!(
+                    "Blocked escaping symlink '{}' -> '{}' in tar archive",
+                    rel_path.display(),
+                    link_target.display()
+                );
+            }
+            #[cfg(unix)]
+            {
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let _ = std::fs::remove_file(&out_path);
+                let _ = std::os::unix::fs::symlink(link_target.as_ref(), &out_path);
+            }
+            continue;
+        }
+        if !entry_type.is_file() {
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        #[cfg(unix)]
+        let mode = entry.header().mode().ok();
+        let _ = std::fs::remove_file(&out_path);
+        let mut out_file = std::fs::File::create(&out_path)?;
+        std::io::copy(&mut entry, &mut out_file)?;
+        #[cfg(unix)]
+        if let Some(m) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(m & 0o777));
+        }
+    }
     Ok(())
 }
 
@@ -2403,6 +2482,8 @@ pub fn sync_from_antigravity(
         if !cfg_path.exists() {
             continue;
         }
+        let from_workspace =
+            !workspace_root.as_os_str().is_empty() && cfg_path.starts_with(workspace_root);
         scanned_mcp_files.push(cfg_path.to_string_lossy().to_string());
         if let Ok(raw) = std::fs::read_to_string(&cfg_path) {
             if let Ok(val) = serde_json::from_str::<Value>(&raw) {
@@ -2418,7 +2499,7 @@ pub fn sync_from_antigravity(
                                 name: name.clone(),
                                 transport: "http".into(),
                                 target: url.to_string(),
-                                enabled: true,
+                                enabled: !from_workspace,
                                 command: String::new(),
                                 args: Vec::new(),
                                 env: HashMap::new(),
@@ -2458,7 +2539,7 @@ pub fn sync_from_antigravity(
                                 name: name.clone(),
                                 transport: "stdio".into(),
                                 target,
-                                enabled: true,
+                                enabled: !from_workspace,
                                 command: cmd.to_string(),
                                 args,
                                 env,

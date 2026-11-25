@@ -82,17 +82,22 @@ pub fn relative_to_workspace(workspace_root: &Path, entry_path: &Path) -> Option
         let mut tail: Vec<std::ffi::OsString> = Vec::new();
         let mut cur: Option<&Path> = Some(clean_entry.as_path());
         while let Some(probe) = cur {
-            if probe.exists() {
-                if let Ok(canon_anc) = std::fs::canonicalize(probe) {
-                    let mut reconstructed = strip_verbatim_prefix(canon_anc);
-                    for part in tail.iter().rev() {
-                        reconstructed.push(part);
-                    }
-                    if let Ok(rel) = reconstructed.strip_prefix(cr_clean) {
-                        return Some(rel.to_string_lossy().replace('\\', "/"));
-                    }
+            if let Ok(meta) = std::fs::symlink_metadata(probe) {
+                if meta.file_type().is_symlink() && !probe.exists() {
+                    return None;
                 }
-                break;
+                if probe.exists() {
+                    if let Ok(canon_anc) = std::fs::canonicalize(probe) {
+                        let mut reconstructed = strip_verbatim_prefix(canon_anc);
+                        for part in tail.iter().rev() {
+                            reconstructed.push(part);
+                        }
+                        if let Ok(rel) = reconstructed.strip_prefix(cr_clean) {
+                            return Some(rel.to_string_lossy().replace('\\', "/"));
+                        }
+                    }
+                    break;
+                }
             }
             if let Some(name) = probe.file_name() {
                 tail.push(name.to_os_string());
@@ -496,8 +501,17 @@ pub fn resolve_workspace_path(workspace_root: &Path, user_path: &str) -> anyhow:
 
     let mut probe = joined.as_path();
     let existing = loop {
-        if probe.exists() {
-            break std::fs::canonicalize(probe)?;
+        if let Ok(meta) = std::fs::symlink_metadata(probe) {
+            if meta.file_type().is_symlink() {
+                if !probe.exists() {
+                    anyhow::bail!(
+                        "Sandbox policy blocked dangling symlink in workspace: '{user_path}'"
+                    );
+                }
+            }
+            if probe.exists() {
+                break std::fs::canonicalize(probe)?;
+            }
         }
         match probe.parent() {
             Some(p) => probe = p,
@@ -514,6 +528,30 @@ pub fn resolve_workspace_path(workspace_root: &Path, user_path: &str) -> anyhow:
             "Sandbox policy blocked access outside workspace '{}': '{user_path}'",
             clean_canon_root.display()
         );
+    }
+
+    // Verify no intermediate path component along `joined` is an escaping/dangling symlink.
+    if let Some(rel) = relative_to_workspace(&clean_canon_root, &joined) {
+        let mut walk = clean_canon_root.clone();
+        for seg in rel.split(['/', '\\']).filter(|s| !s.is_empty()) {
+            walk.push(seg);
+            if let Ok(meta) = std::fs::symlink_metadata(&walk) {
+                if meta.file_type().is_symlink() {
+                    if !walk.exists() {
+                        anyhow::bail!(
+                            "Sandbox policy blocked dangling symlink in workspace: '{user_path}'"
+                        );
+                    }
+                    let target_canon = strip_verbatim_prefix(std::fs::canonicalize(&walk)?);
+                    if !target_canon.starts_with(&clean_canon_root) {
+                        anyhow::bail!(
+                            "Sandbox policy blocked symlink outside workspace '{}': '{user_path}'",
+                            clean_canon_root.display()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     if candidate.is_absolute() {
@@ -852,6 +890,30 @@ mod tests {
             assert!(
                 resolve_workspace_path(&ws, "escape_link.txt").is_err(),
                 "symlink pointing outside workspace must be rejected"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_workspace_path_blocks_dangling_symlinks_pointing_outside_workspace() {
+        let base =
+            std::env::temp_dir().join(format!("cinder_dangling_symlink_{}", uuid::Uuid::new_v4()));
+        let ws = base.join("ws");
+        let outside_nonexistent = base.join("outside_missing.txt");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let link = ws.join("dangling.txt");
+        #[cfg(unix)]
+        let link_res = std::os::unix::fs::symlink(&outside_nonexistent, &link);
+        #[cfg(windows)]
+        let link_res = std::os::windows::fs::symlink_file(&outside_nonexistent, &link);
+
+        if link_res.is_ok() {
+            assert!(
+                resolve_workspace_path(&ws, "dangling.txt").is_err(),
+                "dangling symlink pointing outside workspace must be rejected"
             );
         }
 

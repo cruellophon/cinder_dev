@@ -226,6 +226,58 @@ pub fn render_chat_column(
         });
     });
 
+    if is_standalone && !snap.scratch_files.is_empty() {
+        Frame::new()
+            .fill(p.bg_sidebar)
+            .inner_margin(Margin::symmetric(14, 5))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    badge(ui, "SCRATCHPAD", p.amber, p.bg_card);
+                    for f in &snap.scratch_files {
+                        if ghost_button(
+                            ui,
+                            p,
+                            egui::RichText::new(format!("{} ↓", f.rel_path))
+                                .small()
+                                .monospace()
+                                .color(p.text),
+                        )
+                        .on_hover_text("Save copy of this scratchpad file to disk")
+                        .clicked()
+                        {
+                            backend.save_scratch_file_as(sess.id.clone(), f.rel_path.clone());
+                        }
+                    }
+                    if ghost_button(
+                        ui,
+                        p,
+                        egui::RichText::new("Reveal Folder").small().color(p.muted),
+                    )
+                    .on_hover_text("Open session scratchpad folder in file manager")
+                    .clicked()
+                    {
+                        backend.reveal_scratch_dir(sess.id.clone());
+                    }
+                    if ghost_button(
+                        ui,
+                        p,
+                        egui::RichText::new("Export to Folder…")
+                            .small()
+                            .color(p.amber),
+                    )
+                    .on_hover_text("Copy scratchpad files into a folder and attach as project workspace")
+                    .clicked()
+                    {
+                        backend.export_scratch_to_workspace(sess.id.clone());
+                    }
+                });
+            });
+        let y = ui.cursor().top();
+        ui.painter()
+            .hline(ui.max_rect().x_range(), y, Stroke::new(1.0_f32, p.border));
+    }
+
     // Centered readable column metrics; dock bottom banners & composer before message stream
     let panel_w = ui.max_rect().width().max(280.0);
     let col_w = (panel_w - 32.0).clamp(240.0, 800.0);
@@ -930,7 +982,15 @@ pub fn render_chat_column(
                                     let trace: Vec<String> = msg
                                         .orchestrator_phases
                                         .iter()
-                                        .map(|ph| format!("{} ({})", ph.phase, ph.model_id))
+                                        .map(|ph| {
+                                            if ph.model_id.trim().is_empty()
+                                                || ph.model_id == ph.phase
+                                            {
+                                                ph.phase.clone()
+                                            } else {
+                                                format!("{} ({})", ph.phase, ph.model_id)
+                                            }
+                                        })
                                         .collect();
                                     ui.label(
                                         egui::RichText::new(trace.join(" → "))

@@ -27,15 +27,16 @@ use harness_providers::{
     ProviderMessage, ToolCallRequest, ToolSpec,
 };
 use harness_store::{
-    AgentMode, BumboStore, ChatMessage, CompareResult, FallbackPolicy, MediaAttachment,
-    OrchestratorPhaseRecord, PendingModelFallback, PendingToolApproval, PendingUserQuestion,
-    PlanArtifact, PlanStatus, PlanStep, RiskTier, Session, SessionArtifact, ToolCallRecord,
+    AgentMode, AllowedRuntimeEntry, BumboStore, ChatMessage, CompareResult, FallbackPolicy,
+    MediaAttachment, OrchestratorPhaseRecord, PendingModelFallback, PendingToolApproval,
+    PendingUserQuestion, PlanArtifact, PlanStatus, PlanStep, RiskTier, Session, SessionArtifact,
+    ToolCallRecord,
 };
 use harness_tools::{
     apply_file_change, call_mcp_tool, classify_tool_risk_with_context, discover_enabled_mcp_tools,
-    execute_tool_with_policy, extract_pdf_file_text, filter_tools_by_modules, mcp_tools_to_specs,
-    prepare_file_change, resolve_workspace_path, sanitize_mcp_slug, tool_specs,
-    ToolExecutionResult,
+    execute_allowed_runtime, execute_tool_with_policy, extract_pdf_file_text,
+    filter_tools_by_modules, mcp_tools_to_specs, prepare_file_change, resolve_workspace_path,
+    run_local_software_spec, sanitize_mcp_slug, tool_specs, ToolExecutionResult,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -917,6 +918,58 @@ pub(crate) fn build_system_prompt(
     prompt
 }
 
+pub fn resolve_session_workspace_root(
+    store: &BumboStore,
+    session_id: &str,
+    workspace_path: &str,
+) -> (PathBuf, bool) {
+    let trimmed = workspace_path.trim();
+    if trimmed.is_empty() {
+        let scratch = store.paths().session_scratch_dir(session_id);
+        let _ = std::fs::create_dir_all(&scratch);
+        return (scratch, true);
+    }
+    let pb = PathBuf::from(trimmed);
+    let is_scratch = store.paths().is_scratch_path(&pb);
+    (pb, is_scratch)
+}
+
+pub(crate) fn append_scratchpad_guidance(
+    prompt: &mut String,
+    is_scratchpad: bool,
+    workspace_root: &Path,
+) {
+    if !is_scratchpad {
+        return;
+    }
+    prompt.push_str(&format!(
+        "\n\nSession Scratchpad Mode ({}): Although no external project folder is attached, this conversation has an isolated sandboxed scratchpad directory. When the user asks for code, scripts, notes, or files (e.g. `aufgaben.rkt`), ALWAYS create the real file inside this scratchpad using `write_file` / `edit_file` so the user gets ready-to-save files directly instead of saying you cannot write to disk or giving copy-paste instructions.",
+        workspace_root.display()
+    ));
+}
+
+pub(crate) fn append_allowed_runtimes_guidance(
+    prompt: &mut String,
+    is_local: bool,
+    allowed: &[AllowedRuntimeEntry],
+) {
+    // Never leak host runtime names/paths into cloud prompts.
+    if !is_local {
+        return;
+    }
+    let enabled: Vec<&str> = allowed
+        .iter()
+        .filter(|r| r.enabled && !r.id.trim().is_empty())
+        .map(|r| r.id.as_str())
+        .collect();
+    if !enabled.is_empty() {
+        prompt.push_str(&format!(
+            "\nOpt-in local CLI runtimes enabled for `run_local_software` (each call requires user approval): {}.",
+            enabled.join(", ")
+        ));
+    }
+}
+
 fn append_hybrid_guidance(
     prompt: &mut String,
     allow_web: bool,
@@ -1321,7 +1374,7 @@ pub(crate) async fn handle_delegate_vision_tool(
         phase: "vision-subagent".into(),
         model_id: used_model
             .clone()
-            .unwrap_or_else(|| "vision-subagent".into()),
+            .unwrap_or_else(|| "unavailable".into()),
         summary: format!(
             "Inspected {} image(s)",
             if image_paths.is_empty() {
@@ -1580,8 +1633,10 @@ pub async fn run_turn(
         user_text,
     );
     let effective_mode = skill_mode.unwrap_or(mode);
+    let (effective_ws_root, is_scratchpad) =
+        resolve_session_workspace_root(ctx.store, session_id, &workspace_path);
     let (attached_ctx, prompt_images) = extract_attachment_context_and_images(
-        Path::new(&workspace_path),
+        &effective_ws_root,
         &attached_files,
         &attachments,
     );
@@ -1703,7 +1758,7 @@ pub async fn run_turn(
         let res = run_orchestrator_turn(
             ctx,
             session_id,
-            Path::new(&workspace_path),
+            &effective_ws_root,
             &prompt_with_context,
             history_msgs,
             attached_files,
@@ -1764,30 +1819,24 @@ pub async fn run_turn(
     }
 
     let initial_loop_mode = if effective_mode == AgentMode::Auto {
-        if workspace_path.trim().is_empty() {
-            mode_phases.push(OrchestratorPhaseRecord {
-                phase: "auto → Chat (standalone)".into(),
-                model_id: model_id.to_string(),
-                summary: "Standalone one-off conversation (no workspace attached).".into(),
-                latency_ms: 0,
-                tokens: 0,
-            });
-            AgentMode::Chat
+        let (posture, reason) = classify_auto_posture(
+            &expanded_text,
+            &attached_files,
+            active_plan.as_ref(),
+        );
+        let phase_lbl = if is_scratchpad {
+            format!("auto → {} (scratchpad)", mode_label(posture))
         } else {
-            let (posture, reason) = classify_auto_posture(
-                &expanded_text,
-                &attached_files,
-                active_plan.as_ref(),
-            );
-            mode_phases.push(OrchestratorPhaseRecord {
-                phase: format!("auto → {}", mode_label(posture)),
-                model_id: model_id.to_string(),
-                summary: reason.into(),
-                latency_ms: 0,
-                tokens: 0,
-            });
-            posture
-        }
+            format!("auto → {}", mode_label(posture))
+        };
+        mode_phases.push(OrchestratorPhaseRecord {
+            phase: phase_lbl,
+            model_id: model_id.to_string(),
+            summary: reason.into(),
+            latency_ms: 0,
+            tokens: 0,
+        });
+        posture
     } else {
         effective_mode
     };
@@ -1796,7 +1845,7 @@ pub async fn run_turn(
     let res = run_agent_loop(
         ctx,
         session_id,
-        Path::new(&workspace_path),
+        &effective_ws_root,
         model_id,
         initial_loop_mode,
         allow_web,
@@ -2014,18 +2063,18 @@ pub async fn resolve_pending_approval(
     let checkpoint_id = Uuid::new_v4().to_string();
 
     let exec_res = if approve {
-        execute_tool_with_checkpoint(
-            ctx,
-            session_id,
-            &checkpoint_id,
-            &pending.tool_name,
-            &args,
-            Path::new(&workspace_path),
-            &snapshot.settings.api_keys.brave_search_api_key,
-            &pending.tool_name,
-            !pending.model_id.starts_with("local::"),
-        )
-        .await
+    execute_tool_with_checkpoint(
+        ctx,
+        session_id,
+        &checkpoint_id,
+        &pending.tool_name,
+        &args,
+        &resolve_session_workspace_root(ctx.store, session_id, &workspace_path).0,
+        &snapshot.settings.api_keys.brave_search_api_key,
+        &pending.tool_name,
+        !pending.model_id.starts_with("local::"),
+    )
+    .await
     } else {
         ToolExecutionResult {
             output: "User rejected this tool action. Explain or propose an alternative.".into(),
@@ -2070,10 +2119,12 @@ pub async fn resolve_pending_approval(
         .max_autonomous_steps
         .clamp(2, 64);
     let next_max_steps = configured_steps.max(pending.step_index + 2);
+    let (effective_ws_root, _) =
+        resolve_session_workspace_root(ctx.store, session_id, &workspace_path);
     let res = run_agent_loop(
         ctx,
         session_id,
-        Path::new(&workspace_path),
+        &effective_ws_root,
         &pending.model_id,
         mode,
         allow_web,
@@ -2269,10 +2320,12 @@ pub async fn answer_pending_question(
             )
             .await;
 
+        let (effective_ws_root, _) =
+            resolve_session_workspace_root(ctx.store, session_id, &workspace_path);
         let res = run_agent_loop(
             ctx,
             session_id,
-            Path::new(&workspace_path),
+            &effective_ws_root,
             &pq.model_id,
             mode,
             allow_web,
@@ -2340,10 +2393,12 @@ pub async fn answer_pending_question(
 
     let allow_web = ctx.gate.mode() == PrivacyMode::Hybrid;
     let next_max_steps = configured_steps.max(pq.step_index + 2);
+    let (effective_ws_root, _) =
+        resolve_session_workspace_root(ctx.store, session_id, &workspace_path);
     let res = run_agent_loop(
         ctx,
         session_id,
-        Path::new(&workspace_path),
+        &effective_ws_root,
         &pq.model_id,
         mode,
         allow_web,
@@ -2440,10 +2495,12 @@ pub async fn resolve_pending_fallback(
         })
         .await?;
 
+    let (effective_ws_root, _) =
+        resolve_session_workspace_root(ctx.store, session_id, &workspace_path);
     let res = run_agent_loop(
         ctx,
         session_id,
-        Path::new(&workspace_path),
+        &effective_ws_root,
         &target_model,
         pf.mode,
         allow_web,
@@ -2840,6 +2897,19 @@ pub(crate) async fn execute_tool_with_checkpoint(
         };
     }
 
+    if tool_name == "run_local_software" {
+        let allowed = ctx.store.snapshot().await.settings.allowed_runtimes;
+        return match execute_allowed_runtime(workspace_root, &allowed, args).await {
+            Ok(ok) => ok,
+            Err(e) => ToolExecutionResult {
+                output: format!("Tool error ({tool_name}): {e}"),
+                diff: None,
+                file_path: None,
+                is_error: true,
+            },
+        };
+    }
+
     execute_tool_with_policy(
         workspace_root,
         ctx.gate,
@@ -2894,12 +2964,20 @@ async fn run_agent_loop(
     } else {
         None
     };
+    let is_scratchpad = ctx.store.paths().is_scratch_path(workspace_root);
+    let runtime_spec = run_local_software_spec(&settings.allowed_runtimes);
     let mut base_prompt = build_system_prompt(
         workspace_root,
         current_mode,
         active_model_id.starts_with("local::"),
         active_plan.as_ref(),
         &custom_sys_prompt,
+    );
+    append_scratchpad_guidance(&mut base_prompt, is_scratchpad, workspace_root);
+    append_allowed_runtimes_guidance(
+        &mut base_prompt,
+        active_model_id.starts_with("local::"),
+        &settings.allowed_runtimes,
     );
     append_hybrid_guidance(
         &mut base_prompt,
@@ -2923,6 +3001,9 @@ async fn run_agent_loop(
         let mut s = active_tools_for_context(current_mode, allow_web, &enabled_modules, has_workspace);
         if has_workspace && !matches!(current_mode, AgentMode::Chat | AgentMode::Compare) {
             s.extend(mcp_specs.clone());
+            if let Some(ref rt_spec) = runtime_spec {
+                s.push(rt_spec.clone());
+            }
         }
         s
     } else {
@@ -3485,6 +3566,12 @@ async fn run_agent_loop(
                     active_plan.as_ref(),
                     &custom_sys_prompt,
                 );
+                append_scratchpad_guidance(&mut base_next, is_scratchpad, workspace_root);
+                append_allowed_runtimes_guidance(
+                    &mut base_next,
+                    active_model_id.starts_with("local::"),
+                    &settings.allowed_runtimes,
+                );
                 append_hybrid_guidance(
                     &mut base_next,
                     allow_web,
@@ -3502,6 +3589,9 @@ async fn run_agent_loop(
                 );
                 if has_workspace && !matches!(current_mode, AgentMode::Chat | AgentMode::Compare) {
                     current_specs.extend(mcp_specs.clone());
+                    if let Some(ref rt_spec) = runtime_spec {
+                        current_specs.push(rt_spec.clone());
+                    }
                 }
 
                 let _ = ctx
@@ -3761,7 +3851,9 @@ async fn run_agent_loop(
                 RiskTier::HighRiskDestructive => true,
                 RiskTier::WorkspaceMutation => match tc.name.as_str() {
                     "write_file" | "edit_file" => !(settings.auto_approve_edits || has_approved_plan),
-                    "run_command" | "verify_workspace" => !settings.auto_approve_commands,
+                    "run_command" | "verify_workspace" => {
+                        is_scratchpad || !settings.auto_approve_commands
+                    }
                     name if name.starts_with("mcp__") => !settings.auto_approve_commands,
                     _ => false,
                 },
@@ -5365,6 +5457,49 @@ mod tests {
                     .unwrap();
             assert_eq!(picked_local, "local::qwen3.5:9b");
         });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scratchpad_and_runtime_guidance_isolate_standalone_and_omit_cloud_fingerprint() {
+        use harness_store::{AllowedRuntimeEntry, BumboPaths, BumboStore};
+
+        let dir = std::env::temp_dir().join(format!("cinder_scratch_test_{}", Uuid::new_v4()));
+        let paths = BumboPaths {
+            app_data_dir: dir.clone(),
+            engines_dir: dir.join("engines"),
+            state_file: dir.join("state.json"),
+            default_vault_dir: dir.join("models"),
+        };
+        let store = BumboStore::init(paths).unwrap();
+
+        let (ws_root, is_scratch) = resolve_session_workspace_root(&store, "sess-42", "");
+        assert!(is_scratch);
+        assert!(ws_root.is_dir());
+        assert!(store.paths().is_scratch_path(&ws_root));
+
+        let (regular_ws, regular_scratch) =
+            resolve_session_workspace_root(&store, "sess-42", &dir.join("repo").to_string_lossy());
+        assert!(!regular_scratch);
+        assert_eq!(regular_ws, dir.join("repo"));
+
+        let runtimes = vec![AllowedRuntimeEntry {
+            id: "racket".into(),
+            label: "Racket".into(),
+            executable: "racket".into(),
+            enabled: true,
+        }];
+        let mut cloud_prompt = String::new();
+        append_allowed_runtimes_guidance(&mut cloud_prompt, false, &runtimes);
+        assert!(
+            cloud_prompt.is_empty(),
+            "cloud system prompt must not leak local runtime list"
+        );
+
+        let mut local_prompt = String::new();
+        append_allowed_runtimes_guidance(&mut local_prompt, true, &runtimes);
+        assert!(local_prompt.contains("racket"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

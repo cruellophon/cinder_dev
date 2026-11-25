@@ -924,12 +924,12 @@ pub fn render_markdown(
                 let line_count = code.lines().count().max(1);
                 let font_size = (p.base_font_size - 1.0).max(11.0);
                 let (default_h, natural_h) =
-                    code_box_default_height(line_count, font_size, 260.0, 72.0, 960.0);
+                    code_box_default_height(line_count, font_size, 420.0, 140.0, 960.0);
                 let size_id = ui.make_persistent_id(("md_code_size", idx, lang.as_str(), code.len()));
                 let (mut cur_h, mut user_resized) = ui
                     .data(|d| d.get_temp::<(f32, bool)>(size_id))
                     .unwrap_or((default_h, false));
-                cur_h = cur_h.clamp(72.0, 960.0);
+                cur_h = cur_h.clamp(140.0, 960.0);
 
                 Frame::new()
                     .fill(p.bg_sidebar)
@@ -960,6 +960,22 @@ pub fn render_markdown(
                                 if ghost_button(ui, p, copy_rt).clicked() {
                                     copy_to_clipboard(ui.ctx(), code);
                                     mark_copied_feedback(ui.ctx(), copy_id);
+                                }
+                                if ghost_button(
+                                    ui,
+                                    p,
+                                    egui::RichText::new("Save As…").small().color(p.muted),
+                                )
+                                .on_hover_text("Save this code block to disk")
+                                .clicked()
+                                {
+                                    let suggested = infer_code_snippet_filename(lang, code);
+                                    ui.ctx().data_mut(|d| {
+                                        d.insert_temp(
+                                            egui::Id::new("cinder_pending_save_code"),
+                                            (suggested, code.clone()),
+                                        );
+                                    });
                                 }
                                 if natural_h > default_h + 8.0 || user_resized {
                                     let is_expanded = cur_h > default_h + 8.0;
@@ -1036,7 +1052,7 @@ pub fn render_markdown(
                                 &mut user_resized,
                                 default_h,
                                 natural_h,
-                                72.0,
+                                140.0,
                                 960.0,
                                 ("md_code_handle", idx, lang.as_str(), code.len()),
                             );
@@ -1478,6 +1494,62 @@ pub fn highlight_code_job(code: &str, lang: &str, p: &CinderPalette) -> egui::te
     job
 }
 
+pub fn infer_code_snippet_filename(lang: &str, code: &str) -> String {
+    for line in code.lines().take(3) {
+        let trimmed = line.trim();
+        let comment_rest = trimmed
+            .strip_prefix(";;")
+            .or_else(|| trimmed.strip_prefix(';'))
+            .or_else(|| trimmed.strip_prefix("//"))
+            .or_else(|| trimmed.strip_prefix('#'))
+            .or_else(|| trimmed.strip_prefix("--"))
+            .or_else(|| trimmed.strip_prefix("/*").map(|s| s.trim_end_matches("*/")));
+        if let Some(rest) = comment_rest {
+            for tok in rest.split_whitespace() {
+                let clean = tok.trim_matches(|c: char| matches!(c, ':' | '`' | '\'' | '"' | '(' | ')'));
+                if let Some((stem, ext)) = clean.rsplit_once('.') {
+                    if !stem.is_empty()
+                        && stem.len() <= 48
+                        && !ext.is_empty()
+                        && ext.len() <= 6
+                        && stem
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                    {
+                        return clean.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    let ext = match lang.trim().to_ascii_lowercase().as_str() {
+        "racket" | "rkt" | "scheme" => "rkt",
+        "python" | "py" => "py",
+        "rust" | "rs" => "rs",
+        "javascript" | "js" => "js",
+        "typescript" | "ts" => "ts",
+        "c" => "c",
+        "cpp" | "c++" | "cxx" => "cpp",
+        "java" => "java",
+        "go" => "go",
+        "html" => "html",
+        "css" => "css",
+        "json" => "json",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "sql" => "sql",
+        "tex" | "latex" => "tex",
+        "typ" | "typst" => "typ",
+        "md" | "markdown" => "md",
+        "sh" | "bash" => "sh",
+        "ps1" | "powershell" => "ps1",
+        _ => "txt",
+    };
+    format!("snippet.{ext}")
+}
+
 pub fn code_box_default_height(
     line_count: usize,
     font_size: f32,
@@ -1692,6 +1764,15 @@ mod tests {
         let (d_huge, n_huge) = code_box_default_height(500, 12.0, 260.0, 72.0, 960.0);
         assert_eq!(d_huge, 260.0);
         assert_eq!(n_huge, 960.0);
+
+        assert_eq!(
+            infer_code_snippet_filename("racket", ";; aufgaben.rkt\n#lang racket\n"),
+            "aufgaben.rkt"
+        );
+        assert_eq!(
+            infer_code_snippet_filename("racket", "#lang racket\n(+ 1 2)"),
+            "snippet.rkt"
+        );
     }
 
     #[test]

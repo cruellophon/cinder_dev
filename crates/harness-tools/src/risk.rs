@@ -127,8 +127,34 @@ fn has_shell_metacharacters(cmd: &str) -> bool {
         || cmd.contains('`')
         || cmd.contains("$(")
         || cmd.contains("${")
+        || cmd.contains('$')
+        || cmd.contains('(')
+        || cmd.contains(')')
+        || cmd.contains('[')
+        || cmd.contains(']')
+        || cmd.contains('{')
+        || cmd.contains('}')
+        || cmd.contains('%')
+        || cmd.contains('@')
+        || cmd.contains('~')
         || cmd.contains('\n')
         || cmd.contains('\r')
+}
+
+fn are_readonly_path_args_confined(tokens: &[String], start_idx: usize) -> bool {
+    for tok in tokens.iter().skip(start_idx) {
+        if tok.starts_with('-') {
+            continue;
+        }
+        if tok.contains("..")
+            || tok.starts_with('/')
+            || tok.starts_with('\\')
+            || tok.contains(':')
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn segment_leading_programs(cmd: &str) -> Vec<String> {
@@ -194,18 +220,18 @@ fn is_safe_readonly_command(cmd_raw: &str) -> bool {
     let prog = normalize_program_name(first);
 
     match prog {
-        "dir" | "ls" | "pwd" | "get-childitem" | "gci" | "echo" | "write-output" => true,
+        "dir" | "ls" | "get-childitem" | "gci" => are_readonly_path_args_confined(&tokens, 1),
+        "pwd" => tokens.len() == 1,
         "git" => is_safe_readonly_git(&tokens),
-        "cargo" => match tokens.get(1).map(String::as_str) {
-            Some("check") | Some("metadata") => true,
-            Some("test") => tokens.iter().any(|t| t == "--no-run"),
-            _ => false,
-        },
         "python" | "python3" => {
             tokens.get(1).map(String::as_str) == Some("-m")
                 && tokens.get(2).map(String::as_str) == Some("py_compile")
+                && are_readonly_path_args_confined(&tokens, 3)
         }
-        "pytest" => tokens.iter().any(|t| t == "--collect-only"),
+        "pytest" => {
+            tokens.iter().any(|t| t == "--collect-only")
+                && are_readonly_path_args_confined(&tokens, 1)
+        }
         _ => false,
     }
 }
@@ -267,6 +293,12 @@ pub fn is_sensitive_secret_path(path: &str) -> bool {
             | "secrets.yml"
             | "secrets.toml"
             | "secrets.ini"
+            | "state.json"
+            | "mcp_config.json"
+            | ".mcp.json"
+            | ".git-credentials"
+            | "auth.json"
+            | "hosts.yml"
     ) {
         return true;
     }
@@ -327,6 +359,51 @@ pub fn classify_tool_risk_with_context(
     classify_tool_risk(tool_name, args)
 }
 
+pub fn is_high_risk_config_write_path(path: &str) -> bool {
+    let trimmed = path
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let norm = trimmed.trim_start_matches("./");
+    let fname = Path::new(norm)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(norm);
+
+    if norm.split('/').any(|seg| seg == ".git") || fname == ".gitmodules" {
+        return true;
+    }
+    if norm.ends_with(".cargo/config")
+        || norm.ends_with(".cargo/config.toml")
+        || matches!(fname, "rust-toolchain" | "rust-toolchain.toml")
+    {
+        return true;
+    }
+    if norm.ends_with(".vscode/tasks.json")
+        || norm.ends_with(".vscode/launch.json")
+        || norm.ends_with(".vscode/settings.json")
+    {
+        return true;
+    }
+    if matches!(
+        fname,
+        "mcp_config.json"
+            | ".mcp.json"
+            | ".bashrc"
+            | ".zshrc"
+            | ".profile"
+            | ".bash_profile"
+            | "profile.ps1"
+    ) {
+        return true;
+    }
+    false
+}
+
 pub fn classify_tool_risk(tool_name: &str, args: &Value) -> (RiskTier, String) {
     match tool_name {
         "list_dir" | "read_file" | "search_files" | "extract_pdf_text" | "propose_edit"
@@ -335,10 +412,40 @@ pub fn classify_tool_risk(tool_name: &str, args: &Value) -> (RiskTier, String) {
             RiskTier::SafeReadOnly,
             "Read-only / planning operation".into(),
         ),
-        "write_file" | "edit_file" => (
-            RiskTier::WorkspaceMutation,
-            "Modifies workspace file".into(),
-        ),
+        "write_file" | "edit_file" => {
+            for key in [
+                "path",
+                "file_path",
+                "filepath",
+                "file",
+                "filename",
+                "target_file",
+            ] {
+                if let Some(p) = args.get(key).and_then(|v| v.as_str()) {
+                    if is_high_risk_config_write_path(p) {
+                        return (
+                            RiskTier::HighRiskDestructive,
+                            format!(
+                                "Security Guard: modifying execution/hook config '{p}' always requires manual approval"
+                            ),
+                        );
+                    }
+                }
+            }
+            (
+                RiskTier::WorkspaceMutation,
+                "Modifies workspace file".into(),
+            )
+        }
+        "run_local_software" => {
+            let rt_id = args["runtime_id"].as_str().unwrap_or("runtime");
+            (
+                RiskTier::HighRiskDestructive,
+                format!(
+                    "Allowed Runtime '{rt_id}': mandatory user approval required before local execution"
+                ),
+            )
+        }
         "run_command" | "verify_workspace" => {
             let cmd_raw = args["command"].as_str().unwrap_or("");
             let cmd = cmd_raw.trim().to_ascii_lowercase();
@@ -441,12 +548,23 @@ mod tests {
             "ls -la",
             "dir",
             "pwd",
-            "cargo check",
-            "cargo test --workspace --no-run",
             "python -m py_compile main.py",
         ] {
             let (tier, _) = classify_tool_risk("run_command", &json!({ "command": cmd }));
             assert_eq!(tier, RiskTier::SafeReadOnly, "cmd={cmd}");
+        }
+
+        // Build-script / proc-macro / PowerShell subexpression / off-workspace path escapes must never be SafeReadOnly
+        for cmd in [
+            "cargo check",
+            "cargo test --workspace --no-run",
+            "echo [System.Diagnostics.Process]::Start('calc')",
+            "echo $env:PATH",
+            "dir C:\\Windows",
+            "ls ../secret",
+        ] {
+            let (tier, _) = classify_tool_risk("run_command", &json!({ "command": cmd }));
+            assert_ne!(tier, RiskTier::SafeReadOnly, "cmd={cmd}");
         }
 
         // Extra bypass checks: git --output, encoded/nested shells
@@ -500,5 +618,33 @@ mod tests {
         let (cloud_example, _) =
             classify_tool_risk_with_context("read_file", &json!({ "path": ".env.example" }), true);
         assert_eq!(cloud_example, RiskTier::SafeReadOnly);
+    }
+
+    #[test]
+    fn high_risk_config_write_guard_escalates_git_hooks_cargo_and_vscode_configs() {
+        for sensitive_cfg in [
+            ".git/hooks/pre-commit",
+            ".git/config",
+            ".cargo/config.toml",
+            ".vscode/tasks.json",
+            ".agents/mcp_config.json",
+            ".mcp.json",
+        ] {
+            let (tier, _) = classify_tool_risk(
+                "write_file",
+                &json!({ "path": sensitive_cfg, "content": "x" }),
+            );
+            assert_eq!(
+                tier,
+                RiskTier::HighRiskDestructive,
+                "expected HighRiskDestructive for {sensitive_cfg}"
+            );
+        }
+
+        let (normal, _) = classify_tool_risk(
+            "write_file",
+            &json!({ "path": "src/main.rs", "content": "fn main() {}" }),
+        );
+        assert_eq!(normal, RiskTier::WorkspaceMutation);
     }
 }

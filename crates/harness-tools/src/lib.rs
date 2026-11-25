@@ -5,6 +5,7 @@ pub mod packages;
 pub mod rag;
 pub mod risk;
 pub mod sandbox;
+pub mod software;
 
 pub use git::{
     find_git_root, inspect_git_diff_head, inspect_git_status, parse_git_status_porcelain_v1_branch,
@@ -15,7 +16,8 @@ pub use mcp::{
     namespaced_mcp_tool, probe_mcp_server, sanitize_mcp_slug, McpDiscoveredTool, McpProbeResult,
 };
 pub use native_dialogs::{
-    open_url_safely, open_with_system_default, pick_files, pick_folder, reveal_in_file_manager,
+    is_dangerous_executable_extension, open_url_safely, open_with_system_default, pick_files,
+    pick_folder, pick_save_file, reveal_in_file_manager,
 };
 pub use packages::{
     curated_dependency_allowlist, curated_plugin_catalog, export_antigravity_mcp_json,
@@ -31,12 +33,15 @@ pub use rag::{
 };
 pub use risk::{
     classify_tool_risk, classify_tool_risk_with_context, extract_tool_secret_path,
-    is_sensitive_secret_path,
+    is_high_risk_config_write_path, is_sensitive_secret_path,
 };
 pub use sandbox::{
     clean_latex_pdf_text, create_workspace_dir, create_workspace_file, delete_workspace_entry,
     extract_pdf_file_text, list_workspace_tree, relative_to_workspace, rename_workspace_entry,
     resolve_workspace_path, strip_verbatim_prefix, WorkspaceFileNode,
+};
+pub use software::{
+    execute_allowed_runtime, run_local_software_spec, runtime_presets, validate_runtime_args,
 };
 
 use harness_net::{NetworkGate, PrivacyMode};
@@ -1203,6 +1208,29 @@ fn spawn_pipe_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     });
 }
 
+/// Strip sensitive API tokens and cloud credentials from child process environments.
+pub fn scrub_sensitive_child_env(cmd: &mut tokio::process::Command) {
+    for var in [
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "BRAVE_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITLAB_TOKEN",
+        "NPM_TOKEN",
+        "PYPI_TOKEN",
+    ] {
+        cmd.env_remove(var);
+    }
+}
+
 async fn run_shell_command(
     workspace_root: &Path,
     args: &Value,
@@ -1241,6 +1269,7 @@ pub async fn run_shell_command_streaming(
         c
     };
     cmd.current_dir(&cwd);
+    scrub_sensitive_child_env(&mut cmd);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -1552,6 +1581,40 @@ fn format_web_search_hits(provider: &str, hits: &[(String, String, String)]) -> 
     )
 }
 
+pub fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            let is_this_network = octets[0] == 0; // 0.0.0.0/8
+            let is_cgnat = octets[0] == 100 && (octets[1] & 0xC0) == 64; // 100.64.0.0/10
+            let is_benchmark = octets[0] == 198 && (octets[1] & 0xFE) == 18; // 198.18.0.0/15
+            ipv4.is_loopback()
+                || ipv4.is_private()
+                || ipv4.is_link_local()
+                || ipv4.is_unspecified()
+                || ipv4.is_multicast()
+                || ipv4.is_broadcast()
+                || is_this_network
+                || is_cgnat
+                || is_benchmark
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            let segs = ipv6.segments();
+            let is_unique_local = (segs[0] & 0xfe00) == 0xfc00;
+            let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
+            let mapped_blocked = ipv6
+                .to_ipv4_mapped()
+                .is_some_and(|v4| is_non_public_ip(std::net::IpAddr::V4(v4)));
+            ipv6.is_loopback()
+                || ipv6.is_unspecified()
+                || ipv6.is_multicast()
+                || is_unique_local
+                || is_link_local
+                || mapped_blocked
+        }
+    }
+}
+
 fn validate_public_fetch_url(raw_url: &str) -> anyhow::Result<url::Url> {
     let cleaned = raw_url
         .trim()
@@ -1568,30 +1631,17 @@ fn validate_public_fetch_url(raw_url: &str) -> anyhow::Result<url::Url> {
     match parsed.host() {
         None => anyhow::bail!("URL has no host: '{raw_url}'"),
         Some(url::Host::Ipv4(ipv4)) => {
-            if ipv4.is_loopback()
-                || ipv4.is_private()
-                || ipv4.is_link_local()
-                || ipv4.is_unspecified()
-                || ipv4.is_multicast()
-            {
-                anyhow::bail!("Private, loopback, or link-local IPv4 targets are blocked: '{raw_url}'");
+            if is_non_public_ip(std::net::IpAddr::V4(ipv4)) {
+                anyhow::bail!(
+                    "Private, loopback, CGNAT, or link-local IPv4 targets are blocked: '{raw_url}'"
+                );
             }
         }
         Some(url::Host::Ipv6(ipv6)) => {
-            let segs = ipv6.segments();
-            let is_unique_local = (segs[0] & 0xfe00) == 0xfc00;
-            let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
-            let mapped_blocked = ipv6.to_ipv4_mapped().is_some_and(|v4| {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-            });
-            if ipv6.is_loopback()
-                || ipv6.is_unspecified()
-                || ipv6.is_multicast()
-                || is_unique_local
-                || is_link_local
-                || mapped_blocked
-            {
-                anyhow::bail!("Private, loopback, or link-local IPv6 targets are blocked: '{raw_url}'");
+            if is_non_public_ip(std::net::IpAddr::V6(ipv6)) {
+                anyhow::bail!(
+                    "Private, loopback, or link-local IPv6 targets are blocked: '{raw_url}'"
+                );
             }
         }
         Some(url::Host::Domain(domain)) => {
@@ -1606,6 +1656,29 @@ fn validate_public_fetch_url(raw_url: &str) -> anyhow::Result<url::Url> {
         }
     }
 
+    Ok(parsed)
+}
+
+async fn validate_and_resolve_public_url(raw_url: &str) -> anyhow::Result<url::Url> {
+    let parsed = validate_public_fetch_url(raw_url)?;
+    if let Some(url::Host::Domain(domain)) = parsed.host() {
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((domain, port))
+            .await
+            .map_err(|e| anyhow::anyhow!("DNS resolution failed for '{domain}': {e}"))?
+            .collect();
+        if addrs.is_empty() {
+            anyhow::bail!("DNS returned no addresses for '{domain}'.");
+        }
+        for addr in addrs {
+            if is_non_public_ip(addr.ip()) {
+                anyhow::bail!(
+                    "SSRF Guard blocked '{domain}': resolved to non-public IP '{}'",
+                    addr.ip()
+                );
+            }
+        }
+    }
     Ok(parsed)
 }
 
@@ -1874,7 +1947,7 @@ async fn run_fetch_url(gate: &NetworkGate, args: &Value) -> anyhow::Result<ToolE
 
     let raw_url = arg_str(args, &["url", "query", "href"])
         .ok_or_else(|| anyhow::anyhow!("Missing 'url' argument"))?;
-    let parsed = validate_public_fetch_url(raw_url)?;
+    let mut parsed = validate_and_resolve_public_url(raw_url).await?;
     let target_url = parsed.to_string();
 
     if let Some((kind, api_url)) = github_api_fast_path(&parsed) {
@@ -1888,19 +1961,40 @@ async fn run_fetch_url(gate: &NetworkGate, args: &Value) -> anyhow::Result<ToolE
         }
     }
 
-    let req = gate
-        .request(Method::GET, &target_url, "fetch_url")?
-        .header("User-Agent", "cinder-ide")
-        .header(
-            "Accept",
-            "text/html,text/plain,text/markdown,application/json;q=0.9",
-        );
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(15), req.send())
-        .await
-        .map_err(|_| anyhow::anyhow!("Fetching '{target_url}' timed out after 15s"))??;
+    let mut hops = 0usize;
+    let resp = loop {
+        let cur_url = parsed.to_string();
+        let req = gate
+            .request_no_redirect(Method::GET, &cur_url, "fetch_url")?
+            .header("User-Agent", "cinder-ide")
+            .header(
+                "Accept",
+                "text/html,text/plain,text/markdown,application/json;q=0.9",
+            );
+        let r = tokio::time::timeout(std::time::Duration::from_secs(15), req.send())
+            .await
+            .map_err(|_| anyhow::anyhow!("Fetching '{cur_url}' timed out after 15s"))??;
+        if r.status().is_redirection() {
+            if hops >= 5 {
+                anyhow::bail!("Fetching '{target_url}' exceeded maximum 5 redirects.");
+            }
+            let loc = r
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow::anyhow!("Redirect response missing Location header"))?;
+            let next_url = parsed
+                .join(loc.trim())
+                .map_err(|e| anyhow::anyhow!("Invalid redirect target '{loc}': {e}"))?;
+            parsed = validate_and_resolve_public_url(next_url.as_str()).await?;
+            hops += 1;
+            continue;
+        }
+        break r;
+    };
     let status = resp.status();
     if !status.is_success() {
-        anyhow::bail!("Fetching '{target_url}' returned HTTP {status}");
+        anyhow::bail!("Fetching '{}' returned HTTP {status}", parsed.as_str());
     }
 
     let content_type = resp
@@ -2403,6 +2497,8 @@ mod upload_tests {
             "http://192.168.1.1/admin",
             "http://10.0.0.1/status",
             "http://169.254.169.254/latest/meta-data",
+            "http://100.64.0.1/",
+            "http://0.0.0.0/",
             "http://[::1]:8080/",
             "http://[::ffff:127.0.0.1]/",
             "file:///etc/passwd",

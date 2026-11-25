@@ -100,7 +100,8 @@ pub async fn revert_checkpoint_file(
         .find(|f| f.rel_path == rel_path)
         .ok_or_else(|| anyhow::anyhow!("File '{rel_path}' not found in checkpoint"))?;
 
-    restore_backup_to_disk(Path::new(&sess.workspace_path), backup)?;
+    let (ws_root, _) = crate::resolve_session_workspace_root(store, session_id, &sess.workspace_path);
+    restore_backup_to_disk(&ws_root, backup)?;
 
     let updated = store
         .update(|s| {
@@ -137,10 +138,10 @@ pub async fn rollback_entire_checkpoint(
         .find(|c| c.id == checkpoint_id)
         .ok_or_else(|| anyhow::anyhow!("Checkpoint not found"))?;
 
-    let ws_root = Path::new(&sess.workspace_path);
+    let (ws_root, _) = crate::resolve_session_workspace_root(store, session_id, &sess.workspace_path);
     for backup in cp.files.iter().rev() {
         if backup.status != FileChangeStatus::Reverted {
-            restore_backup_to_disk(ws_root, backup)?;
+            restore_backup_to_disk(&ws_root, backup)?;
         }
     }
 

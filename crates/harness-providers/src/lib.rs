@@ -1089,6 +1089,18 @@ async fn complete_ollama_loopback(
         }
     }
 
+    if req.model_id.starts_with("local::")
+        && prompt_tokens == 0
+        && completion_tokens == 0
+        && (!clean_content.is_empty() || !tool_calls.is_empty())
+    {
+        let th_len = thinking.as_deref().map(str::len).unwrap_or(0);
+        let req_chars: usize = req.system_prompt.len()
+            + req.messages.iter().map(|m| m.content.len()).sum::<usize>();
+        prompt_tokens = ((req_chars / 4) as u64).max(1);
+        completion_tokens = (((clean_content.len() + th_len) / 4) as u64).max(1);
+    }
+
     Ok(CompletionResponse {
         content: clean_content,
         thinking,
@@ -1161,10 +1173,18 @@ impl OpenAiStreamAccumulator {
                 }
             }
         }
-        if let Some(pt) = val["usage"]["prompt_tokens"].as_u64() {
+        if let Some(pt) = val["usage"]["prompt_tokens"]
+            .as_u64()
+            .or_else(|| val["timings"]["prompt_n"].as_u64())
+            .or_else(|| val["prompt_eval_count"].as_u64())
+        {
             self.prompt_tokens = pt;
         }
-        if let Some(ct) = val["usage"]["completion_tokens"].as_u64() {
+        if let Some(ct) = val["usage"]["completion_tokens"]
+            .as_u64()
+            .or_else(|| val["timings"]["predicted_n"].as_u64())
+            .or_else(|| val["eval_count"].as_u64())
+        {
             self.completion_tokens = ct;
         }
         if let Some(rt) = val["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64() {
@@ -1210,10 +1230,18 @@ impl OpenAiStreamAccumulator {
                 }
             }
         }
-        if let Some(pt) = val["usage"]["prompt_tokens"].as_u64() {
+        if let Some(pt) = val["usage"]["prompt_tokens"]
+            .as_u64()
+            .or_else(|| val["timings"]["prompt_n"].as_u64())
+            .or_else(|| val["prompt_eval_count"].as_u64())
+        {
             self.prompt_tokens = pt;
         }
-        if let Some(ct) = val["usage"]["completion_tokens"].as_u64() {
+        if let Some(ct) = val["usage"]["completion_tokens"]
+            .as_u64()
+            .or_else(|| val["timings"]["predicted_n"].as_u64())
+            .or_else(|| val["eval_count"].as_u64())
+        {
             self.completion_tokens = ct;
         }
         if let Some(rt) = val["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64() {
@@ -1292,12 +1320,28 @@ impl OpenAiStreamAccumulator {
             }
         }
 
+        let (prompt_tokens, completion_tokens) = if req.model_id.starts_with("local::")
+            && self.prompt_tokens == 0
+            && self.completion_tokens == 0
+            && (!clean_content.is_empty() || !tool_calls.is_empty())
+        {
+            let th_len = thinking.as_deref().map(str::len).unwrap_or(0);
+            let req_chars: usize = req.system_prompt.len()
+                + req.messages.iter().map(|m| m.content.len()).sum::<usize>();
+            (
+                ((req_chars / 4) as u64).max(1),
+                (((clean_content.len() + th_len) / 4) as u64).max(1),
+            )
+        } else {
+            (self.prompt_tokens, self.completion_tokens)
+        };
+
         CompletionResponse {
             content: clean_content,
             thinking,
             tool_calls,
-            prompt_tokens: self.prompt_tokens,
-            completion_tokens: self.completion_tokens,
+            prompt_tokens,
+            completion_tokens,
             thinking_tokens: self.thinking_tokens,
             latency_ms,
             actual_model_id: req.model_id.clone(),
@@ -1513,7 +1557,7 @@ async fn complete_openai_compat_with_headers(
         "max_tokens": req.max_tokens,
         "stream": true,
     });
-    if purpose == "openrouter_api" {
+    if purpose == "openrouter_api" || purpose == "local_inference" {
         body["stream_options"] = json!({ "include_usage": true });
     }
     if !tools.is_empty() {
@@ -4557,5 +4601,34 @@ mod tests {
 
         let streaming = "Checking now.\n<|tool_call|>call:read_file{path:<|\"|>Cargo.toml";
         assert_eq!(strip_live_inline_tool_markup(streaming), "Checking now.");
+    }
+
+    #[test]
+    fn openai_stream_accumulator_extracts_llama_cpp_timings_and_local_fallback() {
+        let mut acc = OpenAiStreamAccumulator::default();
+        acc.apply_chunk(&json!({
+            "choices": [{ "delta": { "content": "Hello from local model!" } }],
+            "timings": { "prompt_n": 42, "predicted_n": 7 }
+        }));
+        let req = CompletionRequest {
+            model_id: "local::qwen3.5:9b".into(),
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools: vec![],
+            enable_thinking: false,
+            max_tokens: 256,
+            temperature: 0.2,
+        };
+        let resp = acc.into_response(&req, 100);
+        assert_eq!(resp.prompt_tokens, 42);
+        assert_eq!(resp.completion_tokens, 7);
+
+        let mut acc_fallback = OpenAiStreamAccumulator::default();
+        acc_fallback.apply_chunk(&json!({
+            "choices": [{ "delta": { "content": "Generated forty-six characters of output text!" } }]
+        }));
+        let resp_fb = acc_fallback.into_response(&req, 50);
+        assert!(resp_fb.prompt_tokens >= 1);
+        assert!(resp_fb.completion_tokens >= 10);
     }
 }

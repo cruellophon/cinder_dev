@@ -44,6 +44,14 @@ pub struct BumboStore {
 impl BumboStore {
     pub fn init(paths: BumboPaths) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&paths.app_data_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &paths.app_data_dir,
+                std::fs::Permissions::from_mode(0o700),
+            );
+        }
         std::fs::create_dir_all(&paths.engines_dir)?;
 
         let mut state = if paths.state_file.exists() {
@@ -127,6 +135,7 @@ impl BumboStore {
                 fallback_policy: FallbackPolicy::Ask,
                 fallback_chain: Vec::new(),
                 model_aliases: std::collections::BTreeMap::new(),
+                allowed_runtimes: Vec::new(),
             },
             workspaces,
             sessions: vec![initial_session],
@@ -247,6 +256,19 @@ impl BumboStore {
         }
         let tmp = state_file.with_extension(format!("json.{}.tmp", Uuid::new_v4().simple()));
         let payload = serde_json::to_string_pretty(state)?;
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(payload.as_bytes())?;
+        }
+        #[cfg(not(unix))]
         std::fs::write(&tmp, payload)?;
         let mut last_err = None;
         for attempt in 0..4 {

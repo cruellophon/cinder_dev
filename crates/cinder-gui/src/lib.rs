@@ -566,6 +566,11 @@ impl eframe::App for CinderApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_backend_events();
         self.handle_shortcuts_and_dnd(ctx);
+        if let Some((suggested_name, code_body)) = ctx.data_mut(|d| {
+            d.remove_temp::<(String, String)>(egui::Id::new("cinder_pending_save_code"))
+        }) {
+            self.backend.save_text_as(suggested_name, code_body);
+        }
 
         let ui_cfg = self
             .state

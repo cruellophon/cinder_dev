@@ -27,12 +27,13 @@ use harness_tools::{
     evict_mcp_server_session, export_antigravity_mcp_json, inspect_git_diff_head,
     inspect_git_status, inspect_project_dependencies, install_curated_plugin,
     install_custom_project_dependency, install_project_dependency, is_dependency_allowlisted,
-    list_plugin_catalog_with_status, list_workspace_tree, pick_files, pick_folder,
-    probe_mcp_server, probe_toolchains, rename_workspace_entry, search_workspace_knowledge,
-    sync_from_antigravity, uninstall_curated_plugin, uninstall_project_dependency,
-    validate_custom_package_name, AntigravitySyncReport, GitDiffEntry, GitWorkspaceStatus,
-    IndexStats, InstallJobManager, InstallJobRecord, KnowledgeSearchHit, McpProbeResult,
-    PluginCatalogView, ProjectDependenciesOverview, ToolchainStatus, WorkspaceFileNode,
+    list_plugin_catalog_with_status, list_workspace_tree, pick_files, pick_folder, pick_save_file,
+    probe_mcp_server, probe_toolchains, rename_workspace_entry, resolve_workspace_path,
+    reveal_in_file_manager, search_workspace_knowledge, sync_from_antigravity,
+    uninstall_curated_plugin, uninstall_project_dependency, validate_custom_package_name,
+    AntigravitySyncReport, GitDiffEntry, GitWorkspaceStatus, IndexStats, InstallJobManager,
+    InstallJobRecord, KnowledgeSearchHit, McpProbeResult, PluginCatalogView,
+    ProjectDependenciesOverview, ToolchainStatus, WorkspaceFileNode,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -75,6 +76,7 @@ pub struct UiSnapshot {
     pub sessions: Vec<SessionSummary>,
     pub active_session: Option<Session>,
     pub workspace_tree: Vec<WorkspaceFileNode>,
+    pub scratch_files: Vec<WorkspaceFileNode>,
     pub git_status: GitWorkspaceStatus,
     pub workspace_rules: String,
     pub skills: Vec<SkillDefinition>,
@@ -403,12 +405,28 @@ impl BackendHandle {
         let mut settings = snap.settings;
         settings.privacy_mode = privacy_audit.privacy_mode;
 
+        let scratch_files = match active_session.as_ref() {
+            Some(s) if s.workspace_path.trim().is_empty() => {
+                let sdir = self.store.paths().session_scratch_dir(&s.id);
+                if sdir.is_dir() {
+                    list_workspace_tree(&sdir, 32)
+                        .into_iter()
+                        .filter(|n| !n.is_dir && !n.rel_path.starts_with(".cinder_tmp"))
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        };
+
         UiSnapshot {
             settings,
             workspaces: snap.workspaces,
             sessions,
             active_session,
             workspace_tree,
+            scratch_files,
             git_status,
             workspace_rules,
             skills,
@@ -957,6 +975,150 @@ impl BackendHandle {
                     }
                 })
                 .await;
+            h.emit_snapshot(false).await;
+        });
+    }
+
+    pub fn save_text_as(self: &Arc<Self>, suggested_name: String, content: String) {
+        let h = Arc::clone(self);
+        self.rt.spawn(async move {
+            let picked = tokio::task::spawn_blocking(move || {
+                pick_save_file("Save Code Snippet As", &suggested_name)
+            })
+            .await;
+            match picked {
+                Ok(Ok(Some(dest))) => match std::fs::write(&dest, content.as_bytes()) {
+                    Ok(()) => h.toast(format!("Saved to {dest}"), false),
+                    Err(e) => h.toast(format!("Could not save file: {e}"), true),
+                },
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => h.toast(format!("Save dialog error: {e}"), true),
+                Err(e) => h.toast(format!("Save dialog task failed: {e}"), true),
+            }
+        });
+    }
+
+    pub fn save_scratch_file_as(self: &Arc<Self>, session_id: String, rel_path: String) {
+        let h = Arc::clone(self);
+        self.rt.spawn(async move {
+            let sdir = h.store.paths().session_scratch_dir(&session_id);
+            let src_path = match resolve_workspace_path(&sdir, &rel_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    h.toast(format!("Invalid scratchpad file: {e}"), true);
+                    return;
+                }
+            };
+            let bytes = match std::fs::read(&src_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    h.toast(format!("Could not read '{rel_path}': {e}"), true);
+                    return;
+                }
+            };
+            let suggested = src_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file.txt")
+                .to_string();
+            let picked =
+                tokio::task::spawn_blocking(move || pick_save_file("Save Scratchpad File As", &suggested))
+                    .await;
+            match picked {
+                Ok(Ok(Some(dest))) => match std::fs::write(&dest, &bytes) {
+                    Ok(()) => h.toast(format!("Saved '{rel_path}' to {dest}"), false),
+                    Err(e) => h.toast(format!("Could not save file: {e}"), true),
+                },
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => h.toast(format!("Save dialog error: {e}"), true),
+                Err(e) => h.toast(format!("Save dialog task failed: {e}"), true),
+            }
+        });
+    }
+
+    pub fn reveal_scratch_dir(self: &Arc<Self>, session_id: String) {
+        let sdir = self.store.paths().session_scratch_dir(&session_id);
+        let _ = std::fs::create_dir_all(&sdir);
+        if let Err(e) = reveal_in_file_manager(&sdir) {
+            self.toast(format!("Could not reveal scratchpad folder: {e}"), true);
+        }
+    }
+
+    pub fn export_scratch_to_workspace(self: &Arc<Self>, session_id: String) {
+        let h = Arc::clone(self);
+        self.rt.spawn(async move {
+            let picked = tokio::task::spawn_blocking(|| {
+                pick_folder("Choose Destination Folder for Scratchpad Files")
+            })
+            .await;
+            let Some(dest_str) = (match picked {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    h.toast(format!("Folder picker error: {e}"), true);
+                    return;
+                }
+                Err(e) => {
+                    h.toast(format!("Folder picker task failed: {e}"), true);
+                    return;
+                }
+            }) else {
+                return;
+            };
+            let dest_root = PathBuf::from(&dest_str);
+            if !dest_root.is_dir() {
+                h.toast("Selected destination is not a valid folder.", true);
+                return;
+            }
+            let sdir = h.store.paths().session_scratch_dir(&session_id);
+            let mut copied = 0usize;
+            if sdir.is_dir() {
+                for node in list_workspace_tree(&sdir, 128) {
+                    if node.is_dir || node.rel_path.starts_with(".cinder_tmp") {
+                        continue;
+                    }
+                    if let Ok(src) = resolve_workspace_path(&sdir, &node.rel_path) {
+                        if let Ok(dst) = resolve_workspace_path(&dest_root, &node.rel_path) {
+                            if let Some(parent) = dst.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if std::fs::copy(&src, &dst).is_ok() {
+                                copied += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            let ws_name = dest_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Exported Workspace")
+                .to_string();
+            let _ = h
+                .store
+                .update(|s| {
+                    if !s
+                        .workspaces
+                        .iter()
+                        .any(|w| w.path.eq_ignore_ascii_case(&dest_str))
+                    {
+                        s.workspaces.push(WorkspaceEntry {
+                            id: Uuid::new_v4().to_string(),
+                            name: ws_name,
+                            path: dest_str.clone(),
+                            is_uni_project: false,
+                        });
+                    }
+                    if let Some(sess) = s.sessions.iter_mut().find(|x| x.id == session_id) {
+                        sess.workspace_path = dest_str.clone();
+                        sess.updated_at = Utc::now();
+                    }
+                    s.settings.active_workspace_path = dest_str.clone();
+                })
+                .await;
+            h.toast(
+                format!("Exported {copied} file(s) and attached '{dest_str}'."),
+                false,
+            );
             h.emit_snapshot(false).await;
         });
     }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use thiserror::Error;
 use url::Url;
@@ -69,38 +69,95 @@ pub enum NetError {
 }
 
 pub struct NetworkGate {
-    mode: RwLock<PrivacyMode>,
+    mode: Arc<RwLock<PrivacyMode>>,
     entries: RwLock<VecDeque<AuditEntry>>,
     loopback_allowed: AtomicU64,
     external_allowed: AtomicU64,
     external_blocked: AtomicU64,
     api_client: Client,
     download_client: Client,
+    no_redirect_client: Client,
+}
+
+fn classify_redirect_target(
+    current_mode: PrivacyMode,
+    orig_url: Option<&Url>,
+    next_url: &Url,
+) -> Result<(), &'static str> {
+    if !matches!(next_url.scheme(), "http" | "https") {
+        return Err("Blocked HTTP redirect to unsupported URL scheme");
+    }
+    let Some(next_host) = next_url.host_str() else {
+        return Err("Blocked HTTP redirect missing host");
+    };
+    let next_loopback = is_loopback_host(next_host);
+    if current_mode == PrivacyMode::StrictLocal && !next_loopback {
+        return Err("Strict Local Mode blocked HTTP redirect to external host");
+    }
+    if let Some(orig) = orig_url.and_then(|u| u.host_str()) {
+        let orig_loopback = is_loopback_host(orig);
+        if orig_loopback && !next_loopback {
+            return Err("Blocked HTTP redirect from loopback to external host");
+        }
+        if !orig_loopback && next_loopback {
+            return Err("SSRF Guard: blocked HTTP redirect from external host to loopback");
+        }
+    }
+    Ok(())
+}
+
+fn build_redirect_policy(mode: Arc<RwLock<PrivacyMode>>) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 8 {
+            return attempt.stop();
+        }
+        let current_mode = *mode.read().expect("NetworkGate mode lock poisoned");
+        let orig = attempt.previous().first();
+        match classify_redirect_target(current_mode, orig, attempt.url()) {
+            Ok(()) => attempt.follow(),
+            Err(reason) => attempt.error(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                reason,
+            )),
+        }
+    })
 }
 
 impl NetworkGate {
     pub fn new(initial_mode: PrivacyMode) -> anyhow::Result<Self> {
+        let mode = Arc::new(RwLock::new(initial_mode));
         let api_client = Client::builder()
             .user_agent(USER_AGENT)
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(180))
+            .redirect(build_redirect_policy(Arc::clone(&mode)))
             .no_proxy()
             .build()?;
 
         let download_client = Client::builder()
             .user_agent(USER_AGENT)
             .connect_timeout(Duration::from_secs(20))
+            .redirect(build_redirect_policy(Arc::clone(&mode)))
+            .no_proxy()
+            .build()?;
+
+        let no_redirect_client = Client::builder()
+            .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .build()?;
 
         Ok(Self {
-            mode: RwLock::new(initial_mode),
+            mode,
             entries: RwLock::new(VecDeque::with_capacity(MAX_AUDIT_ENTRIES)),
             loopback_allowed: AtomicU64::new(0),
             external_allowed: AtomicU64::new(0),
             external_blocked: AtomicU64::new(0),
             api_client,
             download_client,
+            no_redirect_client,
         })
     }
 
@@ -149,6 +206,16 @@ impl NetworkGate {
         purpose: &str,
     ) -> Result<RequestBuilder, NetError> {
         self.authorize_with_client(&self.download_client, method, raw_url, purpose)
+    }
+
+    /// Authorize an outbound HTTP request with redirects disabled (for per-hop SSRF validation).
+    pub fn request_no_redirect(
+        &self,
+        method: Method,
+        raw_url: &str,
+        purpose: &str,
+    ) -> Result<RequestBuilder, NetError> {
+        self.authorize_with_client(&self.no_redirect_client, method, raw_url, purpose)
     }
 
     fn authorize_with_client(
@@ -306,5 +373,18 @@ mod tests {
         assert_eq!(summary.external_requests_blocked, 0);
         assert!(summary.entries[0].url.contains("REDACTED"));
         assert!(!summary.entries[0].url.contains("supersecret123"));
+    }
+
+    #[test]
+    fn redirect_guard_blocks_strict_local_escape_and_external_to_loopback_ssrf() {
+        let local_origin = Url::parse("http://127.0.0.1:18080/health").unwrap();
+        let ext_target = Url::parse("https://evil.example/leak").unwrap();
+        assert!(classify_redirect_target(PrivacyMode::StrictLocal, Some(&local_origin), &ext_target).is_err());
+        assert!(classify_redirect_target(PrivacyMode::Hybrid, Some(&local_origin), &ext_target).is_err());
+
+        let ext_origin = Url::parse("https://example.com/start").unwrap();
+        let loopback_target = Url::parse("http://127.0.0.1:18080/v1/models").unwrap();
+        assert!(classify_redirect_target(PrivacyMode::Hybrid, Some(&ext_origin), &loopback_target).is_err());
+        assert!(classify_redirect_target(PrivacyMode::Hybrid, Some(&ext_origin), &ext_target).is_ok());
     }
 }

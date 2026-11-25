@@ -68,6 +68,7 @@ fn configure_no_window_std(_cmd: &mut Command) {}
 fn run_git_sync(workspace_root: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
     cmd.arg("--no-optional-locks")
+        .args(["-c", "core.fsmonitor=false", "-c", "protocol.file.allow=never"])
         .arg("-C")
         .arg(workspace_root)
         .args(args);
